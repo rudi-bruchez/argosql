@@ -6,7 +6,7 @@
 
 **Architecture:** Une connexion SQL conservée pendant chaque invocation exécute des requêtes embarquées et paramétrées. Les diagnostics produisent des tables typées vers un collecteur qui écrit les exports complets, puis le moteur de sortie construit un aperçu borné. La configuration, la session, les diagnostics, le parseur XML et la sérialisation ont des frontières testables séparément.
 
-**Tech Stack:** Go 1.27, `database/sql`, `github.com/microsoft/go-mssqldb v1.11.0`, YAML, bibliothèque standard pour CLI/JSON/XML/tests, Podman pour SQL Server 2019/2022 et smoke test 2025. Utiliser le module YAML maintenu `go.yaml.in/yaml/v4`, résoudre sa version à la tâche 2 et la figer dans go.mod/go.sum. [Source YAML](https://github.com/yaml/go-yaml), [pilote SQL](https://github.com/microsoft/go-mssqldb/tree/v1.11.0).
+**Tech Stack:** Go 1.27, `database/sql`, `github.com/microsoft/go-mssqldb v1.11.0`, YAML, bibliothèque standard pour CLI/JSON/XML/tests, Podman pour SQL Server 2019/2022 et smoke test 2025. Utiliser le module YAML maintenu `go.yaml.in/yaml/v4`, résoudre sa version à la tâche 2 et la figer dans go.mod/go.sum. Mesuré au 8 septembre 2026 : la seule version publiée est `v4.0.0-rc.6`. La décision est donc de figer une pré-version, pas de choisir entre deux versions stables ; l'écrire ainsi dans docs/testing.md à la tâche 16, avec la date de la mesure. Sa strictesse a été vérifiée : champs inconnus, clés dupliquées et profils dupliqués sont bien rejetés. [Source YAML](https://github.com/yaml/go-yaml), [pilote SQL](https://github.com/microsoft/go-mssqldb/tree/v1.11.0).
 
 **Spec:** [2026-09-08-argosql-mvp-design.md](../specs/2026-09-08-argosql-mvp-design.md). La spec corrigée prime sur le rapport de review historique. La demande de plan autorise sa rédaction ; ce document n'annonce ni code implémenté ni tests déjà passés.
 
@@ -31,7 +31,9 @@ Exécuter les tâches dans l'ordre. Chaque tâche a un cycle rouge/vert et une s
 
 Les blocs SQL de ce plan sont des esquisses du noyau, jamais le contenu final d'un fichier `.sql`. La prose qui suit chaque bloc est normative et l'étend : colonnes supplémentaires, variante par version du moteur, jointures de noms. Un implémenteur qui colle le bloc dans le fichier et écrit ses tests à partir du même bloc obtient une suite verte qui a perdu l'exigence. Chaque tâche portant un bloc SQL nomme ci-dessous l'assertion qui prouve que l'extension est présente. Un panel de relecture a produit trois faux positifs sur ce seul motif : la lecture verbatim du bloc est la lecture naturelle, c'est pourquoi elle est interdite ici explicitement.
 
-Les blocs de tests sont des cas directeurs à placer dans les fichiers indiqués, dans le package concerné, avec les imports standard nécessaires. Les listes de cas adjacentes sont également obligatoires. Les blocs d'algorithme ne dispensent pas des contrats de la spec. Les commandes de test doivent d'abord échouer pour la raison attendue, puis réussir après implémentation ; une erreur de compilation sur un nouveau symbole est un rouge d'introduction acceptable ; un échec d'installation ou d'environnement n'est pas un rouge fonctionnel.
+Les blocs de tests sont des cas directeurs à placer dans les fichiers indiqués, dans le package concerné, avec les imports standard nécessaires. Les listes de cas adjacentes sont également obligatoires. Les blocs d'algorithme ne dispensent pas des contrats de la spec. Chaque commande `go test -run` de ce plan est suivie du nombre de tests que le filtre doit sélectionner, sous la forme « attendu : N tests ». Mesuré : `go test -run 'TestUnknown|TestResolve'` affiche `ok` et sort avec le code 0 quand `TestResolve` n'existe pas, sans le moindre avertissement. Un nombre inférieur à N veut dire que le filtre est faux ou que le test n'a pas été écrit, jamais que le travail est fait. Vérifier le compte avec `go test -run <filtre> -v | grep -c '^=== RUN'` avant de conclure au vert. Les filtres de ce plan nomment plusieurs tests que les tâches ne définissent pas ; les corriger en écrivant la tâche plutôt qu'en élargissant le filtre.
+
+Les commandes de test doivent d'abord échouer pour la raison attendue, puis réussir après implémentation ; une erreur de compilation sur un nouveau symbole est un rouge d'introduction acceptable ; un échec d'installation ou d'environnement n'est pas un rouge fonctionnel.
 
 Après chaque tâche validée : inspecter le diff, ajouter uniquement les fichiers de cette tâche et créer un commit avec le message proposé. Commandes : `git add -- <chemins de la tâche>` puis `git commit -m '<message proposé>'`. Ne jamais utiliser `git add .` pour absorber les fichiers de l'utilisateur. Un point de revue suit chaque tranche.
 
@@ -45,7 +47,7 @@ Après chaque tâche validée : inspecter le diff, ajouter uniquement les fichie
 | `internal/config/{load,tls}.go` | YAML strict, secrets, TLS explicite |
 | `internal/sqlserver/{session,permissions,objects}.go` | Connexion tenue, capacités, résolution |
 | `internal/diagnostics/*.go`, `internal/diagnostics/sql/*.sql` | SQL embarqué et contrats des commandes |
-| `internal/output/{cell,tsv,json,decode,preview}.go` | Formats et budget stdout |
+| `internal/output/{cell,scan,tsv,json,decode,preview}.go` | Conversion des valeurs du pilote, formats et budget stdout |
 | `internal/artifacts/{store,collector,manifest}.go` | Flux d'export, quotas et complétude |
 | `internal/plan/{xml,summary}.go` | Export XML et résumé incrémental |
 | `tests/integration/{podman,fixture,tls}_test.go` | Fixtures réelles isolées |
@@ -60,6 +62,24 @@ Tous les fichiers listés sont à créer sauf README.md et .gitignore. Les tests
 ```go
 // internal/model : champs exportés sérialisés en snake_case.
 type Cell struct { Value any } // nil, string, bool, int64, float64 ; SQL exact en string si nécessaire
+// Sans cette méthode, Cell se sérialise en {"Value":"abc"} : ni positionnel, ni
+// snake_case. Mesuré. Elle appartient à la tâche 1, pas à la tâche 5.
+func (c Cell) MarshalJSON() ([]byte, error) // encode la valeur nue, jamais un objet
+// Vocabulaire fermé des raisons de réduction. Toute autre valeur est un défaut.
+const (
+    ReasonPreviewOmitted     = "preview_omitted"     // cellule trop grosse pour le budget
+    ReasonRowsTruncated      = "rows_truncated"      // lignes retirées pour tenir
+    ReasonCellTruncated      = "cell_truncated"      // troncature par runes
+    ReasonEncodingNormalized = "encoding_normalized" // remplacement de séquence invalide
+)
+// Enveloppe de dernier recours quand le résultat lui-même ne tient pas dans le
+// budget. Type dédié : model.Result ne peut pas produire ce littéral, et
+// omitempty ferait disparaître "ok":false que la spec exige.
+type FallbackError struct {
+    SchemaVersion int          `json:"schema_version"`
+    OK            bool         `json:"ok"`
+    Error         *PublicError `json:"error"`
+}
 type Column struct { Name, SQLType string }
 type TableSpec struct { Name string; Columns []Column }
 type Notice struct { Kind, Message, Table string }
@@ -137,7 +157,7 @@ func TestExitCode(t *testing.T) {
 }
 ```
 
-- [ ] Exécuter `go test ./internal/model -run TestExitCode -v` ; attendu rouge sur les symboles manquants.
+- [ ] Exécuter `go test ./internal/model -run TestExitCode -v` ; attendu : 1 test ; rouge sur les symboles manquants.
 - [ ] Implémenter les types ; `ExitCode` utilise `errors.As` pour préserver le code à travers les wrappers :
 
 ```go
@@ -186,7 +206,7 @@ func TestDefaultTrust(t *testing.T) {
 ```
 
 - [ ] Rouge : `go test ./internal/config -v`.
-- [ ] Décoder via un type brut utilisant `*bool` pour distinguer absent/false. Rejeter champs inconnus, doublons, YAML supplémentaire, username/password_env manquants, port hors 1–65535, base finale vide ; résolution relative ca_file, parsing PEM/DER. Utiliser `url.UserPassword`, `net.JoinHostPort`, `url.Values`, jamais interpolation de credentials :
+- [ ] Décoder via un type brut utilisant `*bool` pour distinguer absent/false. Rejeter champs inconnus, doublons, YAML supplémentaire, username/password_env manquants, port hors 1–65535, base finale vide ; résolution relative ca_file, parsing PEM/DER. Mesuré : `go-mssqldb` v1.11.0 dispatche sur l'extension du fichier dans `msdsn.Parse` et n'accepte que `.pem` et `.der` ; un PEM parfaitement valide nommé `ca.crt`, `ca.cer` ou sans extension rend `certificate type .crt is not supported` au moment de la connexion, donc un code 3, alors que la spec exige un code 2 avant connexion. Valider ca_file dans Load, avant toute construction de DSN : rejeter avec 2 toute extension autre que `.pem` ou `.der`, en nommant les deux extensions acceptées dans le message. Lire et parser le contenu soi-même, et vérifier la valeur de retour de `AppendCertsFromPEM` : le pilote l'ignore, si bien qu'un `.pem` au contenu invalide produit un pool vide et un échec de chaîne à la connexion au lieu d'une erreur de configuration. Un `.pem` dont le contenu ne fournit aucun certificat vaut 2. Utiliser `url.UserPassword`, `net.JoinHostPort`, `url.Values`, jamais interpolation de credentials :
 
 ```go
 q := url.Values{"encrypt": {"true"}, "TrustServerCertificate": {strconv.FormatBool(p.TrustServerCertificate)}, "database": {p.Database}}
@@ -194,7 +214,7 @@ if p.CAFile != "" { q.Set("certificate", p.CAFile) }
 u := url.URL{Scheme:"sqlserver", Host:net.JoinHostPort(p.Host, strconv.Itoa(p.Port)), User:url.UserPassword(p.Username,p.Password), RawQuery:q.Encode()}
 ```
 
-- [ ] Vert : tests true/false/absent, ca_file+true rejeté, override base, caractères `@;?` du secret, champs sensibles interdits et erreurs YAML reformulées sans afficher la source. Aucun TLS flag global ajouté.
+- [ ] Vert : tests true/false/absent, ca_file+true rejeté, override base, caractères `@;?` du secret, champs sensibles interdits et erreurs YAML reformulées sans afficher la source. Aucun TLS flag global ajouté. Cas explicites du ca_file : même contenu PEM valide nommé `ca.pem` accepté, `ca.crt` rejeté avec 2, sans extension rejeté avec 2, `.pem` au contenu vide ou corrompu rejeté avec 2. La matrice TLS de la tâche 4b génère ses propres certificats et ne rencontrera jamais ces cas : ils appartiennent aux tests unitaires de cette tâche.
 - [ ] Commit : `feat: load strict connection profiles with trusted TLS default`.
 
 ### Tâche 3 : session tenue, délais et nettoyage
@@ -211,7 +231,9 @@ func (s *Session) Close() error
 
 L'appelant crée le contexte global avant Open. Major est obtenu par SERVERPROPERTY après setup. Major=15 utilise la variante SQL 2019 ; Major=16 ou 17 utilise la variante 2022. Major=17 ajoute un avis de compatibilité non validée. Toute autre version retourne 4 avant les requêtes spécifiques. Tester 15/16/17 et une version inconnue ; ne pas sélectionner automatiquement une variante pour toutes les versions futures.
 
-- [ ] Test du faux pilote : enregistrer un pilote minimal implémentant Conn, QueryerContext, ExecerContext et SessionResetter. Enregistrer les événements et remettre lockTimeout=-1 dans ResetSession. Le test doit constater 5000 au deuxième SELECT via Session.Conn, puis -1 après remise au pool dans le témoin.
+- [ ] Test du faux pilote : enregistrer un pilote minimal implémentant Conn, QueryerContext, ExecerContext et SessionResetter. Enregistrer les événements et remettre lockTimeout=-1 dans ResetSession. Le test doit constater 5000 au deuxième SELECT via Session.Conn.
+
+Mesuré avec un faux pilote sur Go 1.27 : `ResetSession` n'est pas appelé quand la connexion revient au pool. Après `Conn.Close()` le journal du pilote est inchangé et le témoin vaut encore 5000. Le reset ne se déclenche qu'à l'acquisition suivante, avant la première requête de la reprise. Le témoin doit donc être lu par un `db.Conn` ultérieur, pas après `Close`. Écrire l'assertion sous cette forme : après `Close`, aucun événement `ResetSession` dans le journal ; après un nouveau `db.Conn` suivi d'un SELECT, l'événement est présent et la valeur est -1. Une étape qui prétend observer -1 juste après la remise au pool observe 5000 et sera « corrigée » jusqu'à passer, sans que personne ne comprenne pourquoi.
 
 ```go
 func TestHeldConnection(t *testing.T) {
@@ -226,7 +248,7 @@ func TestHeldConnection(t *testing.T) {
 }
 ```
 
-- [ ] Rouge : `go test ./internal/sqlserver -run TestHeldConnection -v`.
+- [ ] Rouge : `go test ./internal/sqlserver -run TestHeldConnection -v` ; attendu : 1 test.
 - [ ] Construire le pool, acquérir Conn avec un contexte enfant <=5 s, fermer ce contexte après acquisition, puis utiliser le contexte global pour setup et diagnostics :
 
 ```go
@@ -270,7 +292,7 @@ func TestSessionTLS(t *testing.T) {
 }
 ```
 
-- [ ] Rouge : `ASQ_TEST_IMAGE=mcr.microsoft.com/mssql/server:2022-latest go test -tags=integration ./tests/integration -run TestSessionTLS -v -count=1`.
+- [ ] Rouge : `ASQ_TEST_IMAGE=mcr.microsoft.com/mssql/server:2022-latest go test -tags=integration ./tests/integration -run TestSessionTLS -v -count=1` ; attendu : 1 test.
 - [ ] Harness : génération crypto/rand de mots de passe, fichier env temporaire 0600 ; `exec.CommandContext` avec argv séparés :
 
 ```text
@@ -295,9 +317,18 @@ Après une charge, l'admin exécute `EXEC sys.sp_query_store_flush_db` dans AppD
 
 ### Tâche 5 : cellules et formats complets
 
-**Fichiers :** créer `internal/output/cell.go`, `tsv.go`, `json.go`, `decode.go` et leurs tests.
+**Fichiers :** créer `internal/output/cell.go`, `scan.go`, `tsv.go`, `json.go`, `decode.go` et leurs tests.
 
-**Interfaces :** `EncodeTSVCell(model.Cell) string` ; encodeur incrémental aligné sur le modèle push du collecteur :
+**Interfaces :** `EncodeTSVCell(model.Cell) string` ; le convertisseur des valeurs du pilote, dont dépendent les quatorze diagnostics et qui n'appartenait à aucune tâche :
+
+```go
+// scan.go : seul endroit du projet qui transforme une ligne SQL en []model.Cell.
+func ScanRow(rows *sql.Rows, types []*sql.ColumnType) ([]model.Cell, error)
+```
+
+Mesuré avec `go-mssqldb` v1.11.0 : `decimal`, `money`, `varbinary` et `uniqueidentifier` arrivent tous en `[]uint8`, et `datetime2`/`datetimeoffset` en `time.Time`. Aucun de ces types n'est admis par `Cell.Value`, dont le domaine est nil, string, bool, int64, float64. Seul `ColumnType.DatabaseTypeName()` sépare un décimal exact d'un binaire : la conversion se décide sur ce nom, jamais sur le type Go seul, sinon un `varbinary` devient un nombre en texte. Règles : decimal et money en string exacte, varbinary en hexadécimal préfixé, uniqueidentifier en forme canonique, date et heure en texte ISO 8601, bigint en int64 puis chaîne JSON. Un type SQL non couvert est une erreur explicite, jamais un `fmt.Sprintf` de secours. Tester chacun de ces types contre un serveur réel et non seulement contre des valeurs fabriquées.
+
+Encodeur incrémental aligné sur le modèle push du collecteur :
 
 ```go
 func NewTableEncoder(w io.Writer,format string,spec model.TableSpec)(*Encoder,error)
@@ -375,7 +406,7 @@ Pour une table interrompue, fermer proprement le JSON/TSV des lignes acceptées 
 
 **Interfaces :** `PreviewOptions{Rows int; CellLimit int; NoTruncate bool; ByteLimit int}` ; `Render(result model.Result, options PreviewOptions, format string) ([]byte,error)`.
 
-Le collecteur garde sur disque les données complètes. La tâche 5 fournit NewTableDecoder/Next pour la seconde lecture ; ne pas introduire un format privé supplémentaire. Il construit les candidats d'aperçu lors d'une seconde lecture des artefacts : au plus le nombre demandé et les octets potentiellement affichables, pas 10,000 cellules de 100 MiB en RAM. Le renderer mesure les octets réellement encodés. Le collecteur fixe `model.Completeness` : rows_collected, collection_complete et properties_complete. Render travaille sur une copie du résultat, remplit `model.PreviewState` sur cette copie, puis la sérialise ; le manifeste écrit par le collecteur ne connaît pas ces champs et ne peut donc pas mentir sur l'aperçu.
+Le collecteur garde sur disque les données complètes. Ni `New(dir, format, limits)` ni `Finish(info, runErr)` ne transporte `PreviewOptions`, et cette tâche s'interdit de changer ces signatures : le collecteur ne peut donc pas décider seul du nombre de candidats. Trancher ainsi, sans toucher aux signatures existantes : le collecteur n'a aucune responsabilité d'aperçu, et `Render` fait la seconde lecture des artefacts en utilisant le décodeur de la tâche 5, à partir des chemins que `Finish` a déjà placés dans `model.Result.Artifacts`. La phrase qui confiait au collecteur la construction des candidats venait de la correction de la relecture précédente et se contredisait elle-même. La tâche 5 fournit NewTableDecoder/Next pour cette seconde lecture ; ne pas introduire un format privé supplémentaire. Render retient au plus le nombre de lignes demandé et les octets potentiellement affichables, jamais 10,000 cellules de 100 MiB en RAM, et mesure les octets réellement encodés. Le collecteur fixe `model.Completeness` : rows_collected, collection_complete et properties_complete. Render travaille sur une copie du résultat, remplit `model.PreviewState` sur cette copie, puis la sérialise ; le manifeste écrit par le collecteur ne connaît pas ces champs et ne peut donc pas mentir sur l'aperçu.
 
 Réserve mémoire de la seconde lecture : au plus ByteLimit octets sérialisables retenus par table. Une ligne dont le décodage dépasse à elle seule cette réserve n'est pas écartée : elle est retenue sous forme tronquée à la réserve, avec sa raison dans omitted_reasons. Écarter la ligne transformerait `--no-truncate` sur une grosse cellule en aperçu vide, ce qui est exactement la confusion entre omis et vide que cette tâche existe pour empêcher. La première ligne candidate de chaque table non vide est toujours retenue, au moins tronquée. Le plafond d'octets de la sortie s'applique inchangé ensuite ; `--no-truncate` porte sur la troncature par runes, jamais sur le plafond. L'utilisation mémoire d'une ligne décodée reste distincte de celle du fichier complet.
 
@@ -394,8 +425,8 @@ func TestOversizedCellIsNotEmpty(t *testing.T) {
 }
 ```
 
-- [ ] Rouge : `go test ./internal/output -run 'Test.*Preview|TestOversized' -v`.
-- [ ] Appliquer cet ordre : tronquer cellules par runes -> réserver enveloppe/métadonnées -> parts égales entre tables non vides -> lignes entières -> redistribuer dans l'ordre de la spec -> réencoder et vérifier la taille incluant newline. Retirer la dernière ligne candidate si le calcul exact augmente avec les métadonnées. Gérer fallback manifeste puis erreur fixe sans chemin :
+- [ ] Rouge : `go test ./internal/output -run 'TestOversizedCellIsNotEmpty|TestPreviewBudget' -v` ; attendu : 2 tests. Le filtre nomme les tests, il n'utilise pas `Test.*Preview`, qui masque une absence derrière une correspondance large.
+- [ ] Appliquer cet ordre : tronquer cellules par runes -> réserver enveloppe/métadonnées -> parts égales entre tables non vides -> lignes entières -> redistribuer dans l'ordre de la spec -> réencoder et vérifier la taille incluant newline. Retirer la dernière ligne candidate si le calcul exact augmente avec les métadonnées. Gérer fallback manifeste puis erreur fixe sans chemin. Ce littéral se sérialise depuis `model.FallbackError` défini à la tâche 1, jamais depuis `model.Result` : mesuré, `Result` produit en plus `context`, `tables` et `sql_number`, et `omitempty` ferait disparaître `"ok":false`. Les raisons de réduction viennent du vocabulaire fermé de la tâche 1 ; ne pas inventer de chaîne locale.
 
 ```json
 {"schema_version":1,"ok":false,"error":{"code":6,"kind":"output_budget","message":"response metadata exceeds output budget"}}
@@ -460,7 +491,7 @@ principal. Ajouter un cas négatif volontaire (classe `SERVER`, invalide) et
 vérifier qu'il rend bien `Unknown`, pour que le test échoue si quelqu'un fait
 disparaître la distinction.
 
-- [ ] Rouge : `go test ./internal/sqlserver -run 'TestUnknown|TestResolve' -v`.
+- [ ] Rouge : `go test ./internal/sqlserver -run 'TestUnknownIsNotDenied|TestResolveTwoPart' -v` ; attendu : 2 tests. C'est ce filtre qui a servi de démonstration : avec `TestResolve` non défini, il rendait `ok` et sortait 0.
 Comportement mesuré de `HAS_PERMS_BY_NAME`, sur SQL Server 2022 RTM-CU26 (16.0.4265.3), à respecter tel quel :
 
 | Situation | Retour | Ce que le code en conclut |
@@ -501,14 +532,14 @@ WHERE s.name=@schema AND o.name=@name;
 
 Zéro ligne ->8 `not_found_or_not_visible` par défaut. Permission connue refusée sur objet résolu ->4. Le champ NULL d'une sonde reste unknown. Ne pas exiger VIEW DEFINITION pour résoudre un objet déjà visible grâce à un autre droit.
 - [ ] Créer Q/I/S avec mots de passe transmis par le harness, pas littéraux versionnés. Appliquer les bundles exacts de la spec et des variantes metadata-only/SELECT-colonne. Sous Q, Resolve(dbo.Orders) renvoie 8 ; sous I, objet résolu ; sous I, sonde instance=Denied ; sous S=Allowed. Tester module chiffré, schéma avec DENY, objet absent et nom avec crochets.
-- [ ] Vert : `go test ./internal/sqlserver -v`, puis `go test -tags=integration ./tests/integration -run TestPermissions -v -count=1` sur les deux images.
+- [ ] Vert : `go test ./internal/sqlserver -v`, puis `go test -tags=integration ./tests/integration -run 'TestPermissions|TestEveryProbeIsWellFormed' -v -count=1` ; attendu : 2 tests ; sur les deux images.
 - [ ] Commit : `feat: resolve visible objects without inventing permission facts`.
 
 ### Tâche 9 : CLI utilisable, info et santé Query Store
 
 **Deux unités de revue successives :** 9a termine parseur/registre/main et help offline ; 9b ajoute info, health/status et les tests SQL. Faire un cycle rouge/vert et commit séparé pour chaque unité.
 
-**Fichiers :** créer `cmd/asq/main.go`, `internal/cli/parse.go`, `registry.go`, `run.go`, `parse_test.go`, `run_test.go`, `internal/diagnostics/info.go`, `health.go`, `health_test.go`, `sql/info.sql`, `sql/health.sql`, `sql/coverage.sql`, `embed.go`.
+**Fichiers :** créer `cmd/asq/main.go`, `internal/cli/parse.go`, `registry.go`, `run.go`, `parse_test.go`, `run_test.go`, `internal/diagnostics/info.go`, `health.go`, `health_test.go`, `sql/info.sql`, `sql/health.sql`, `sql/coverage.sql`, `embed.go`, `tests/integration/status_test.go`.
 
 **Interfaces :**
 
@@ -552,8 +583,32 @@ type Request struct {
 }
 ```
 
-parse.go possède les défauts de chemins : ConfigPath=filepath.Join(os.UserConfigDir(),"argosql","config.yaml"), OutDir=filepath.Join(os.UserCacheDir(),"argosql"). Différer la résolution des deux pour help ; une erreur de résolution vaut 2. Flags globaux : --ctx requis pour SQL, --db optionnel si profil renseigné, --config, --format tsv|json (tsv), --timeout 1–300 (30), --preview 0–10000 (10), --truncate 1–10000 (200), --no-truncate bool (false), --out-dir. Explicit mémorise la présence afin de refuser --no-truncate avec --truncate même égal au défaut. Les flags spécifiques sont admis uniquement sur leur commande ; hours/since/until sont mutuellement exclus selon la spec. Tester chacun des défauts/limites et les deux placements des flags. Parser à partir du registre, acceptant flags avant/après le chemin et après les positionnels ; consommer la valeur d'un flag avant de chercher un sous-chemin. Rejeter flags inconnus, doublons contradictoires, positionnels supplémentaires. Ne pas choisir une commande via un préfixe ambigu. `help --json` ne lit ni config ni connexion. Registre initial : help, info, qs status seulement.
-- [ ] Info : SERVERPROPERTY, DB_NAME, USER_NAME et compatibility_level. Health : sys.database_query_store_options ; couverture par MIN(start_time)/MAX(end_time), EXISTS runtime global. Champs dans status : desired_state, actual_state, readonly_reason, decoded reasons, capture_mode, current/max_storage_mb, retention_days, interval_minutes ; coverage : oldest/newest_interval, has_history. État OFF/ERROR n'empêche pas status de retourner 0. Le mapping des bits vient de la documentation de sys.database_query_store_options, testé sur bits connus et inconnus, et ne dépend pas de SELECT *.
+parse.go possède les défauts de chemins. `os.UserConfigDir` et `os.UserCacheDir` rendent deux valeurs, donc l'écriture imbriquée ne compile pas ; c'est justement l'erreur de résolution que le plan veut mapper vers 2 :
+
+```go
+dir, err := os.UserConfigDir()
+if err != nil { return &model.PublicError{Code: 2, Kind: "config_path", Message: "cannot resolve user config directory"} }
+req.ConfigPath = filepath.Join(dir, "argosql", "config.yaml")
+```
+
+Même forme pour OutDir avec `os.UserCacheDir`. Différer la résolution des deux pour help, qui ne doit pas échouer sur un environnement sans répertoire de configuration. Flags globaux : --ctx requis pour SQL, --db optionnel si profil renseigné, --config, --format tsv|json (tsv), --timeout 1–300 (30), --preview 0–10000 (10), --truncate 1–10000 (200), --no-truncate bool (false), --out-dir. Explicit mémorise la présence afin de refuser --no-truncate avec --truncate même égal au défaut. Les flags spécifiques sont admis uniquement sur leur commande ; hours/since/until sont mutuellement exclus selon la spec. Aucun flag par commande n'était nommé dans ce plan avant cette révision ; les voici, tirés de la spec, avec leurs bornes, à porter dans le registre au fur et à mesure des tâches 10 à 14 :
+
+| Flag | Commandes | Type et bornes | Défaut |
+| --- | --- | --- | --- |
+| `--by` | qs top | énum cpu\|duration\|reads\|executions | cpu |
+| `--aggregate` | qs top | énum total\|avg ; avg rejeté avec 2 pour executions | total |
+| `--top` | qs top, idx missing | entier 1–100 | 10 |
+| `--min-executions` | qs top | entier >= 1 | 1 |
+| `--object` | qs top | schema.name d'un module parent ; table résolue rejetée avec 2 | vide |
+| `--include-internal` | qs top | booléen | false |
+| `--hours` | qs top, qs query | entier positif, exclusif avec since/until | 24 |
+| `--since` / `--until` | qs top, qs query | RFC3339, les deux ensemble, since < until | vide |
+| `--plan-id` | plan | entier signé 64 bits positif, requis | aucun |
+| `--summary` | plan | booléen | false |
+| `--table` | idx missing | schema.name, suit le contrat de visibilité | vide |
+
+`Flag{Name,Kind string; Default any; Min,Max int64}` ne peut exprimer ni une énumération ni une exclusion mutuelle. Ajouter `Enum []string` et `ExclusiveWith []string`, et une méthode de validation qui les applique, plutôt que de disperser ces règles dans chaque commande. `Command` reçoit de même les champs que `help` doit rendre selon la spec : exemples, unités, permissions requises et versions concernées. Un registre qui ne les porte pas oblige `help` à les réinventer. Tester chacun des défauts/limites et les deux placements des flags. Parser à partir du registre, acceptant flags avant/après le chemin et après les positionnels ; consommer la valeur d'un flag avant de chercher un sous-chemin. Rejeter flags inconnus, doublons contradictoires, positionnels supplémentaires. Ne pas choisir une commande via un préfixe ambigu. `help --json` ne lit ni config ni connexion. Registre initial : help, info, qs status seulement.
+- [ ] Info : SERVERPROPERTY, DB_NAME, USER_NAME et compatibility_level. Health : sys.database_query_store_options ; couverture par MIN(start_time)/MAX(end_time) restreint aux intervalles portant réellement des lignes de runtime, EXISTS runtime global. Mesuré sur une base fraîche de 2022 : un intervalle existe déjà avec zéro ligne de runtime, si bien qu'un MIN/MAX non restreint annonce une fenêtre de couverture d'une heure alors que has_history vaut 0. Restreinte aux intervalles porteurs de lignes, la même couverture rend NULL. Retourner NULL pour oldest_interval et newest_interval quand il n'y a pas d'historique, jamais une fenêtre inventée, et tester exactement ce cas sur une base créée à l'instant. Champs dans status : desired_state, actual_state, readonly_reason, decoded reasons, capture_mode, current/max_storage_mb, retention_days, interval_minutes ; coverage : oldest/newest_interval, has_history. État OFF/ERROR n'empêche pas status de retourner 0. Le mapping des bits vient de la documentation de sys.database_query_store_options, testé sur bits connus et inconnus, et ne dépend pas de SELECT *.
 
 ```go
 if h.ReadOnlyReason == 0 {
@@ -594,7 +649,7 @@ func TestWindow(t *testing.T) {
 }
 ```
 
-- [ ] Rouge : `go test ./internal/diagnostics -run 'TestWindow|TestTop' -v`.
+- [ ] Rouge : `go test ./internal/diagnostics -run 'TestWindow|TestTopAggregation' -v` ; attendu : 2 tests.
 - [ ] Esquisse du noyau SQL, à étendre selon la prose qui suit le bloc. Adapter le nom de métrique par liste statique et jamais par texte libre. Assertion qui prouve l'extension : le jeu de colonnes rendu par `top` compte les neuf colonnes nommées plus bas, `top_2022.sql` groupe et retourne `replica_group_id`, et `top_2019.sql` retourne cette colonne en NULL typé. Un test compare la liste des colonnes du TableSpec à la liste attendue et échoue si l'une manque.
 
 ```sql
@@ -622,9 +677,9 @@ HAVING SUM(r.executions)>=@min_executions
 ORDER BY cpu_total_ms DESC,q.query_id;
 ```
 
-Étendre cette même agrégation avec duration et logical reads, pas une requête par métrique. Déclarer IDs/executions comme bigint (chaînes JSON), les métriques calculées comme float SQL (nombres JSON). Le test 2.8 utilise une tolérance absolue de 1e-9 et le total 28 une tolérance de 1e-9, jamais une comparaison textuelle du float ; le test executions=10 reste exact. Les totaux de lectures calculés à partir de moyennes sont des estimations flottantes, pas des compteurs entiers inventés. Ce choix ne change pas la préservation exacte des decimal de la base à la tâche 5. Sur 2022, grouper rs.replica_group_id à chaque étage et retourner cette colonne. 2019 retourne NULL typé pour elle. Colonnes queries : query_id, replica_group_id, executions, cpu_total_ms, cpu_avg_ms, duration_total_ms, duration_avg_ms, reads_total, reads_avg ; pas de texte intégral dans le classement. Contrôle parent_module via Resolve et type avant exécution.
+Étendre cette même agrégation avec duration et logical reads, pas une requête par métrique. Déclarer IDs/executions comme bigint (chaînes JSON), les métriques calculées comme float SQL (nombres JSON). Le test 2.8 utilise une tolérance absolue de 1e-9 et le total 28 une tolérance de 1e-9, jamais une comparaison textuelle du float ; le test executions=10 reste exact. Les totaux de lectures calculés à partir de moyennes sont des estimations flottantes, pas des compteurs entiers inventés. Ce choix ne change pas la préservation exacte des decimal de la base à la tâche 5. Sur 2022, grouper rs.replica_group_id à chaque étage, le porter dans le GROUP BY final et dans le départage de l'ORDER BY, et retourner cette colonne. 2019 retourne NULL typé pour elle. Le bloc esquissé plus haut finit sur `GROUP BY q.query_id` et `ORDER BY cpu_total_ms DESC, q.query_id` : c'est la forme 2019, et la recopier telle quelle dans top_2022.sql perd le classement par réplique que la spec impose. Colonnes queries : query_id, replica_group_id, executions, cpu_total_ms, cpu_avg_ms, duration_total_ms, duration_avg_ms, reads_total, reads_avg ; pas de texte intégral dans le classement. Contrôle parent_module via Resolve et type avant exécution.
 - [ ] Réutiliser ReadHealth. Dans état non collectant sans historique ->4, sinon fenêtre sans correspondance ->table vide 0. Ajouter warnings capture/coverage sans prétendre exhaustivité. Vérifier `executions/avg` refusé avant connexion.
-- [ ] Vert : fixtures SQL synthétiques dans tables temporaires de test pour vérifier le noyau d'agrégation (ne pas écrire dans les catalogues), puis charge réelle Query Store. Le test synthétique remplace uniquement la source de données du noyau SQL ; les attentes sont numériques fixes. Sur charge réelle, découvrir les IDs via marqueur unique et attendre/forcer le flush avec l'admin. `go test -tags=integration ./tests/integration -run TestTop -v -count=1` sur 2019/2022.
+- [ ] Vert : fixtures SQL synthétiques dans tables temporaires de test pour vérifier le noyau d'agrégation (ne pas écrire dans les catalogues), puis charge réelle Query Store. Le test synthétique remplace uniquement la source de données du noyau SQL ; les attentes sont numériques fixes. Sur charge réelle, découvrir les IDs via marqueur unique et attendre/forcer le flush avec l'admin. `go test -tags=integration ./tests/integration -run TestTop -v -count=1` ; attendu : 1 test ; sur 2019/2022.
 - [ ] Commit : `feat: rank Query Store workloads with weighted metrics`.
 
 ### Tâche 11 : détail query_id et export texte
@@ -647,7 +702,7 @@ func TestQueryExport(t *testing.T) {
 }
 ```
 
-- [ ] Rouge : `go test -tags=integration ./tests/integration -run TestQueryExport -v -count=1`.
+- [ ] Rouge : `go test -tags=integration ./tests/integration -run TestQueryExport -v -count=1` ; attendu : 1 test.
 - [ ] Chercher q/query_text avec LEFT JOIN facultatif pour le module ; query : query_id, object_id, parent_module nullable, is_internal_query, query_hash, text_preview, text_artifact. File export `.sql` complet via Sink.File. Plans : plan_id, replica_group_id, forced, executions et mêmes totaux/moyennes que top. LEFT JOIN des agrégats vers les plans : un plan sans runtime garde zero/null. L'identité interne reste accessible par ID. Ne pas limiter les plans à ceux forcés.
 
 ```sql
@@ -668,6 +723,11 @@ WHERE q.query_id=@id;
 
 ```go
 // plan
+// Sink.File attend un io.Reader et NormalizeXML écrit dans un io.Writer : les
+// brancher directement rend une goroutine et un tuyau nécessaires, exactement
+// l'incompatibilité push/pull que la relecture précédente avait corrigée
+// ailleurs sans l'atteindre ici. Normaliser vers un fichier temporaire du store,
+// puis passer ce fichier ouvert à Sink.File. Aucune goroutine.
 func NormalizeXML(src io.Reader,dst io.Writer) (normalized bool,err error)
 func Summarize(src io.Reader,dst model.Sink) error
 // diagnostics
@@ -719,7 +779,7 @@ func TestEncryptedModule(t *testing.T) {
 }
 ```
 
-- [ ] Rouge : tests unitaires et `go test -tags=integration ./tests/integration -run 'TestEncryptedModule|TestObjects|TestSize' -v -count=1`.
+- [ ] Rouge : tests unitaires et `go test -tags=integration ./tests/integration -run 'TestEncryptedModule|TestObjects|TestSize' -v -count=1` ; attendu : 3 tests.
 - [ ] Schémas de sortie : table(object_id,schema,name,rows nullable) ; columns(ordinal,name,type,max_length,precision,scale,nullable,identity,computed,default_definition,computed_definition) ; indexes(index_id,name,type,keys,includes,filter,unique,disabled) ; module(object_id,name,type,definition_state,line_count,artifact) ; allocations(index_id,partition_number,allocation_type,used_pages,reserved_pages,used_bytes,reserved_bytes). Pour colonnes Unicode longueur SQL en octets signalée explicitement ou convertie en caractères dans un champ distinct ; `max_length=-1` reste max.
 - [ ] SQL jointures par IDs, préagréger colonnes de clés/inclusions avant jointure aux index ; ordre key_ordinal et index_column_id ; échapper leurs libellés dans la sortie, jamais concaténer comme SQL exécutable. Module via sys.sql_modules et OBJECTPROPERTYEX(IsEncrypted) lorsque visible : appliquer tous les états de la spec sans transformer NULL en texte vide.
 - [ ] Taille :
@@ -752,7 +812,7 @@ func TestPartialStatistics(t *testing.T) {
 }
 ```
 
-- [ ] Rouge : `go test -tags=integration ./tests/integration -run 'TestPartialStatistics|TestIndexDMV' -v -count=1`.
+- [ ] Rouge : `go test -tags=integration ./tests/integration -run 'TestPartialStatistics|TestIndexDMV' -v -count=1` ; attendu : 2 tests.
 - [ ] Usage part de sys.indexes LEFT JOIN usage filtré database_id ; colonnes index_id,name,seeks,scans,lookups,updates,last_seek,last_scan,last_lookup,last_update,observation_status. Compteurs NULL si aucune ligne DMV, pas 0 inventé. Ajouter contexte server_start_time et avertissement reset ; jamais verdict unused.
 - [ ] Missing :
 
@@ -806,8 +866,8 @@ func TestPrincipalMatrix(t *testing.T) {
 ```
 
 Ajouter chaque commande de la matrice avec IDs découverts, pas codés en dur. help est lancé sans Lab.Run et sans environnement SQL. Admin tente DML/DDL/EXEC sous chaque principal et vérifie les refus sans exposer ces opérations au binaire.
-- [ ] Rouge : `go test -tags=integration ./tests/integration -run 'TestPrincipalMatrix|TestWorkflow|TestExports|TestErrors' -v -count=1`.
-- [ ] Rejouer le workflow complet en CLI, lire les artefacts réels et JSON. Configurer les états Query Store dans des bases fixture séparées ; ERROR et propriétés inconnues via backend de test, pas corruption de base. Comparer exports SQL/XML aux valeurs UTF-8 retournées via admin ; assertions sur octets complets et non sur seules tailles.
+- [ ] Rouge : `go test -tags=integration ./tests/integration -run 'TestPrincipalMatrix|TestWorkflow|TestExports|TestErrors' -v -count=1` ; attendu : 4 tests.
+- [ ] Rejouer le workflow complet en CLI, lire les artefacts réels et JSON. Configurer les états Query Store dans des bases fixture séparées. Mesuré : sur 2022, `CREATE DATABASE` seul donne déjà `actual_state_desc = READ_WRITE`, Query Store étant actif par défaut sur les bases utilisateur, ce qui n'est pas le cas sur 2019. Une fixture d'état OFF doit donc le désactiver explicitement sur 2022 ; une fixture qui se contente de créer la base y teste l'état READ_WRITE en croyant tester OFF. Écrire la désactivation sans condition de version, elle est inoffensive sur 2019. ERROR et propriétés inconnues via backend de test, pas corruption de base. Comparer exports SQL/XML aux valeurs UTF-8 retournées via admin ; assertions sur octets complets et non sur seules tailles.
 - [ ] Ajouter injections d'erreur déterministes dans les tests de sortie/collecteur : échec à la Nième écriture, manifeste trop long, dépassement pendant le deuxième fichier, lecture SQL interrompue après N lignes, invalid XML après export. Résultat JSON toujours syntaxiquement complet tant que stdout fonctionne. Un pipe stdout fermé peut empêcher toute réponse complète : constater l'échec d'écriture sans prétendre le contraire.
 
 ```go
@@ -923,6 +983,58 @@ utilisable et `SET LOCK_TIMEOUT 5000` persiste sur la même session ; les noms d
 paramètres du DSN sont bien lus par go-mssqldb v1.11.0 et le moteur rapporte
 `encrypt_option=TRUE` ; `INTERVAL_LENGTH_MINUTES = 1` est accepté. Les points 1
 et 2 ci-dessus ont été mesurés avant d'être écrits, pas déduits du rapport.
+
+### Troisième lecteur, rendu après les six corrections ci-dessus
+
+Le Claude neuf sur le prompt neutre a rendu environ trois fois ce que les deux
+agy avaient produit, avec neuf trouvailles vérifiées en exécutant. Toutes
+appliquées, plus les trous d'attribution qu'il signalait en lecture.
+
+Trous d'attribution, la catégorie la plus chère parce qu'un implémenteur comble
+un trou en inventant et que ses tests passent :
+
+- Le convertisseur des valeurs du pilote vers `model.Cell` n'appartenait à
+  aucune tâche et n'était dans aucune carte de fichiers, alors que les quatorze
+  diagnostics en dépendent et que `decimal`, `money`, `varbinary` et
+  `uniqueidentifier` arrivent tous en `[]uint8`. Attribué à la tâche 5,
+  `internal/output/scan.go`.
+- `Cell` n'avait pas de `MarshalJSON`, donc se sérialisait en objet plutôt qu'en
+  valeur nue positionnelle. Attribué à la tâche 1.
+- Aucun flag par commande n'était nommé nulle part. Table complète ajoutée à la
+  tâche 9, avec les bornes de la spec, et `Flag` étendu pour porter énumérations
+  et exclusions mutuelles qu'il ne pouvait pas exprimer.
+- `PreviewOptions` n'atteignait pas le collecteur à qui la tâche 7 confiait la
+  construction des candidats, alors que la même tâche interdisait de changer les
+  signatures. La responsabilité passe entièrement à `Render`.
+
+Défauts mesurés sur le moteur ou le pilote :
+
+- `ResetSession` ne se déclenche pas à la remise au pool mais à l'acquisition
+  suivante ; l'étape de la tâche 3 observait 5000 là où elle annonçait -1.
+- `ca_file` : le pilote dispatche sur l'extension, donc un `.crt` valide donnait
+  un code 3 à la connexion là où la spec exige 2 avant connexion, et
+  `AppendCertsFromPEM` voit sa valeur de retour ignorée par le pilote.
+- Un `go test -run` dont le filtre ne matche rien rend `ok` et sort 0. Chaque
+  commande de test porte désormais le nombre de tests attendu.
+- La couverture de `qs status` annonçait une fenêtre sur une base sans
+  historique, un intervalle vide existant dès la création.
+- Query Store est actif par défaut sur les bases utilisateur de 2022, ce qui
+  rendait muettes les fixtures d'état OFF de la tâche 15.
+- `go.yaml.in/yaml/v4` n'existe qu'en `v4.0.0-rc.6` : la décision réelle est de
+  figer une pré-version.
+- L'enveloppe d'erreur fixe de la tâche 7 ne pouvait pas sortir de
+  `model.Result`. Type dédié `model.FallbackError` ajouté à la tâche 1.
+- `NormalizeXML` écrit dans un `io.Writer` quand `Sink.File` attend un
+  `io.Reader` : la même incompatibilité push/pull que la relecture précédente
+  avait corrigée ailleurs sans atteindre cet endroit.
+
+Deux enseignements de méthode, notés parce qu'ils se reproduiront. Le lecteur
+directif avait classé le test `ResetSession` de la tâche 3 en « pas un
+problème » : sa conclusion était juste et son mécanisme faux, et c'est le
+mécanisme que le plan décrivait. Un prompt qui nomme les suspects fait répondre
+à une question étroite et bénir ce qui l'entoure. Et le lecteur neutre le plus
+fort a trouvé seul plus que les deux autres réunis : dépenser sur un lecteur de
+plus avant de dépenser sur de meilleures questions.
 
 Les corrections ci-dessus n'ont pas été relues à leur tour. C'est la même
 exposition que celle qui a produit les trouvailles 4 et 5.
