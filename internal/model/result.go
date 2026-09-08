@@ -1,22 +1,20 @@
 package model
 
 import (
-	"encoding/json"
 	"io"
 	"time"
 )
 
 // Cell holds one output value: nil, string, bool, int64, float64, or the
 // exact SQL text as string when no narrower Go type applies.
-type Cell struct{ Value any }
-
-// MarshalJSON encodes the naked value, never an object. Without this method
-// Cell{Value:"abc"} serializes as {"Value":"abc"}, which is neither
-// positional nor snake_case: a row must be an array of naked values.
-// Measured; this belongs to task 1, not task 5.
-func (c Cell) MarshalJSON() ([]byte, error) {
-	return json.Marshal(c.Value)
-}
+//
+// It is a bare interface type and not a struct wrapping one field, because a
+// struct needs a MarshalJSON method to serialize as a naked value instead of
+// {"Value":"abc"}, and a bare type needs nothing: encoding/json renders the
+// dynamic value directly, so a row is an array of naked values for free.
+// Measured byte-identical to the struct-plus-marshaller form. Consumers
+// type-switch on a Cell directly rather than on a field of it.
+type Cell any
 
 // Closed vocabulary of reduction reasons. Any other value is a defect.
 const (

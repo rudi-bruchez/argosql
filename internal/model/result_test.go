@@ -20,7 +20,7 @@ func TestResultJSONSnakeCaseAndPositionalCells(t *testing.T) {
 			{
 				Spec: TableSpec{Name: "t", Columns: []Column{{Name: "a", SQLType: "int"}}},
 				Rows: [][]Cell{
-					{{Value: "abc"}, {Value: int64(42)}, {Value: nil}, {Value: true}, {Value: 3.5}},
+					{"abc", int64(42), nil, true, 3.5},
 				},
 				State: Completeness{RowsCollected: 7, CollectionComplete: true, PropertiesComplete: true},
 			},
@@ -39,11 +39,10 @@ func TestResultJSONSnakeCaseAndPositionalCells(t *testing.T) {
 		}
 	}
 
-	// A row is an array of naked values, never an array of {"Value":...} objects.
+	// A row is an array of naked values in column order. This is the whole
+	// reason Cell is a bare type: the assertion below fails for any shape
+	// that wraps a value in an object or reorders the row.
 	if !strings.Contains(got, `["abc",42,null,true,3.5]`) {
 		t.Fatalf("expected positional row encoding, got %s", got)
-	}
-	if strings.Contains(got, `"Value"`) {
-		t.Fatalf("Cell must not serialize as an object: %s", got)
 	}
 }

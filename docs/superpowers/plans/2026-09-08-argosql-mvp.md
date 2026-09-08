@@ -61,10 +61,11 @@ Tous les fichiers listés sont à créer sauf README.md et .gitignore. Les tests
 
 ```go
 // internal/model : champs exportés sérialisés en snake_case.
-type Cell struct { Value any } // nil, string, bool, int64, float64 ; SQL exact en string si nécessaire
-// Sans cette méthode, Cell se sérialise en {"Value":"abc"} : ni positionnel, ni
-// snake_case. Mesuré. Elle appartient à la tâche 1, pas à la tâche 5.
-func (c Cell) MarshalJSON() ([]byte, error) // encode la valeur nue, jamais un objet
+type Cell any // nil, string, bool, int64, float64 ; SQL exact en string si nécessaire
+// Type nu et non struct à un champ : une struct exige un MarshalJSON pour se
+// sérialiser en valeur nue plutôt qu'en {"Value":"abc"}, un type nu n'exige
+// rien. Mesuré identique octet pour octet. Les consommateurs font leur
+// type-switch sur la Cell elle-même, pas sur un champ de la Cell.
 // Vocabulaire fermé des raisons de réduction. Toute autre valeur est un défaut.
 const (
     ReasonPreviewOmitted     = "preview_omitted"     // cellule trop grosse pour le budget
