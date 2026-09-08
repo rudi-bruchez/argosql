@@ -105,7 +105,7 @@ func TestOpenMajorVersion(t *testing.T) {
 		{major: 18, wantErr: true},
 	}
 	for _, tc := range cases {
-		db, _ := newFakeDB(fakeOptions{major: tc.major})
+		db, events := newFakeDB(fakeOptions{major: tc.major})
 		s, err := open(context.Background(), db)
 		if tc.wantErr {
 			if err == nil {
@@ -119,6 +119,11 @@ func TestOpenMajorVersion(t *testing.T) {
 			if public.Code != 4 {
 				t.Fatalf("major %d: got code %d, want 4", tc.major, public.Code)
 			}
+			// The rejection happens after the connection is acquired
+			// (lines 111-118 in session.go): open must still close
+			// both Conn and the pool on this path, not just return
+			// the right code.
+			assertNoConnectionLeak(t, events)
 			continue
 		}
 		if err != nil {
@@ -164,7 +169,7 @@ func TestOpenConnectTimeout(t *testing.T) {
 // global context, not connectCtx) is done, and open must map the resulting
 // context error to a code 5 execution error, not code 3.
 func TestOpenExecutionTimeout(t *testing.T) {
-	db, _ := newFakeDB(fakeOptions{major: 16, execBlocks: true})
+	db, events := newFakeDB(fakeOptions{major: 16, execBlocks: true})
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
 
@@ -180,6 +185,7 @@ func TestOpenExecutionTimeout(t *testing.T) {
 	if public.Code != 5 {
 		t.Fatalf("got code %d, want 5", public.Code)
 	}
+	assertNoConnectionLeak(t, events)
 }
 
 // TestOpenContextAlreadyCanceled proves open fails fast, at code 3, when
@@ -210,7 +216,7 @@ func TestOpenContextAlreadyCanceled(t *testing.T) {
 // into the message.
 func TestOpenSetupError(t *testing.T) {
 	t.Run("permission", func(t *testing.T) {
-		db, _ := newFakeDB(fakeOptions{major: 16, execErr: sqlError(229, "the server would say something here")})
+		db, events := newFakeDB(fakeOptions{major: 16, execErr: sqlError(229, "the server would say something here")})
 		s, err := open(context.Background(), db)
 		if err == nil {
 			s.Close()
@@ -229,10 +235,13 @@ func TestOpenSetupError(t *testing.T) {
 		if public.SQLNumber != 229 {
 			t.Fatalf("got SQLNumber %d, want 229", public.SQLNumber)
 		}
+		// setupSession's error branch (lines 91-95 in session.go) must
+		// close Conn and the pool, not just propagate the error.
+		assertNoConnectionLeak(t, events)
 	})
 
 	t.Run("other execution error", func(t *testing.T) {
-		db, _ := newFakeDB(fakeOptions{major: 16, execErr: sqlError(50000, "the server would say something here too")})
+		db, events := newFakeDB(fakeOptions{major: 16, execErr: sqlError(50000, "the server would say something here too")})
 		s, err := open(context.Background(), db)
 		if err == nil {
 			s.Close()
@@ -248,7 +257,64 @@ func TestOpenSetupError(t *testing.T) {
 		if public.SQLNumber != 50000 {
 			t.Fatalf("got SQLNumber %d, want 50000", public.SQLNumber)
 		}
+		assertNoConnectionLeak(t, events)
 	})
+}
+
+// TestOpenLockTimeoutMismatch exercises the branch a naive fake driver
+// hid: setupSession's mismatch check (session.go, "if value != 5000")
+// fires when the value read back genuinely differs from the value that
+// was set, not when the fake driver just always answers a fixed number.
+// SET LOCK_TIMEOUT 5000 succeeds and is honestly recorded by the fake
+// driver as 5000, but the read-back is overridden to -1, simulating a
+// session setting that silently did not take effect on the server - the
+// one case this check exists to catch.
+func TestOpenLockTimeoutMismatch(t *testing.T) {
+	override := -1
+	db, events := newFakeDB(fakeOptions{major: 16, lockTimeoutOverride: &override})
+	s, err := open(context.Background(), db)
+	if err == nil {
+		s.Close()
+		t.Fatal("expected an error, got none")
+	}
+	var public *model.PublicError
+	if !errors.As(err, &public) {
+		t.Fatalf("error is not a *model.PublicError: %v", err)
+	}
+	if public.Code != 5 {
+		t.Fatalf("got code %d, want 5", public.Code)
+	}
+	if public.Kind != "execution" {
+		t.Fatalf("got kind %q, want execution", public.Kind)
+	}
+	if got := countEvent(events, "exec:set-lock-timeout"); got != 1 {
+		t.Fatalf("got %d SET LOCK_TIMEOUT execs, want 1: the mismatch must be caught after a real SET, not instead of one", got)
+	}
+	assertNoConnectionLeak(t, events)
+}
+
+// TestOpenVersionQueryError covers fetchMajorVersion's own error branch
+// (session.go lines 99-102): a driver failure reading SERVERPROPERTY,
+// distinct from setup succeeding and the version simply being
+// unsupported, must also close Conn and the pool.
+func TestOpenVersionQueryError(t *testing.T) {
+	db, events := newFakeDB(fakeOptions{major: 16, majorErr: sqlError(4060, "cannot open database")})
+	s, err := open(context.Background(), db)
+	if err == nil {
+		s.Close()
+		t.Fatal("expected an error, got none")
+	}
+	var public *model.PublicError
+	if !errors.As(err, &public) {
+		t.Fatalf("error is not a *model.PublicError: %v", err)
+	}
+	if public.Code != 5 {
+		t.Fatalf("got code %d, want 5", public.Code)
+	}
+	if public.SQLNumber != 4060 {
+		t.Fatalf("got SQLNumber %d, want 4060", public.SQLNumber)
+	}
+	assertNoConnectionLeak(t, events)
 }
 
 // TestCloseIdempotent proves a second Close, or a Close on a Session that
