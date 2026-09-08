@@ -1,5 +1,12 @@
 # Relecture croisée de la spec MVP argosql
 
+Note de suivi du 8 septembre 2026 : ce rapport conserve les observations et
+propositions historiques. La [spec corrigée](2026-09-08-argosql-mvp-design.md)
+porte les contrats applicables, notamment le choix utilisateur de
+`TrustServerCertificate=true` par défaut. Les conclusions sur le GROUP BY,
+la mémoire du parseur et le plafond de collecte y ont été nuancées. Cette
+mise à jour documentaire ne constitue pas une nouvelle exécution des expériences.
+
 Document relu : `2026-09-08-argosql-mvp-design.md`, à son état initial, avant
 toute implémentation.
 
