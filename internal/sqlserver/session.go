@@ -168,18 +168,17 @@ func classifySQLError(err error, message string) error {
 // calling it more than once, or on a Session left partially closed by a
 // failed Open, never errors or panics.
 func (s *Session) Close() error {
-	var errs []error
+	// errors.Join drops nil arguments, so the two closes need no slice and
+	// no append: a successful close contributes nothing to the result, and
+	// both failing yields both errors.
+	var connErr, dbErr error
 	if s.Conn != nil {
-		if err := s.Conn.Close(); err != nil {
-			errs = append(errs, err)
-		}
+		connErr = s.Conn.Close()
 		s.Conn = nil
 	}
 	if s.db != nil {
-		if err := s.db.Close(); err != nil {
-			errs = append(errs, err)
-		}
+		dbErr = s.db.Close()
 		s.db = nil
 	}
-	return errors.Join(errs...)
+	return errors.Join(connErr, dbErr)
 }

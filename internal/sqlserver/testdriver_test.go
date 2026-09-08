@@ -37,6 +37,7 @@ type fakeConn struct {
 
 	execErr    error // returned by ExecContext for the SET LOCK_TIMEOUT statement
 	execBlocks bool  // ExecContext blocks on ctx.Done() instead of answering
+	closeErr   error // returned by Close, to prove Session.Close surfaces it
 }
 
 func (c *fakeConn) log(event string) {
@@ -51,7 +52,7 @@ func (c *fakeConn) Prepare(query string) (driver.Stmt, error) {
 
 func (c *fakeConn) Close() error {
 	c.log("close")
-	return nil
+	return c.closeErr
 }
 
 func (c *fakeConn) Begin() (driver.Tx, error) {
@@ -193,6 +194,7 @@ type fakeOptions struct {
 	lockTimeoutOverride *int
 	execErr             error
 	execBlocks          bool
+	closeErr            error
 	connectErr          error
 	connectBlocks       bool
 }
@@ -208,6 +210,7 @@ func newFakeDB(opts fakeOptions) (*sql.DB, *[]string) {
 		lockTimeoutOverride: opts.lockTimeoutOverride,
 		execErr:             opts.execErr,
 		execBlocks:          opts.execBlocks,
+		closeErr:            opts.closeErr,
 	}
 	connector := &fakeConnector{
 		conn:          conn,

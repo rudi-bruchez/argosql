@@ -319,6 +319,35 @@ func TestOpenVersionQueryError(t *testing.T) {
 
 // TestCloseIdempotent proves a second Close, or a Close on a Session that
 // never fully opened, neither errors nor panics.
+// TestCloseSurfacesDriverError covers the one thing TestCloseIdempotent does
+// not: that Close reports a failure instead of swallowing it. Measured by an
+// external reviewer, whose eleven deliberate breaks found exactly this one
+// uncovered: dropping the error aggregation from Close left the whole suite
+// green. An operator whose connection failed to close would be told the run
+// ended cleanly.
+func TestCloseSurfacesDriverError(t *testing.T) {
+	boom := errors.New("driver refused to close")
+	db, _ := newFakeDB(fakeOptions{major: 16, closeErr: boom})
+	s, err := open(context.Background(), db)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	err = s.Close()
+	if err == nil {
+		t.Fatal("Close must report a driver close failure, not swallow it")
+	}
+	if !errors.Is(err, boom) {
+		t.Fatalf("Close must surface the driver's own error, got %v", err)
+	}
+	// Still idempotent, and still leaves nothing behind, even on this path.
+	if s.Conn != nil || s.db != nil {
+		t.Fatal("Close must leave Conn and db nil even when the driver errors")
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("second Close after a failed first: %v", err)
+	}
+}
+
 func TestCloseIdempotent(t *testing.T) {
 	s, _ := openRecordedSession(t)
 	if err := s.Close(); err != nil {
