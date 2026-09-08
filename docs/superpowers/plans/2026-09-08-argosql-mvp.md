@@ -29,6 +29,8 @@
 
 Exécuter les tâches dans l'ordre. Chaque tâche a un cycle rouge/vert et une sortie vérifiable ; ne pas publier ni déployer à la fin. À l'exécution, utiliser le skill de worktree pour isoler le code si nécessaire et y transporter explicitement la spec/ce plan, y compris leurs modifications non committées. Ne pas créer maintenant de worktree pour cette seule rédaction.
 
+Les blocs SQL de ce plan sont des esquisses du noyau, jamais le contenu final d'un fichier `.sql`. La prose qui suit chaque bloc est normative et l'étend : colonnes supplémentaires, variante par version du moteur, jointures de noms. Un implémenteur qui colle le bloc dans le fichier et écrit ses tests à partir du même bloc obtient une suite verte qui a perdu l'exigence. Chaque tâche portant un bloc SQL nomme ci-dessous l'assertion qui prouve que l'extension est présente. Un panel de relecture a produit trois faux positifs sur ce seul motif : la lecture verbatim du bloc est la lecture naturelle, c'est pourquoi elle est interdite ici explicitement.
+
 Les blocs de tests sont des cas directeurs à placer dans les fichiers indiqués, dans le package concerné, avec les imports standard nécessaires. Les listes de cas adjacentes sont également obligatoires. Les blocs d'algorithme ne dispensent pas des contrats de la spec. Les commandes de test doivent d'abord échouer pour la raison attendue, puis réussir après implémentation ; une erreur de compilation sur un nouveau symbole est un rouge d'introduction acceptable ; un échec d'installation ou d'environnement n'est pas un rouge fonctionnel.
 
 Après chaque tâche validée : inspecter le diff, ajouter uniquement les fichiers de cette tâche et créer un commit avec le message proposé. Commandes : `git add -- <chemins de la tâche>` puis `git commit -m '<message proposé>'`. Ne jamais utiliser `git add .` pour absorber les fichiers de l'utilisateur. Un point de revue suit chaque tranche.
@@ -61,15 +63,26 @@ type Cell struct { Value any } // nil, string, bool, int64, float64 ; SQL exact 
 type Column struct { Name, SQLType string }
 type TableSpec struct { Name string; Columns []Column }
 type Notice struct { Kind, Message, Table string }
+// Completeness ne décrit que la collecte. Le collecteur la remplit et c'est
+// elle, et elle seule, que le manifeste sérialise.
 type Completeness struct {
-    RowsCollected, RowsShown int64
-    CollectionComplete, PreviewComplete, PropertiesComplete bool
+    RowsCollected int64
+    CollectionComplete, PropertiesComplete bool
+}
+// PreviewState ne décrit que l'aperçu. Render la remplit sur sa copie du
+// résultat. Le collecteur ne l'écrit jamais et le manifeste ne la contient
+// jamais : un manifeste qui porterait rows_shown=0 promettrait faussement
+// qu'aucune ligne n'a été affichée.
+type PreviewState struct {
+    RowsShown int64
+    PreviewComplete bool
     OmittedReasons []string
 }
 type TableResult struct {
     Spec TableSpec
     Rows [][]Cell // aperçu seulement, jamais la collecte entière
     State Completeness
+    Preview PreviewState
 }
 type Artifact struct { Kind, Path string; Bytes int64; Complete bool }
 type ContextInfo struct {
@@ -344,7 +357,7 @@ func TestRowLimit(t *testing.T) {
 ```
 
 - [ ] Rouge : `go test ./internal/artifacts -v`.
-- [ ] Store crée un sous-répertoire d'invocation unique, fichiers générés via O_EXCL, répertoires 0700/fichiers 0600 sous Unix. Quota global inclut tous les fichiers, manifeste et fichiers temporaires conservés. Réserver 64 KiB pour le manifeste ; si celui-ci réclame davantage, retirer uniquement les fichiers temporaires non finalisés créés par ce run avant la fin, jamais les artefacts déjà complets ou échouer 6 sans prétendre complet. Manifestes n'embarquent ni valeurs SQL ni liste illimitée de warnings.
+- [ ] Store crée un sous-répertoire d'invocation unique, fichiers générés via O_EXCL, répertoires 0700/fichiers 0600 sous Unix. Quota global inclut tous les fichiers, manifeste et fichiers temporaires conservés. Réserver 64 KiB pour le manifeste ; si celui-ci réclame davantage, retirer uniquement les fichiers temporaires non finalisés créés par ce run avant la fin, jamais les artefacts déjà complets ou échouer 6 sans prétendre complet. Manifestes n'embarquent ni valeurs SQL ni liste illimitée de warnings. Le manifeste sérialise `model.Completeness` et jamais `model.PreviewState` : au moment où le collecteur écrit, l'aperçu n'a pas encore été calculé, et sérialiser ses champs à zéro affirmerait qu'aucune ligne n'a été affichée. Un test lit le manifeste produit et échoue s'il contient les clés `rows_shown`, `preview_complete` ou `omitted_reasons`.
 
 ```go
 // Un objet source indivisible est copié avec une sentinelle de dépassement.
@@ -362,7 +375,9 @@ Pour une table interrompue, fermer proprement le JSON/TSV des lignes acceptées 
 
 **Interfaces :** `PreviewOptions{Rows int; CellLimit int; NoTruncate bool; ByteLimit int}` ; `Render(result model.Result, options PreviewOptions, format string) ([]byte,error)`.
 
-Le collecteur garde sur disque les données complètes. La tâche 5 fournit NewTableDecoder/Next pour la seconde lecture ; ne pas introduire un format privé supplémentaire. Il construit les candidats d'aperçu lors d'une seconde lecture des artefacts : au plus le nombre demandé et les octets potentiellement affichables, pas 10,000 cellules de 100 MiB en RAM. Le renderer mesure les octets réellement encodés. Le collecteur fixe rows_collected, collection_complete et properties_complete. Render travaille sur une copie du résultat, calcule rows_shown/preview_complete et les raisons de réduction, puis sérialise cette copie ; le manifeste contient les compteurs de collecte, pas une fausse promesse sur l'aperçu. Retenir au plus ByteLimit octets sérialisables par table lors de la seconde lecture ; une seule ligne en cours de décodage peut dépasser cette réserve, elle n'est alors pas retenue. L'utilisation mémoire d'une ligne décodée reste distincte de celle du fichier complet.
+Le collecteur garde sur disque les données complètes. La tâche 5 fournit NewTableDecoder/Next pour la seconde lecture ; ne pas introduire un format privé supplémentaire. Il construit les candidats d'aperçu lors d'une seconde lecture des artefacts : au plus le nombre demandé et les octets potentiellement affichables, pas 10,000 cellules de 100 MiB en RAM. Le renderer mesure les octets réellement encodés. Le collecteur fixe `model.Completeness` : rows_collected, collection_complete et properties_complete. Render travaille sur une copie du résultat, remplit `model.PreviewState` sur cette copie, puis la sérialise ; le manifeste écrit par le collecteur ne connaît pas ces champs et ne peut donc pas mentir sur l'aperçu.
+
+Réserve mémoire de la seconde lecture : au plus ByteLimit octets sérialisables retenus par table. Une ligne dont le décodage dépasse à elle seule cette réserve n'est pas écartée : elle est retenue sous forme tronquée à la réserve, avec sa raison dans omitted_reasons. Écarter la ligne transformerait `--no-truncate` sur une grosse cellule en aperçu vide, ce qui est exactement la confusion entre omis et vide que cette tâche existe pour empêcher. La première ligne candidate de chaque table non vide est toujours retenue, au moins tronquée. Le plafond d'octets de la sortie s'applique inchangé ensuite ; `--no-truncate` porte sur la troncature par runes, jamais sur le plafond. L'utilisation mémoire d'une ligne décodée reste distincte de celle du fichier complet.
 
 - [ ] Test directeur :
 
@@ -386,7 +401,7 @@ func TestOversizedCellIsNotEmpty(t *testing.T) {
 {"schema_version":1,"ok":false,"error":{"code":6,"kind":"output_budget","message":"response metadata exceeds output budget"}}
 ```
 
-- [ ] Vert : trois sections, zéro ligne demandée, marqueur littéral dans la donnée, cellules Unicode, métadonnées trop grandes, chemin trop long, erreur 7 avec artefacts partiels ; stdout JSON unique et stderr séparé. Fixture dorée pour TSV et JSON d'une même réponse.
+- [ ] Vert : trois sections, zéro ligne demandée, marqueur littéral dans la donnée, cellules Unicode, métadonnées trop grandes, chemin trop long, erreur 7 avec artefacts partiels ; stdout JSON unique et stderr séparé. Fixture dorée pour TSV et JSON d'une même réponse. Assertion explicite sur la ligne surdimensionnée : le rendu de `TestOversizedCellIsNotEmpty` porte `rows_shown` valant 1 et une cellule non vide, pas une table à zéro ligne. Un aperçu vide fait échouer ce test ; c'est le défaut que la réserve par table avait introduit.
 - [ ] Commit : `feat: bound stdout without confusing omitted and empty results`.
 
 ### Tâche 8 : résolution d'objets et capacités à trois états
@@ -399,7 +414,11 @@ func TestOversizedCellIsNotEmpty(t *testing.T) {
 type Permission int
 const (Unknown Permission = iota; Allowed; Denied)
 type Object struct { ID int64; Schema, Name, Type string }
+// Sonde niveau objet. name est déjà résolu par Resolve : voir la note mesurée.
 func Probe(ctx context.Context, conn *sql.Conn, name, class, permission string) (Permission,error)
+// Sonde niveau instance. Elle n'a pas de securable et s'écrit obligatoirement
+// HAS_PERMS_BY_NAME(NULL, NULL, @permission).
+func ServerProbe(ctx context.Context, conn *sql.Conn, permission string) (Permission,error)
 func Resolve(ctx context.Context, conn *sql.Conn, qualified string) (Object,error)
 ```
 
@@ -413,8 +432,65 @@ func TestUnknownIsNotDenied(t *testing.T) {
 }
 ```
 
+Ce test unitaire ne prouve à lui seul rien du moteur : il vérifie un
+convertisseur sur des valeurs fabriquées. Mesuré, `HAS_PERMS_BY_NAME` ne rend
+NULL que sur une sonde malformée, donc `Unknown` ne peut pas venir d'un état
+légitime du serveur. Le test qui porte la garantie est celui-ci, à écrire dans
+`tests/integration/permissions_test.go`, et il énumère les sondes que le
+registre émet réellement :
+
+```go
+func TestEveryProbeIsWellFormed(t *testing.T) {
+    // AllProbes est exporté par internal/sqlserver pour les tests : la liste
+    // exacte des couples (classe, permission) que les commandes émettent,
+    // plus les permissions instance de ServerProbe.
+    lab := NewLab(t, os.Getenv("ASQ_TEST_IMAGE"))
+    for _, pr := range sqlserver.AllProbes() {
+        got, err := pr.Run(ctx, conn, "dbo.Orders")
+        if err != nil { t.Fatalf("%s: %v", pr.Label, err) }
+        if got == sqlserver.Unknown {
+            t.Fatalf("%s rend NULL sur un serveur réel : sonde malformée", pr.Label)
+        }
+    }
+}
+```
+
+Une sonde qui rend `Unknown` ici est un défaut de code, pas un fait sur le
+principal. Ajouter un cas négatif volontaire (classe `SERVER`, invalide) et
+vérifier qu'il rend bien `Unknown`, pour que le test échoue si quelqu'un fait
+disparaître la distinction.
+
 - [ ] Rouge : `go test ./internal/sqlserver -run 'TestUnknown|TestResolve' -v`.
-- [ ] Probe lie les trois valeurs de HAS_PERMS_BY_NAME ; Resolve utilise sys.schemas JOIN sys.objects avec paramètres distincts. Décomposer les noms à deux parties en respectant les crochets et `]]`, espaces/dots à l'intérieur des identifiants ; rejeter trois parties et noms mal formés avec 2. Ne pas construire du SQL à partir d'un identifiant utilisateur.
+Comportement mesuré de `HAS_PERMS_BY_NAME`, sur SQL Server 2022 RTM-CU26 (16.0.4265.3), à respecter tel quel :
+
+| Situation | Retour | Ce que le code en conclut |
+| --- | --- | --- |
+| Objet existant, principal sans droit | `0` | Denied |
+| Objet inexistant | `0` | Denied, d'où la nécessité de résoudre d'abord |
+| Permission inconnue de SQL Server | `NULL` | sonde malformée, défaut de code |
+| Classe `'SERVER'` | `NULL` | sonde malformée, défaut de code |
+| `HAS_PERMS_BY_NAME(NULL, NULL, 'VIEW SERVER STATE')` | `1` | forme correcte au niveau instance |
+
+La fonction rend donc deux valeurs et non trois. Elle ne dit jamais « je ne peux
+pas prouver » : elle rend `NULL` uniquement quand la sonde elle-même est mal
+écrite. Le tri-état que la spec exige est porté par la résolution, pas par la
+sonde : zéro ligne dans `sys.objects` vaut `not_found_or_not_visible`, parce que
+le catalogue n'expose pas ce qui est invisible au principal. Ne pas présenter
+`Unknown` à l'utilisateur comme un fait sur ses droits ; le mapper en code 5,
+kind `probe_malformed`, et le traiter comme un défaut à corriger.
+
+Conséquence sur l'ordre des codes : puisqu'un objet inexistant sonde à `Denied`,
+l'ordre « 8 avant 4 » n'est pas une préférence de présentation. C'est la seule
+chose qui empêche l'outil de répondre « permission refusée » sur un objet qui
+n'existe pas. Écrire un test qui sonde un nom absent sans résoudre d'abord et
+constate le `0`, pour que la raison de l'ordre reste visible dans la suite.
+
+Une sonde `SELECT` au niveau OBJECT ne mesure pas non plus ce que valent les
+droits d'une commande qui lit des vues système : un principal avec un
+`GRANT SELECT` de colonne sonde à `0` sur la table. Ne pas fermer une commande
+sur cette seule base ; sonder la permission que la commande utilise réellement.
+
+- [ ] Probe rend Allowed ou Denied et traite NULL comme un défaut ; ServerProbe utilise obligatoirement la forme `(NULL, NULL, @permission)`, avec VIEW SERVER STATE sur Major=15 et VIEW SERVER PERFORMANCE STATE sur Major>=16 conformément à la spec. Resolve utilise sys.schemas JOIN sys.objects avec paramètres distincts. Décomposer les noms à deux parties en respectant les crochets et `]]`, espaces/dots à l'intérieur des identifiants ; rejeter trois parties et noms mal formés avec 2. Ne pas construire du SQL à partir d'un identifiant utilisateur.
 
 ```sql
 SELECT o.object_id, s.name, o.name, o.type
@@ -519,7 +595,7 @@ func TestWindow(t *testing.T) {
 ```
 
 - [ ] Rouge : `go test ./internal/diagnostics -run 'TestWindow|TestTop' -v`.
-- [ ] SQL de base, adapter le nom de métrique par liste statique et jamais par texte libre :
+- [ ] Esquisse du noyau SQL, à étendre selon la prose qui suit le bloc. Adapter le nom de métrique par liste statique et jamais par texte libre. Assertion qui prouve l'extension : le jeu de colonnes rendu par `top` compte les neuf colonnes nommées plus bas, `top_2022.sql` groupe et retourne `replica_group_id`, et `top_2019.sql` retourne cette colonne en NULL typé. Un test compare la liste des colonnes du TableSpec à la liste attendue et échoue si l'une manque.
 
 ```sql
 WITH runtime AS (
@@ -655,7 +731,7 @@ SELECT SUM(CASE WHEN index_id IN (0,1) THEN row_count ELSE 0 END) AS rows,
 FROM sys.dm_db_partition_stats WHERE object_id=@id;
 ```
 
-Construire allocations à partir des trois catégories de cette DMV sans jointure multiplicatrice. Rejeter memory-optimized pour Size=4 ; Table garde métadonnées et warning row_count. Tests heap, clustered+2 NC, partitions, LOB/overflow, columnstore, objet vide, DECIMAL et computed/default ; la somme des catégories égale les totaux, row_count n'est jamais la somme de tous les index.
+Ce bloc ne rend que les totaux : il est l'esquisse du noyau, pas le contenu de `size.sql`. Construire allocations à partir des trois catégories de cette DMV sans jointure multiplicatrice, avec la ventilation par index_id, partition_number et allocation_type que le schéma de sortie nomme. Assertion qui prouve l'extension : sur une table à index clusterisé, deux non clusterisés et une colonne LOB remplie, la table allocations porte plus d'une ligne, ses catégories couvrent les trois valeurs d'allocation_type rencontrées, et la somme de ses used_pages égale le total du bloc ci-dessus. Un test qui ne verrait qu'une ligne d'allocations a collé l'esquisse dans le fichier. Rejeter memory-optimized pour Size=4 ; Table garde métadonnées et warning row_count. Tests heap, clustered+2 NC, partitions, LOB/overflow, columnstore, objet vide, DECIMAL et computed/default ; la somme des catégories égale les totaux, row_count n'est jamais la somme de tous les index.
 - [ ] Vert : même matrice Q/I/S et états chiffré/invisible/absent ; taille et index testés indépendamment des presets de permissions. `go test ./...` puis intégration Objects/Size.
 - [ ] Commit : `feat: inspect object definitions index structure and allocation sizes`.
 
@@ -681,18 +757,21 @@ func TestPartialStatistics(t *testing.T) {
 - [ ] Missing :
 
 ```sql
-SELECT TOP (@top) d.index_handle,d.object_id,d.equality_columns,d.inequality_columns,
+SELECT TOP (@top) d.index_handle,d.object_id,s.name AS schema_name,o.name AS object_name,
+       d.equality_columns,d.inequality_columns,
        d.included_columns,g.user_seeks,g.user_scans,g.avg_total_user_cost,g.avg_user_impact,
        (CONVERT(float,g.user_seeks)+g.user_scans)*g.avg_total_user_cost*g.avg_user_impact/100.0 AS impact
 FROM sys.dm_db_missing_index_group_stats AS g
 JOIN sys.dm_db_missing_index_groups AS ig ON ig.index_group_handle=g.group_handle
 JOIN sys.dm_db_missing_index_details AS d ON d.index_handle=ig.index_handle
+LEFT JOIN sys.objects AS o ON o.object_id=d.object_id
+LEFT JOIN sys.schemas AS s ON s.schema_id=o.schema_id
 WHERE d.database_id=DB_ID() AND (@object_id IS NULL OR d.object_id=@object_id)
 ORDER BY impact DESC,d.index_handle;
 ```
 
-Afficher limitations et index_handle stable, pas pourcentage de couverture inventé. Fixture deuxième base avec object_id possiblement identique : aucune ligne de cette base ne doit fuiter dans le résultat.
-- [ ] Stats : sys.stats + colonnes ordonnées, OUTER APPLY des propriétés. Retourner stats_id,name,columns,rows,rows_sampled,sample_pct,last_updated,modification_counter,auto_created,user_created,filter,properties_status. NULL sample_pct si rows=0 ; last_updated=NULL avec ligne de propriétés existe reste available. Sonder SELECT seulement pour attribuer un refus connu, jamais créer un motif à partir de l'absence seule.
+Les jointures vers sys.objects et sys.schemas sont des LEFT JOIN, comme la spec l'exige : la visibilité des métadonnées ne doit pas retirer silencieusement une ligne de preuve DMV. Un principal qui voit la DMV sans voir l'objet obtient la ligne avec schema_name et object_name à NULL, jamais une ligne en moins. Tester exactement ce cas et échouer si le nombre de lignes change avec les droits de métadonnées. Afficher limitations et index_handle stable, pas pourcentage de couverture inventé. Fixture deuxième base avec object_id possiblement identique : aucune ligne de cette base ne doit fuiter dans le résultat.
+- [ ] Stats : le bloc SQL ci-dessous est l'esquisse du noyau et ne rend que six des douze colonnes attendues. L'étendre avec sys.stats_columns pour les colonnes ordonnées, et avec auto_created, user_created, filter_definition et properties_status. Assertion qui prouve l'extension : le TableSpec de `stats list` compte les douze colonnes nommées ci-dessous, et un test échoue si l'une manque. sys.stats + colonnes ordonnées, OUTER APPLY des propriétés. Retourner stats_id,name,columns,rows,rows_sampled,sample_pct,last_updated,modification_counter,auto_created,user_created,filter,properties_status. NULL sample_pct si rows=0 ; last_updated=NULL avec ligne de propriétés existe reste available. Sonder SELECT seulement pour attribuer un refus connu, jamais créer un motif à partir de l'absence seule.
 
 ```sql
 SELECT st.stats_id,st.name,p.rows,p.rows_sampled,p.last_updated,p.modification_counter
@@ -806,4 +885,44 @@ Ce plan est à exécuter par tâches avec le workflow SuperPowers choisi. La ré
 
 [Review Claude Code intégrale](2026-09-08-argosql-mvp-claude-review.md), reçue après la première rédaction. Corrections appliquées : encodeur push ; décodeur inverse attribué à la tâche 5 ; propriété des métadonnées de collecte/aperçu ; flags et chemins attribués au CLI ; mapping Major=15/16/17 explicite ; types calculés et tolérances ; Lab.Run en sous-processus uniquement ; conservation des fichiers complets ; fixtures Query Store configurées ; clarification execution_type/réplique ; sous-unités de revue 4a/4b et 9a/9b ; CI par image.
 
-Deux suggestions ne sont pas appliquées telles quelles : retenir N × colonnes × 32 KiB pourrait encore produire un gros tampon, donc la relecture conserve une réserve par table bornée et son décodeur est maintenant planifié ; aucun repli YAML automatique vers une autre API n'est ajouté. La version v4 doit être résolue et figée au début de l'exécution ; en cas d'échec de disponibilité, résoudre cette dépendance explicitement avant de coder Load. La review n'a pas été rejouée après ces corrections.
+Deux suggestions de cette première relecture ne sont pas appliquées telles quelles : retenir N × colonnes × 32 KiB pourrait encore produire un gros tampon, donc la relecture conserve une réserve par table bornée et son décodeur est maintenant planifié ; aucun repli YAML automatique vers une autre API n'est ajouté. La version v4 doit être résolue et figée au début de l'exécution ; en cas d'échec de disponibilité, résoudre cette dépendance explicitement avant de coder Load. La review n'a pas été rejouée après ces corrections.
+
+### Deuxième panel, 8 septembre 2026
+
+Trois lecteurs sur le plan corrigé, au commit 2caf0d3 : agy avec le prompt
+directif, agy avec le prompt neutre, un Claude neuf sur le prompt neutre. Kimi
+écarté, quota épuisé. Six trouvailles retenues sur dix, appliquées ci-dessus.
+
+1. Le plan fondait ses trois états de permission sur `HAS_PERMS_BY_NAME`, que la
+   spec ne nomme nulle part. Mesuré sur 2022 RTM-CU26 : la fonction rend deux
+   valeurs, pas trois, et son NULL ne signale qu'une sonde malformée. Tâche 8
+   réécrite, avec la table des retours mesurés, le mapping de `Unknown` vers un
+   défaut de code, et un test d'intégration qui énumère les sondes réellement
+   émises au lieu du test unitaire sur valeurs fabriquées, qui passait sans rien
+   vérifier.
+2. La sonde niveau instance s'écrit `(NULL, NULL, @permission)`. Avec la classe
+   `'SERVER'` elle rend NULL en permanence. `ServerProbe` ajouté.
+3. `missing.sql` ne joignait pas les noms locaux, alors que la spec impose des
+   LEFT JOIN pour que la visibilité des métadonnées ne retire pas de preuve DMV.
+4. La réserve d'octets par table de l'aperçu écartait entièrement une ligne trop
+   grosse, donc `--no-truncate` sur une grosse cellule produisait un aperçu vide.
+   La ligne est désormais retenue tronquée, avec assertion.
+5. Les compteurs d'aperçu vivaient dans la structure que le collecteur sérialise
+   avant que Render ne les calcule, donc le manifeste portait `rows_shown=0`.
+   `model.Completeness` scindée en `Completeness` et `PreviewState`.
+6. Rien ne disait que les blocs SQL du plan sont des esquisses que la prose
+   étend. Règle globale ajoutée, et une assertion par tâche concernée.
+
+Quatre trouvailles rejetées, toutes du même moule : le lecteur exécutait un bloc
+SQL verbatim, comme le prompt l'exigeait, et signalait des colonnes que la prose
+juste après ajoute. Ce moule est devenu la trouvaille 6 plutôt qu'un rejet sec.
+
+Vérifié personnellement plutôt que cru sur parole, parce que ces points portent
+la tâche 3 : `db.Conn(connectCtx)` suivi d'un cancel immédiat laisse la connexion
+utilisable et `SET LOCK_TIMEOUT 5000` persiste sur la même session ; les noms de
+paramètres du DSN sont bien lus par go-mssqldb v1.11.0 et le moteur rapporte
+`encrypt_option=TRUE` ; `INTERVAL_LENGTH_MINUTES = 1` est accepté. Les points 1
+et 2 ci-dessus ont été mesurés avant d'être écrits, pas déduits du rapport.
+
+Les corrections ci-dessus n'ont pas été relues à leur tour. C'est la même
+exposition que celle qui a produit les trouvailles 4 et 5.
