@@ -8,8 +8,10 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"math/big"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -193,5 +195,58 @@ func TestCAFileRelativeResolvedAgainstConfigDir(t *testing.T) {
 	want := filepath.Join(dir, "ca.pem")
 	if p.CAFile != want {
 		t.Fatalf("got CAFile %q want %q", p.CAFile, want)
+	}
+}
+
+// TestDSNComponents checks every component DSN is responsible for putting
+// in the connection string, not just encrypt and TrustServerCertificate as
+// TestDefaultTrust (verbatim from the brief, left untouched) does. Missing
+// database silently opens the login's default database - in practice
+// master - instead of the one the profile names; a spec violation
+// ("Never silently connect to `master`.",
+// docs/superpowers/specs/2026-09-08-argosql-mvp-design.md line 41). Missing
+// certificate silently falls back to the OS trust store for a profile that
+// named a private CA. This test builds a Profile directly (DSN takes a
+// Profile, not a loaded file) with a distinctive, distinguishable value in
+// every field, so a bug swapping two fields would also be caught. Failure
+// messages name only the mismatched component, never the assembled DSN,
+// which carries the password.
+func TestDSNComponents(t *testing.T) {
+	p := Profile{
+		Host:                   "dsn-distinctive-host.example.test",
+		Port:                   14330,
+		Database:               "dsn-distinctive-db",
+		Username:               "dsn-distinctive-user",
+		Password:               "dsn-distinctive-password",
+		CAFile:                 "/etc/argosql/dsn-distinctive-ca.pem",
+		TrustServerCertificate: false,
+	}
+	dsn, err := DSN(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if u.Scheme != "sqlserver" {
+		t.Fatalf("wrong scheme: got %q want sqlserver", u.Scheme)
+	}
+	if u.Hostname() != p.Host {
+		t.Fatalf("wrong host: got %q want %q", u.Hostname(), p.Host)
+	}
+	if u.Port() != strconv.Itoa(p.Port) {
+		t.Fatalf("wrong port: got %q want %q", u.Port(), strconv.Itoa(p.Port))
+	}
+	if u.User.Username() != p.Username {
+		t.Fatalf("wrong username: got %q want %q", u.User.Username(), p.Username)
+	}
+	q := u.Query()
+	if q.Get("database") != p.Database {
+		t.Fatalf("wrong database in DSN query: got %q want %q", q.Get("database"), p.Database)
+	}
+	if q.Get("certificate") != p.CAFile {
+		t.Fatalf("wrong certificate in DSN query: got %q want %q", q.Get("certificate"), p.CAFile)
 	}
 }

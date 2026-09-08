@@ -18,15 +18,38 @@ const defaultPort = 1433
 // Profile is a fully resolved connection profile: everything DSN needs to
 // build a SQL Server connection string, with the secret already resolved
 // from the environment. Never log or print Password; DSN itself must not be
-// printed either.
+// printed either. Profile is the only structure in this codebase carrying a
+// secret, and it crosses several packages: String, GoString, and Password's
+// json:"-" tag are defense in depth against a bare %v, %#v, or
+// json.Marshal on the struct printing it by accident.
 type Profile struct {
 	Host                   string
 	Database               string
 	Username               string
-	Password               string
+	Password               string `json:"-"`
 	CAFile                 string
 	Port                   int
 	TrustServerCertificate bool
+}
+
+// redactedPassword replaces Password in every rendering of Profile below.
+const redactedPassword = "REDACTED"
+
+// String backs %v and %+v. Value receiver, deliberately: a pointer
+// receiver here would leave fmt.Sprintf("%v", p) - as opposed to
+// fmt.Sprintf("%v", &p) - printing the raw struct, secret included, since
+// a value's method set does not include pointer-receiver methods.
+// Measured before choosing the receiver.
+func (p Profile) String() string {
+	return fmt.Sprintf("Profile{Host:%s, Database:%s, Username:%s, Password:%s, CAFile:%s, Port:%d, TrustServerCertificate:%v}",
+		p.Host, p.Database, p.Username, redactedPassword, p.CAFile, p.Port, p.TrustServerCertificate)
+}
+
+// GoString backs %#v, for the same reason and with the same value
+// receiver as String.
+func (p Profile) GoString() string {
+	return fmt.Sprintf("config.Profile{Host:%q, Database:%q, Username:%q, Password:%q, CAFile:%q, Port:%d, TrustServerCertificate:%v}",
+		p.Host, p.Database, p.Username, redactedPassword, p.CAFile, p.Port, p.TrustServerCertificate)
 }
 
 // rawProfile mirrors the YAML shape of one profile. Pointer fields
@@ -138,7 +161,15 @@ func Load(path, name, databaseOverride string, getenv func(string) string) (Prof
 		p.TrustServerCertificate = *rp.TrustServerCertificate
 	}
 
-	if rp.CAFile != nil && *rp.CAFile != "" {
+	if rp.CAFile != nil {
+		if *rp.CAFile == "" {
+			// An explicit ca_file: "" is not the same as the key being
+			// absent: an operator who wrote it believes they disabled
+			// something. Rejecting it, rather than silently treating it
+			// like the key was never there, tells them the line has no
+			// effect instead of letting them believe it does.
+			return Profile{}, configError("ca_file is present but empty: remove the key entirely to not provide a CA file")
+		}
 		caFile := *rp.CAFile
 		if !filepath.IsAbs(caFile) {
 			caFile = filepath.Join(filepath.Dir(path), caFile)

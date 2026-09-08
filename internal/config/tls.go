@@ -24,13 +24,19 @@ import (
 // fails once TLS is negotiated. This function reads and parses the file
 // itself so both cases surface as a code 2 configuration error instead.
 func validateCAFile(caFile string, trustServerCertificate bool) error {
+	// Checked before the extension: trust_server_certificate defaults to
+	// true, so most operators who hit this never wrote "true" themselves,
+	// and the message must not accuse them of a line they didn't write.
+	// Checking the contradiction first also means a ca_file with both a
+	// wrong extension and no trust_server_certificate: false gets one
+	// actionable error instead of two round trips.
+	if trustServerCertificate {
+		return configError("ca_file requires trust_server_certificate: false; trust_server_certificate is true by default, and under it the certificate is never validated")
+	}
+
 	ext := strings.ToLower(filepath.Ext(caFile))
 	if ext != ".pem" && ext != ".der" {
 		return configError(fmt.Sprintf("ca_file must have extension .pem or .der, got %q", ext))
-	}
-
-	if trustServerCertificate {
-		return configError("ca_file is set but trust_server_certificate is true: the certificate would never be validated")
 	}
 
 	data, err := os.ReadFile(caFile)
