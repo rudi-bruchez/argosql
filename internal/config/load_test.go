@@ -126,8 +126,8 @@ func TestEmptyDatabaseRejected(t *testing.T) {
 	publicErrorCode(t, err, 2)
 }
 
-// TestMissingUsernameRejected and TestMissingPasswordEnvRejected check the
-// two mandatory identity fields the brief calls out by name.
+// TestMissingUsernameRejected and TestMissingPasswordEnvKeyRejected check
+// the two mandatory identity fields the brief calls out by name.
 func TestMissingUsernameRejected(t *testing.T) {
 	path := writeConfig(t, "profiles:\n  lab:\n    host: localhost\n    database: AppDB\n"+
 		"    password_env: DB_PASSWORD\n")
@@ -135,11 +135,34 @@ func TestMissingUsernameRejected(t *testing.T) {
 	publicErrorCode(t, err, 2)
 }
 
-func TestMissingPasswordEnvRejected(t *testing.T) {
+// TestMissingPasswordEnvKeyRejected covers the password_env *key* being
+// absent from the YAML profile. Distinct from
+// TestPasswordEnvVariableUndefinedRejected below, where the key is present
+// but the environment variable it names is not set.
+func TestMissingPasswordEnvKeyRejected(t *testing.T) {
 	path := writeConfig(t, "profiles:\n  lab:\n    host: localhost\n    database: AppDB\n"+
 		"    username: reader\n")
 	_, err := Load(path, "lab", "", func(string) string { return "secret" })
 	publicErrorCode(t, err, 2)
+}
+
+// TestPasswordEnvVariableUndefinedRejected covers the password_env key
+// being present and naming a variable, but getenv returning an empty
+// string for that name - the getenv signature cannot distinguish an unset
+// variable from one explicitly set to empty, and an empty password is not
+// usable for SQL Server authentication either way. The spec
+// (docs/superpowers/specs/2026-09-08-argosql-mvp-design.md, "Reject ...
+// missing password environment variables ... with code 2") requires this
+// to fail before any connection is attempted, at code 2, not at connection
+// time at code 3.
+func TestPasswordEnvVariableUndefinedRejected(t *testing.T) {
+	path := writeConfig(t, "profiles:\n  lab:\n    host: localhost\n    database: AppDB\n"+
+		"    username: reader\n    password_env: DB_PASSWORD\n")
+	_, err := Load(path, "lab", "", func(string) string { return "" })
+	msg := publicErrorCode(t, err, 2)
+	if !strings.Contains(msg, "DB_PASSWORD") {
+		t.Fatalf("expected message to name the expected variable, got %q", msg)
+	}
 }
 
 // TestPortOutOfRange checks both ends of the accepted 1-65535 range.

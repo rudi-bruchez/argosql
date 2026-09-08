@@ -96,10 +96,20 @@ func Load(path, name, databaseOverride string, getenv func(string) string) (Prof
 		return Profile{}, configError("profile is missing password_env")
 	}
 
+	password := getenv(*rp.PasswordEnv)
+	if password == "" {
+		// getenv's signature cannot distinguish an unset environment
+		// variable from one explicitly set to empty, so both read as
+		// "undefined" here; an empty password is not usable for SQL
+		// Server authentication either way. This must fail before any
+		// connection is attempted, at code 2, not at connection time.
+		return Profile{}, configError(fmt.Sprintf("environment variable %q named by password_env is not set", *rp.PasswordEnv))
+	}
+
 	p := Profile{
 		Host:     *rp.Host,
 		Username: *rp.Username,
-		Password: getenv(*rp.PasswordEnv),
+		Password: password,
 		Port:     defaultPort,
 	}
 
