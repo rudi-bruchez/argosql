@@ -35,6 +35,7 @@ func TestSessionTLS(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
+	logEngineIdentity(t, lab, s.Major)
 	var lock, spid int
 	if err := s.Conn.QueryRowContext(ctx, "SELECT @@LOCK_TIMEOUT, @@SPID").Scan(&lock, &spid); err != nil {
 		t.Fatal(err)
@@ -65,6 +66,7 @@ func TestSessionLockConflict(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer s.Close()
+		logEngineIdentity(t, lab, s.Major)
 
 		_, release := holdRowLock(t, lab)
 		defer release()
@@ -100,6 +102,7 @@ func TestSessionLockConflict(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer s.Close()
+		logEngineIdentity(t, lab, s.Major)
 
 		_, release := holdRowLock(t, lab)
 		defer release()
@@ -111,6 +114,15 @@ func TestSessionLockConflict(t *testing.T) {
 		elapsed := time.Since(start)
 		if err == nil {
 			t.Fatal("expected the conflicting update to fail, got no error")
+		}
+		// Not just "an error, quickly": a query that fails instantly for
+		// any other reason (a dropped connection, a typo'd table name)
+		// would also produce a non-nil error well under 4s, and this
+		// subtest would then pass while asserting the deadline interrupted
+		// a wait it never actually affected. errors.Is pins the failure to
+		// context cancellation specifically.
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("error is not context.DeadlineExceeded: %v", err)
 		}
 		// The server's own LOCK_TIMEOUT is 5s; a 1s caller deadline must
 		// win well before that.

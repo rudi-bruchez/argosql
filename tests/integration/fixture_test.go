@@ -94,6 +94,12 @@ func TestFixtureQueryStoreFlush(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
+	var major int
+	if err := lab.Admin.QueryRowContext(ctx, "SELECT CAST(SERVERPROPERTY('ProductMajorVersion') AS int)").Scan(&major); err != nil {
+		t.Fatalf("reading engine major version: %v", err)
+	}
+	logEngineIdentity(t, lab, major)
+
 	loadQuery := fmt.Sprintf("SELECT COUNT(*) AS %s FROM dbo.Widgets WHERE Quantity >= 0", queryStoreMarker)
 	for i := 0; i < 5; i++ {
 		var count int

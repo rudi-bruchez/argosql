@@ -13,9 +13,12 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -41,6 +44,125 @@ const (
 	bootstrapTimeout = 60 * time.Second
 	podmanCmdTimeout = 30 * time.Second
 )
+
+// TestMain installs the safety net t.Cleanup cannot provide: Go's testing
+// framework only runs a test's registered Cleanup funcs when that test
+// returns normally, never when the process dies from a signal. Measured:
+// a build of this package from before this handler existed, run under
+// `timeout --signal=INT <n> <binary>`, left its container behind in
+// "Stopping" - never removed, recoverable only by hand with a
+// SIGTERM-then-SIGKILL `podman rm`. Every day this suite is interrupted at
+// the keyboard (Ctrl-C is not a rare event) is a day that leaves a ~1.5GB
+// SQL Server container running until someone notices.
+//
+// On the first SIGINT or SIGTERM, this removes every container labeled
+// io.argosql.test for this process's own run ID, then restores that
+// signal's default disposition and re-delivers it to this process. It
+// does not decide how the process should terminate and does not swallow
+// the signal: it only buys itself enough time, once, to clean up before
+// stepping out of the way and letting the normal default behavior (the
+// process dying) happen as it would have without this handler.
+func TestMain(m *testing.M) {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		sig := <-sigCh
+		fmt.Fprintf(os.Stderr, "\nintegration tests: received %s, removing containers labeled io.argosql.test=%s before exiting\n", sig, testRunID)
+
+		ctx, cancel := context.WithTimeout(context.Background(), podmanCmdTimeout)
+		removeContainersByLabel(ctx, "label=io.argosql.test="+testRunID)
+		cancel()
+
+		signal.Stop(sigCh)
+		signal.Reset(sig)
+		if p, err := os.FindProcess(os.Getpid()); err == nil {
+			if err := p.Signal(sig); err != nil {
+				fmt.Fprintf(os.Stderr, "integration tests: re-delivering %s to self: %v\n", sig, err)
+			}
+		}
+	}()
+	os.Exit(m.Run())
+}
+
+// podmanPS lists container IDs matching a single --filter expression
+// (e.g. "label=io.argosql.test=<value>" or "id=<id>"), including stopped
+// containers.
+func podmanPS(ctx context.Context, filter string) ([]string, error) {
+	out, err := exec.CommandContext(ctx, "podman", "ps", "-aq", "--filter", filter).Output()
+	if err != nil {
+		return nil, err
+	}
+	return strings.Fields(string(out)), nil
+}
+
+// podmanContainerIDs is podmanPS for use from a test: it fails the test,
+// rather than returning an error, on a podman failure.
+func podmanContainerIDs(t *testing.T, filter string) []string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), podmanCmdTimeout)
+	defer cancel()
+	ids, err := podmanPS(ctx, filter)
+	if err != nil {
+		t.Fatalf("podman ps --filter %q: %v", filter, describeExecError(err))
+	}
+	return ids
+}
+
+// removeContainersByLabel is TestMain's signal handler's only job: find
+// every container matching labelFilter and force-remove it by ID. It has
+// no *testing.T to report through (it runs outside any test), so a
+// failure here is logged to stderr, best-effort, rather than failing
+// anything.
+//
+// --time 0 matters here, measured: "podman rm --force" on its own still
+// waits up to its default 10s stop grace period before killing a running
+// container, which on this harness is long enough for the interrupted
+// test's own goroutine to race ahead and finish normally before this
+// removal (and the signal re-delivery that follows it) ever completes -
+// the exact failure mode this handler exists to prevent. --time 0 skips
+// the grace period and kills outright.
+func removeContainersByLabel(ctx context.Context, labelFilter string) {
+	ids, err := podmanPS(ctx, labelFilter)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "signal cleanup: listing containers (%s): %v\n", labelFilter, describeExecError(err))
+		return
+	}
+	if len(ids) == 0 {
+		return
+	}
+	args := append([]string{"rm", "--force", "--time", "0"}, ids...)
+	if err := exec.CommandContext(ctx, "podman", args...).Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "signal cleanup: removing containers %v: %v\n", ids, describeExecError(err))
+	}
+}
+
+// driverModuleVersion reports the exact github.com/microsoft/go-mssqldb
+// version this test binary was built against, from the binary's own build
+// info rather than a hand-maintained constant, so it cannot drift from
+// go.mod. Used only for t.Logf identity lines (see logEngineIdentity);
+// never for anything that affects behavior.
+func driverModuleVersion() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "unknown"
+	}
+	for _, dep := range info.Deps {
+		if dep.Path == "github.com/microsoft/go-mssqldb" {
+			return dep.Version
+		}
+	}
+	return "unknown"
+}
+
+// logEngineIdentity records what a diagnostics test actually ran against:
+// the resolved image ID (never the mutable "latest" tag) and the server's
+// major version, plus the driver version. A result from a month ago is
+// otherwise unable to say what it was measured against. Deliberately logs
+// nothing from Profile: no host, no port, no credentials.
+func logEngineIdentity(t *testing.T, lab *Lab, majorVersion int) {
+	t.Helper()
+	t.Logf("engine identity: image=%s major_version=%d driver=go-mssqldb@%s", lab.ImageID, majorVersion, driverModuleVersion())
+}
 
 // Lab is one disposable SQL Server container plus everything a test needs
 // to talk to it: Admin is a pool already connected to the AppDB fixture
@@ -91,7 +213,7 @@ func NewLab(t *testing.T, image string) *Lab {
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), podmanCmdTimeout)
 		defer cancel()
-		if err := exec.CommandContext(ctx, "podman", "rm", "--force", containerID).Run(); err != nil {
+		if err := exec.CommandContext(ctx, "podman", "rm", "--force", "--time", "0", containerID).Run(); err != nil {
 			t.Logf("cleanup: podman rm %s: %v", containerID, describeExecError(err))
 		}
 	})
@@ -320,4 +442,181 @@ func randIndex(n int) int {
 		panic(fmt.Sprintf("crypto/rand: %v", err))
 	}
 	return int(v.Int64())
+}
+
+// sameContainer compares two container ID strings that may be truncated
+// to different lengths by whichever podman subcommand produced them, by
+// comparing their shared prefix.
+func sameContainer(a, b string) bool {
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	if n == 0 {
+		return false
+	}
+	return a[:n] == b[:n]
+}
+
+// TestContainerCarriesRunLabel proves the one property the rest of this
+// harness's safety net depends on: a container NewLab starts carries
+// io.argosql.test set to this process's own run ID, and a podman filter
+// query on that exact label value finds it. removeContainersByLabel
+// (TestMain's SIGINT/SIGTERM handler, above) uses precisely this filter;
+// if the label were ever dropped, renamed, or misspelled on the podman run
+// call, every other test in this package would still pass - only this
+// test, or a real signal, would notice.
+//
+// The handler's own code path - receiving an actual SIGINT or SIGTERM -
+// is covered separately, by TestSignalInterruptRemovesContainer below,
+// which runs this package's own compiled test binary as a subprocess and
+// signals it for real. This test only needs the label mechanism the
+// handler is built on; it does not attempt to simulate an interrupt.
+func TestContainerCarriesRunLabel(t *testing.T) {
+	lab := NewLab(t, os.Getenv("ASQ_TEST_IMAGE"))
+
+	ids := podmanContainerIDs(t, "label=io.argosql.test="+testRunID)
+	found := false
+	for _, id := range ids {
+		if sameContainer(id, lab.ContainerID) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("container %s not found via --filter label=io.argosql.test=%s (filter returned: %v)", lab.ContainerID, testRunID, ids)
+	}
+}
+
+// TestCleanupRemovesByID proves NewLab's t.Cleanup removes a container by
+// its ID, not by the name NewLab happened to give it - the distinction
+// matters because a name can collide with a container that belongs to the
+// user (see this package's doc comments on never touching one), while an
+// ID cannot.
+//
+// It renames the container immediately after NewLab creates it, inside a
+// subtest, so that the subtest's own t.Run returns only once NewLab's
+// t.Cleanup (registered on the subtest's *testing.T) has already run.
+// NewLab's cleanup logs and continues on a podman rm failure rather than
+// failing the test (deliberately: one bad cleanup must not fail an
+// otherwise-passing test), so a cleanup that still tried to remove the
+// renamed container by its old name would fail silently from NewLab's
+// point of view and leave the container running under its new name - this
+// is checked from outside, by querying podman for the ID after the
+// subtest has fully unwound, exactly like the SIGINT drill in this
+// package's task report is checked by podman ps -a rather than by an
+// assertion inside the interrupted test.
+func TestCleanupRemovesByID(t *testing.T) {
+	image := os.Getenv("ASQ_TEST_IMAGE")
+	var containerID string
+	t.Run("create and rename", func(t *testing.T) {
+		lab := NewLab(t, image)
+		containerID = lab.ContainerID
+		newName := "asq-test-renamed-" + randomHex(4)
+		ctx, cancel := context.WithTimeout(context.Background(), podmanCmdTimeout)
+		defer cancel()
+		if err := exec.CommandContext(ctx, "podman", "rename", lab.ContainerID, newName).Run(); err != nil {
+			t.Fatalf("renaming container for the by-ID cleanup check: %v", describeExecError(err))
+		}
+	})
+	// By the time t.Run above returns, every Cleanup registered on its
+	// child *testing.T - including NewLab's podman rm - has already run.
+	if ids := podmanContainerIDs(t, "id="+containerID); len(ids) != 0 {
+		t.Fatalf("container %s is still present after its subtest returned: cleanup did not remove it by ID (it was renamed before cleanup ran, so removal by name would have missed it)", containerID)
+	}
+}
+
+// TestSignalInterruptRemovesContainer reproduces, in-process, the defect
+// TestMain's signal handler exists to fix: it builds this package's own
+// test binary, runs it as a subprocess with ASQ_TEST_IMAGE set, waits
+// (bounded, polling, never a fixed sleep) for that child to have actually
+// created a labeled container, sends it SIGINT, and asserts that no
+// container carrying io.argosql.test survives once the child has exited.
+//
+// This assumes nothing else on the host is concurrently running this same
+// suite (the baseline check below enforces that, rather than silently
+// trusting it): this package's own tests are always run one process at a
+// time, never fanned out in parallel against a shared Podman host.
+func TestSignalInterruptRemovesContainer(t *testing.T) {
+	image := os.Getenv("ASQ_TEST_IMAGE")
+	if image == "" {
+		t.Fatal("ASQ_TEST_IMAGE is not set: the integration suite requires an image and never chooses one on its own")
+	}
+	if _, err := exec.LookPath("podman"); err != nil {
+		t.Fatalf("podman not found on PATH: %v", err)
+	}
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Fatalf("go not found on PATH: %v", err)
+	}
+
+	if before := podmanContainerIDs(t, "label=io.argosql.test"); len(before) != 0 {
+		t.Fatalf("containers already carry io.argosql.test before the child process even starts (another run concurrent with this one?): %v", before)
+	}
+
+	moduleRoot, err := exec.Command("go", "list", "-m", "-f", "{{.Dir}}").Output()
+	if err != nil {
+		t.Fatalf("locating module root: %v", describeExecError(err))
+	}
+
+	binPath := filepath.Join(t.TempDir(), "integration.test")
+	buildCtx, buildCancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer buildCancel()
+	buildCmd := exec.CommandContext(buildCtx, "go", "test", "-tags=integration", "-c", "-o", binPath, "./tests/integration")
+	buildCmd.Dir = strings.TrimSpace(string(moduleRoot))
+	if out, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("building test binary for the signal drill: %v\n%s", err, out)
+	}
+
+	cmd := exec.Command(binPath, "-test.run=TestSessionTLS", "-test.count=1", "-test.v")
+	cmd.Env = append(os.Environ(), "ASQ_TEST_IMAGE="+image)
+	var childOut strings.Builder
+	cmd.Stdout = &childOut
+	cmd.Stderr = &childOut
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("starting child test binary: %v", err)
+	}
+
+	// Wait for the child to have created a container - not a fixed sleep:
+	// poll for the label's appearance, bounded, short delay per attempt.
+	var childContainers []string
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		childContainers = podmanContainerIDs(t, "label=io.argosql.test")
+		if len(childContainers) > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			cmd.Process.Kill()
+			cmd.Wait()
+			t.Fatalf("child process never created a labeled container within 60s; child output:\n%s", childOut.String())
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+
+	if err := cmd.Process.Signal(os.Interrupt); err != nil {
+		t.Fatalf("sending SIGINT to child process: %v", err)
+	}
+
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- cmd.Wait() }()
+	select {
+	case <-waitDone:
+		// The child is expected to exit non-zero (interrupted); that is
+		// not itself a failure of this test.
+	case <-time.After(30 * time.Second):
+		cmd.Process.Kill()
+		t.Fatalf("child process did not exit within 30s of SIGINT; child output:\n%s", childOut.String())
+	}
+
+	after := podmanContainerIDs(t, "label=io.argosql.test")
+	if len(after) != 0 {
+		// This test just proved the orphan the handler is supposed to
+		// prevent; do not also leave it behind.
+		for _, id := range after {
+			rmCtx, rmCancel := context.WithTimeout(context.Background(), podmanCmdTimeout)
+			exec.CommandContext(rmCtx, "podman", "rm", "--force", "--time", "0", id).Run()
+			rmCancel()
+		}
+		t.Fatalf("containers survived SIGINT to the child process: %v\nchild output:\n%s", after, childOut.String())
+	}
 }
