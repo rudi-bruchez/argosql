@@ -229,7 +229,7 @@ func Open(ctx context.Context, p config.Profile) (*Session, error)
 func (s *Session) Close() error
 ```
 
-L'appelant crée le contexte global avant Open. Major est obtenu par SERVERPROPERTY après setup. Major=15 utilise la variante SQL 2019 ; Major=16 ou 17 utilise la variante 2022. Major=17 ajoute un avis de compatibilité non validée. Toute autre version retourne 4 avant les requêtes spécifiques. Tester 15/16/17 et une version inconnue ; ne pas sélectionner automatiquement une variante pour toutes les versions futures.
+L'appelant crée le contexte global avant Open. Major est obtenu par SERVERPROPERTY après setup. Major=15 utilise la variante SQL 2019 ; Major=16 ou 17 utilise la variante 2022. Major=17 est accepté comme 16, et l'avis de compatibilité non validée qui l'accompagne n'appartient pas à cette tâche : `Session` n'a pas d'accès au `Sink`, c'est `internal/cli.Run` qui l'émet à la tâche 9 après `Open`. Toute autre version retourne 4 avant les requêtes spécifiques. Tester 15/16/17 et une version inconnue ; ne pas sélectionner automatiquement une variante pour toutes les versions futures.
 
 - [ ] Test du faux pilote : enregistrer un pilote minimal implémentant Conn, QueryerContext, ExecerContext et SessionResetter. Enregistrer les événements et remettre lockTimeout=-1 dans ResetSession. Le test doit constater 5000 au deuxième SELECT via Session.Conn.
 
@@ -561,6 +561,7 @@ func DecodeReadOnly(h Health) []string
 func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int
 ```
 
+- [ ] Émettre l'avis de compatibilité non validée dans `Run`, juste après `sqlserver.Open` et avant de dispatcher la commande, quand `s.Major` vaut 17 : `model.Notice{Kind: "unvalidated_version"}`. C'est `Run` qui le porte et non `Open`, parce que `Session` n'a pas d'accès au `Sink`, et c'est `Run` et non `Info` parce que l'avis vaut pour toutes les commandes et pas seulement pour `info`. Test : `Run` sur un serveur factice de Major 17 produit exactement un avis de cette sorte, et zéro sur Major 16.
 - [ ] Écrire le test offline et le test du reason=0 :
 
 ```go
