@@ -402,7 +402,7 @@ Pour une table interrompue, fermer proprement le JSON/TSV des lignes acceptées 
 
 ### Tâche 7 : aperçu borné et erreurs sérialisées
 
-**Fichiers :** créer `internal/output/preview.go`, `preview_test.go` ; modifier collector.go et result.go si nécessaire sans changer les signatures.
+**Fichiers :** créer `internal/output/preview.go`, `preview_test.go`. Ne modifier ni collector.go ni result.go : depuis que l'aperçu appartient entièrement à Render et que PreviewState est défini à la tâche 1, cette tâche n'a plus de raison de toucher aux tâches 1 et 6. Si elle croit en avoir besoin, c'est un signal de défaut à remonter, pas une permission.
 
 **Interfaces :** `PreviewOptions{Rows int; CellLimit int; NoTruncate bool; ByteLimit int}` ; `Render(result model.Result, options PreviewOptions, format string) ([]byte,error)`.
 
@@ -472,12 +472,19 @@ registre émet réellement :
 
 ```go
 func TestEveryProbeIsWellFormed(t *testing.T) {
-    // AllProbes est exporté par internal/sqlserver pour les tests : la liste
-    // exacte des couples (classe, permission) que les commandes émettent,
-    // plus les permissions instance de ServerProbe.
+    // AllProbes(major) est exporté par internal/sqlserver : la liste exacte des
+    // couples (classe, permission) que les commandes émettent, plus les
+    // permissions instance de ServerProbe. Elle dépend de la version, la
+    // permission instance différant entre Major=15 et Major>=16. Chaque entrée
+    // porte Label et une méthode Run(ctx, conn, name) (Permission, error).
     lab := NewLab(t, os.Getenv("ASQ_TEST_IMAGE"))
-    for _, pr := range sqlserver.AllProbes() {
-        got, err := pr.Run(ctx, conn, "dbo.Orders")
+    ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+    defer cancel()
+    sess, err := sqlserver.Open(ctx, lab.Profile)
+    if err != nil { t.Fatal(err) }
+    defer sess.Close()
+    for _, pr := range sqlserver.AllProbes(sess.Major) {
+        got, err := pr.Run(ctx, sess.Conn, "dbo.Orders")
         if err != nil { t.Fatalf("%s: %v", pr.Label, err) }
         if got == sqlserver.Unknown {
             t.Fatalf("%s rend NULL sur un serveur réel : sonde malformée", pr.Label)
@@ -679,7 +686,7 @@ ORDER BY cpu_total_ms DESC,q.query_id;
 
 Étendre cette même agrégation avec duration et logical reads, pas une requête par métrique. Déclarer IDs/executions comme bigint (chaînes JSON), les métriques calculées comme float SQL (nombres JSON). Le test 2.8 utilise une tolérance absolue de 1e-9 et le total 28 une tolérance de 1e-9, jamais une comparaison textuelle du float ; le test executions=10 reste exact. Les totaux de lectures calculés à partir de moyennes sont des estimations flottantes, pas des compteurs entiers inventés. Ce choix ne change pas la préservation exacte des decimal de la base à la tâche 5. Sur 2022, grouper rs.replica_group_id à chaque étage, le porter dans le GROUP BY final et dans le départage de l'ORDER BY, et retourner cette colonne. 2019 retourne NULL typé pour elle. Le bloc esquissé plus haut finit sur `GROUP BY q.query_id` et `ORDER BY cpu_total_ms DESC, q.query_id` : c'est la forme 2019, et la recopier telle quelle dans top_2022.sql perd le classement par réplique que la spec impose. Colonnes queries : query_id, replica_group_id, executions, cpu_total_ms, cpu_avg_ms, duration_total_ms, duration_avg_ms, reads_total, reads_avg ; pas de texte intégral dans le classement. Contrôle parent_module via Resolve et type avant exécution.
 - [ ] Réutiliser ReadHealth. Dans état non collectant sans historique ->4, sinon fenêtre sans correspondance ->table vide 0. Ajouter warnings capture/coverage sans prétendre exhaustivité. Vérifier `executions/avg` refusé avant connexion.
-- [ ] Vert : fixtures SQL synthétiques dans tables temporaires de test pour vérifier le noyau d'agrégation (ne pas écrire dans les catalogues), puis charge réelle Query Store. Le test synthétique remplace uniquement la source de données du noyau SQL ; les attentes sont numériques fixes. Sur charge réelle, découvrir les IDs via marqueur unique et attendre/forcer le flush avec l'admin. `go test -tags=integration ./tests/integration -run TestTop -v -count=1` ; attendu : 1 test ; sur 2019/2022.
+- [ ] Vert : fixtures SQL synthétiques dans tables temporaires de test pour vérifier le noyau d'agrégation (ne pas écrire dans les catalogues), puis charge réelle Query Store. Le test synthétique remplace uniquement la source de données du noyau SQL ; les attentes sont numériques fixes. Sur charge réelle, découvrir les IDs via marqueur unique et attendre/forcer le flush avec l'admin. Ce mécanisme de découverte appartient à cette tâche et s'expose comme helper du harnais, `func (lab *Lab) QueryID(t *testing.T, marker string) int64`, ajouté à `tests/integration/fixture_test.go` : il exécute la charge portant le marqueur, force le flush, attend la présence dans une boucle bornée à 30 s et rend le query_id. La tâche 11 s'en sert et ne le redéfinit pas ; aucun ID codé en dur nulle part. `go test -tags=integration ./tests/integration -run TestTop -v -count=1` ; attendu : 1 test ; sur 2019/2022.
 - [ ] Commit : `feat: rank Query Store workloads with weighted metrics`.
 
 ### Tâche 11 : détail query_id et export texte
