@@ -235,8 +235,17 @@ la restriction.
     encoding » ne régit donc rien pour l'artefact pour lequel elle a été
     écrite, et elle a remplacé l'instruction réelle de la source, qui était de
     retirer l'attribut d'encodage pour ne pas reproduire le problème UTF-16LE
-    des `.sqlplan` SSMS. La vraie question, non posée : SSMS ouvre-t-il un
-    `.sqlplan` UTF-8 sans déclaration.
+    des `.sqlplan` SSMS. Ce piège suppose une déclaration, et il n'y en a pas
+    ici : écrire le XML tel qu'il vient donne un document conforme, la
+    déclaration étant facultative et son absence, sans BOM, valant UTF-8.
+
+    Correction apportée après coup, et le défaut vaut d'être noté. J'avais
+    ajouté ici une question ouverte, « SSMS ouvre-t-il un `.sqlplan` UTF-8 sans
+    déclaration », et une tâche de vérification correspondante dans la spec.
+    Elle n'avait pas lieu d'être : je fabriquais une vérification à partir
+    d'une règle que je venais moi-même de déclarer sans objet. Elle a survécu
+    jusqu'au commit parce que c'était un correctif de relecture, et qu'un
+    correctif est moins relu que ce qu'il corrige.
 
 ## Couverture de la source
 
