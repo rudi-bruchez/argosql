@@ -339,7 +339,7 @@ func NewTableDecoder(r io.Reader,format string,spec model.TableSpec)(*Decoder,er
 func (d *Decoder) Next()([]model.Cell,error) // io.EOF à la fin
 ```
 
-Begin crée Encoder, Row appelle WriteRow, End appelle Close ; aucune goroutine/channel d'adaptation. decode.go est le lecteur inverse explicite nécessaire à la tâche 7 : JSON via json.Decoder token/ligne, TSV via lecteur buffered et machine d'échappement inverse. Il lit au plus une ligne à la fois, conserve les types/colonnes positionnels et rejette un artefact mal formé. Tester encode->decode sur tous les types et échappements ci-dessous, y compris `\N` littéral versus null. Ne jamais json.Unmarshal l'artefact entier.
+Begin crée Encoder, Row appelle WriteRow, End appelle Close ; aucune goroutine/channel d'adaptation. decode.go est le lecteur inverse explicite nécessaire à la tâche 7 : JSON via json.Decoder token/ligne, TSV via lecteur buffered et machine d'échappement inverse. Il lit au plus une ligne à la fois, conserve les types/colonnes positionnels et rejette un artefact mal formé, y compris tronqué APRÈS la fermeture du tableau de lignes : s'arrêter au `]` et rendre `io.EOF` sans exiger l'accolade finale fait passer pour complet un artefact qu'un disque plein a coupé. Mesuré. Tester encode->decode sur tous les types et échappements ci-dessous, y compris `\N` littéral versus null. Ne jamais json.Unmarshal l'artefact entier.
 
 - [ ] Test :
 
@@ -354,7 +354,7 @@ func TestTSVEscapes(t *testing.T) {
 ```
 
 - [ ] Rouge : `go test ./internal/output -v`.
-- [ ] Encoder null avant les chaînes ; échapper dans l'ordre backslash, tab, CR, LF. JSON écrit columns une fois puis rows positionnelles ; bigint/decimal sont convertis en chaînes avant encodage. Scan SQL conserve les decimal exacts en texte via conversion SQL explicite lorsque le pilote ne garantit pas le type exact ; tester 38 chiffres, pas un float64 intermédiaire. En-têtes doublons conservés. Documenter les types pris en charge ; date/time en texte ISO, binary en hex.
+- [ ] Encoder null avant les chaînes. L'échappement se fait par `strings.NewReplacer`, qui applique toutes les paires en une seule passe sans recouvrement : l'ordre des arguments n'a donc aucune incidence, et mesuré par deux relecteurs indépendants, l'inverser ne fait tomber aucun test. L'ordre backslash, tab, CR, LF ne vaut que pour une réécriture en passes successives. Ce qui protège les deux implémentations est un cas de test portant à la fois un backslash et une tabulation, avec la sortie exacte attendue ; la chaîne `a\tb\nc` du test ci-dessus ne contient pas de backslash et ne peut donc rien révéler sur ce point. JSON écrit columns une fois puis rows positionnelles ; bigint/decimal sont convertis en chaînes avant encodage. `json.Marshal` remplace silencieusement les séquences UTF-8 invalides par U+FFFD, qu'un `VARCHAR` sous collation non UTF-8 peut porter : l'encodeur doit donc détecter ce remplacement et l'exposer, sans décider quoi en faire. L'avis `encoding_normalized` que la spec ligne 91 exige est émis par la tâche 6, seul endroit qui tient un `Sink`. Celui qui voit n'est pas celui qui parle. Scan SQL conserve les decimal exacts en texte via conversion SQL explicite lorsque le pilote ne garantit pas le type exact ; tester 38 chiffres, pas un float64 intermédiaire. En-têtes doublons conservés. Documenter les types pris en charge ; date/time en texte ISO, binary en hex.
 
 ```go
 strings.NewReplacer("\\", "\\\\", "\t", "\\t", "\r", "\\r", "\n", "\\n").Replace(text)
