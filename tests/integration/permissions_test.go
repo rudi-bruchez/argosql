@@ -94,7 +94,8 @@ func applyObjects(ctx context.Context, appDB *sql.DB) error {
 // script is executed, the same convention NewLab already follows for the
 // container's own sa account (see randomPassword in podman_test.go).
 type principalPasswords struct {
-	Q, I, S string
+	Q, I, S      string
+	MetadataOnly string
 }
 
 // applyPrincipals substitutes pw into principals.sql and applies its two
@@ -108,6 +109,7 @@ func applyPrincipals(ctx context.Context, t *testing.T, masterDB, appDB *sql.DB,
 	script = strings.ReplaceAll(script, "__Q_PASSWORD__", pw.Q)
 	script = strings.ReplaceAll(script, "__I_PASSWORD__", pw.I)
 	script = strings.ReplaceAll(script, "__S_PASSWORD__", pw.S)
+	script = strings.ReplaceAll(script, "__METADATA_ONLY_PASSWORD__", pw.MetadataOnly)
 
 	masterHalf, appDBHalf := splitPrincipalsScript(t, script)
 	if err := applyScriptOnConn(ctx, masterDB, masterHalf); err != nil {
@@ -197,7 +199,7 @@ func TestPermissions(t *testing.T) {
 		t.Fatalf("applying objects.sql: %v", err)
 	}
 
-	pw := principalPasswords{Q: randomPassword(), I: randomPassword(), S: randomPassword()}
+	pw := principalPasswords{Q: randomPassword(), I: randomPassword(), S: randomPassword(), MetadataOnly: randomPassword()}
 	masterDB := openMasterDB(t, lab)
 	if err := applyPrincipals(ctx, t, masterDB, lab.Admin, pw); err != nil {
 		t.Fatalf("applying principals.sql: %v", err)

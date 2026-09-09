@@ -261,6 +261,18 @@ func Parse(args []string) (Request, *Command, error) {
 		}
 	}
 
+	// --table's two-part syntax is checked here for exactly the same
+	// reason as --object above, right next to it: "idx missing" is the
+	// one command that declares "table" rather than "object" for its
+	// own optional schema.name filter (Command.Flags below), so the
+	// same pre-connection syntax check applies to it under its own flag
+	// name.
+	if _, ok := allowed["table"]; ok && req.Table != "" {
+		if err := sqlserver.ValidateQualifiedName(req.Table); err != nil {
+			return req, nil, err
+		}
+	}
+
 	// ParseWindow resolves --hours/--since/--until into req.Window here,
 	// before any connection opens, so every one of the design spec's
 	// code-2 window rejections (mixed half-given since/until, since >=
@@ -331,6 +343,8 @@ func assignRequestField(req *Request, name string, v any) error {
 		req.OutDir = v.(string)
 	case "object":
 		req.Object = v.(string)
+	case "table":
+		req.Table = v.(string)
 	case "min-executions":
 		req.MinExecutions = v.(int64)
 	case "by":

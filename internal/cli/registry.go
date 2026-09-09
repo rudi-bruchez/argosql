@@ -209,13 +209,14 @@ func globalFlags() []Flag {
 }
 
 // NewRegistry builds the registry this build of asq serves: help, info,
-// qs status, qs top, qs query, plan, obj table, obj code, idx list and
-// size table. help's Execute closes over the finished registry through
-// reg, a pointer to the slice NewRegistry is about to return: by the
-// time help actually runs, reg has been fully populated by the
-// composite literal below, even though help's own entry is built first.
+// qs status, qs top, qs query, plan, obj table, obj code, idx list,
+// size table, idx usage, idx missing and stats list. help's Execute
+// closes over the finished registry through reg, a pointer to the
+// slice NewRegistry is about to return: by the time help actually
+// runs, reg has been fully populated by the composite literal below,
+// even though help's own entry is built first.
 func NewRegistry() Registry {
-	reg := make(Registry, 10)
+	reg := make(Registry, 13)
 	reg[0] = helpCommand(&reg)
 	reg[1] = infoCommand()
 	reg[2] = qsStatusCommand()
@@ -226,6 +227,9 @@ func NewRegistry() Registry {
 	reg[7] = objCodeCommand()
 	reg[8] = idxListCommand()
 	reg[9] = sizeTableCommand()
+	reg[10] = idxUsageCommand()
+	reg[11] = idxMissingCommand()
+	reg[12] = statsListCommand()
 	return reg
 }
 
@@ -716,6 +720,107 @@ func sizeTableCommand() Command {
 		Tables:   []model.TableSpec{diagnostics.TableTable, diagnostics.AllocationsTable},
 		Execute: func(ctx context.Context, s *sqlserver.Session, req Request, dst model.Sink) error {
 			return diagnostics.Size(ctx, s, req.Object, dst)
+		},
+	}
+}
+
+// idxUsageCommand registers "idx usage <schema.name>": obj's
+// seeks/scans/lookups/updates and last-use timestamps from
+// sys.dm_db_index_usage_stats, plus server start time when a narrower
+// permission allows it (design spec: "idx usage"). Tables is
+// diagnostics.UsageTable itself, for the same reason infoCommand above
+// uses diagnostics.InfoTable.
+//
+// sys.dm_db_index_usage_stats itself requires the instance-level
+// permission below, not merely the database-level bundle "obj
+// table"/"idx list" rely on (measured against Microsoft's own
+// documentation) - matching the design spec's own Q/I/S matrix exactly:
+// I fails at code 4 here, only S succeeds.
+func idxUsageCommand() Command {
+	return Command{
+		Name:               "idx usage",
+		Positional:         "schema.name",
+		PositionalIsObject: true,
+		Summary:            "Seeks/scans/lookups/updates and last-use timestamps for an object's indexes, plus server start time when permitted, with explicit observation-window limitations.",
+		Examples:           []string{"asq --ctx client --db AppDB idx usage dbo.Orders"},
+		Permissions: []string{
+			"VIEW SERVER STATE (2019)",
+			"VIEW SERVER PERFORMANCE STATE (2022+)",
+		},
+		Versions: []string{"2019", "2022"},
+		Tables:   []model.TableSpec{diagnostics.UsageTable},
+		Execute: func(ctx context.Context, s *sqlserver.Session, req Request, dst model.Sink) error {
+			return diagnostics.Usage(ctx, s, req.Object, dst)
+		},
+	}
+}
+
+// idxMissingCommand registers "idx missing [--table <schema.name>]
+// [--top N]": the top N missing-index suggestions by impact_score,
+// across the whole database or filtered to one resolved object (design
+// spec: "idx missing"). Tables is diagnostics.SuggestionsTable itself,
+// for the same reason infoCommand above uses diagnostics.InfoTable.
+//
+// --table, not --object: this command declares its own flag name
+// (Request.Table, assignRequestField in parse.go) rather than reusing
+// --object, which "qs top" already declares with different semantics
+// (a parent_module filter, design spec line 61) - the two names must
+// not collide on one field with two different meanings.
+//
+// sys.dm_db_missing_index_group_stats/groups/details all require the
+// same instance-level permission as "idx usage" above (measured against
+// Microsoft's own documentation), so this command needs the full S
+// bundle too - matching the design spec's own Q/I/S matrix: "idx
+// missing (no table filter) | 4 | 4 | 0".
+func idxMissingCommand() Command {
+	return Command{
+		Name:     "idx missing",
+		Summary:  "Top missing-index suggestions by a transparent ranking score, across the database or filtered to one resolved object; raw DMV evidence, advisory limitations, no CREATE script.",
+		Examples: []string{"asq --ctx client --db AppDB idx missing --top 10", "asq --ctx client --db AppDB idx missing --table dbo.Orders"},
+		Units: []string{
+			"impact_score: unitless ranking score, not a predicted execution-time saving",
+		},
+		Permissions: []string{
+			"VIEW SERVER STATE (2019)",
+			"VIEW SERVER PERFORMANCE STATE (2022+)",
+		},
+		Versions: []string{"2019", "2022"},
+		Tables:   []model.TableSpec{diagnostics.SuggestionsTable},
+		Flags: []Flag{
+			{Name: "table", Kind: FlagString},
+			{Name: "top", Kind: FlagInt64, Default: int64(10), Min: 1, Max: 100},
+		},
+		Execute: func(ctx context.Context, s *sqlserver.Session, req Request, dst model.Sink) error {
+			opts := diagnostics.MissingOptions{Table: req.Table, Top: req.Top}
+			return diagnostics.Missing(ctx, s, opts, dst)
+		},
+	}
+}
+
+// statsListCommand registers "stats list <schema.name>": obj's
+// statistics, their ordered key columns, update/sampling facts when
+// readable, and a per-row properties_status that never guesses a cause
+// it cannot establish (design spec: "stats list"). Tables is
+// diagnostics.StatisticsTable itself, for the same reason infoCommand
+// above uses diagnostics.InfoTable.
+func statsListCommand() Command {
+	return Command{
+		Name:               "stats list",
+		Positional:         "schema.name",
+		PositionalIsObject: true,
+		Summary:            "An object's statistics: ordered key columns, update time, row/sample counts, sample percentage, modification counter, auto/user-created flags and filter; per-row properties_status, never guessed.",
+		Examples:           []string{"asq --ctx client --db AppDB stats list dbo.Orders"},
+		Units: []string{
+			"sample_pct: percent of rows sampled, null when rows=0",
+		},
+		Permissions: []string{
+			"VIEW DEFINITION",
+			"SELECT on the table, or on each statistic's own columns (sys.dm_db_stats_properties)",
+		},
+		Versions: []string{"2019", "2022"},
+		Tables:   []model.TableSpec{diagnostics.StatisticsTable},
+		Execute: func(ctx context.Context, s *sqlserver.Session, req Request, dst model.Sink) error {
+			return diagnostics.Stats(ctx, s, req.Object, dst)
 		},
 	}
 }

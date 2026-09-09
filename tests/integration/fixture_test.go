@@ -341,6 +341,8 @@ func principalUsername(principal string) string {
 		return "asq_test_i"
 	case "S":
 		return "asq_test_s"
+	case "metadata_only":
+		return "asq_test_metadata_only"
 	default:
 		return ""
 	}
@@ -358,6 +360,8 @@ func (pw principalPasswords) secretFor(principal string) (string, bool) {
 		return pw.I, true
 	case "S":
 		return pw.S, true
+	case "metadata_only":
+		return pw.MetadataOnly, true
 	default:
 		return "", false
 	}
@@ -387,7 +391,7 @@ func (lab *Lab) ensurePrincipals(t *testing.T) principalPasswords {
 			lab.principalsErr = fmt.Errorf("applying objects.sql: %w", err)
 			return
 		}
-		pw := principalPasswords{Q: randomPassword(), I: randomPassword(), S: randomPassword()}
+		pw := principalPasswords{Q: randomPassword(), I: randomPassword(), S: randomPassword(), MetadataOnly: randomPassword()}
 		masterDB := openMasterDB(t, lab)
 		if err := applyPrincipals(ctx, t, masterDB, lab.Admin, pw); err != nil {
 			lab.principalsErr = fmt.Errorf("applying principals.sql: %w", err)

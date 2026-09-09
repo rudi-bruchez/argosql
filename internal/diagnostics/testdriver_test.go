@@ -304,6 +304,120 @@ func sizeRowsResponse(rows [][]driver.Value) objQueryResponse {
 	}
 }
 
+// usageRowsResponse matches usage.sql (identified by its unique
+// observation_status CASE expression) and streams rows back exactly as
+// given: index_id, name, seeks, scans, lookups, updates, last_seek,
+// last_scan, last_lookup, last_update, observation_status.
+func usageRowsResponse(rows [][]driver.Value) objQueryResponse {
+	return objQueryResponse{
+		match: func(q string) bool { return strings.Contains(q, "observation_status") },
+		handle: func(args []driver.NamedValue) (driver.Rows, error) {
+			return &fakeStaticRows{
+				cols: []string{"index_id", "name", "seeks", "scans", "lookups", "updates",
+					"last_seek", "last_scan", "last_lookup", "last_update", "observation_status"},
+				types: []string{"INT", "NVARCHAR", "BIGINT", "BIGINT", "BIGINT", "BIGINT",
+					"DATETIME", "DATETIME", "DATETIME", "DATETIME", "NVARCHAR"},
+				data: rows,
+			}, nil
+		},
+	}
+}
+
+// usageErrResponse matches usage.sql and answers it with err - used to
+// simulate the permission denial sys.dm_db_index_usage_stats itself
+// raises when the instance-level permission is absent (Usage's own
+// doc comment; classifyQueryError, via queryRows, turns this into code
+// 4, kind "permission").
+func usageErrResponse(err error) objQueryResponse {
+	return objQueryResponse{
+		match:  func(q string) bool { return strings.Contains(q, "observation_status") },
+		handle: func(args []driver.NamedValue) (driver.Rows, error) { return nil, err },
+	}
+}
+
+// serverStartTimeResponse matches Usage's own serverStartTimeQuery
+// (identified by its unique sys.dm_os_sys_info projection) and answers
+// it with one row, or err when given.
+func serverStartTimeResponse(value driver.Value, err error) objQueryResponse {
+	return objQueryResponse{
+		match: func(q string) bool { return strings.Contains(q, "sqlserver_start_time") },
+		handle: func(args []driver.NamedValue) (driver.Rows, error) {
+			if err != nil {
+				return nil, err
+			}
+			return &fakeStaticRows{
+				cols:  []string{"sqlserver_start_time"},
+				types: []string{"DATETIME"},
+				data:  [][]driver.Value{{value}},
+			}, nil
+		},
+	}
+}
+
+// missingRowsResponse matches missing.sql (identified by its unique
+// impact_score projection) and streams rows back exactly as given,
+// recording the args it was called with so a test can assert on the
+// exact @object_id/@top values Missing actually sent - never opts.Table's
+// own raw text (dispatch cassure 6).
+func missingRowsResponse(rows [][]driver.Value, captured *[]driver.NamedValue) objQueryResponse {
+	return objQueryResponse{
+		match: func(q string) bool { return strings.Contains(q, "impact_score") },
+		handle: func(args []driver.NamedValue) (driver.Rows, error) {
+			if captured != nil {
+				*captured = args
+			}
+			return &fakeStaticRows{
+				cols: []string{"index_handle", "object_id", "schema_name", "object_name",
+					"equality_columns", "inequality_columns", "included_columns",
+					"user_seeks", "user_scans", "avg_total_user_cost", "avg_user_impact", "impact_score"},
+				types: []string{"INT", "INT", "NVARCHAR", "NVARCHAR", "NVARCHAR", "NVARCHAR", "NVARCHAR",
+					"BIGINT", "BIGINT", "FLOAT", "FLOAT", "FLOAT"},
+				data: rows,
+			}, nil
+		},
+	}
+}
+
+// statsRowsResponse matches stats.sql (identified by its unique OUTER
+// APPLY to sys.dm_db_stats_properties) and streams rows back exactly as
+// given: stats_id, name, columns, rows, rows_sampled, last_updated,
+// modification_counter, auto_created, user_created, filter - the ten
+// columns sql/stats.sql itself projects, before Go computes sample_pct
+// and properties_status (stats.go).
+func statsRowsResponse(rows [][]driver.Value) objQueryResponse {
+	return objQueryResponse{
+		match: func(q string) bool { return strings.Contains(q, "dm_db_stats_properties") },
+		handle: func(args []driver.NamedValue) (driver.Rows, error) {
+			return &fakeStaticRows{
+				cols: []string{"stats_id", "name", "columns", "rows", "rows_sampled",
+					"last_updated", "modification_counter", "auto_created", "user_created", "filter"},
+				types: []string{"INT", "NVARCHAR", "NVARCHAR", "BIGINT", "BIGINT",
+					"DATETIME2", "BIGINT", "BIT", "BIT", "NVARCHAR"},
+				data: rows,
+			}, nil
+		},
+	}
+}
+
+// countingPermProbeResponse is permProbeResponse, plus a counter the
+// caller can inspect afterward - stats.go's own selectPermissionCache
+// claims it probes OBJECT/SELECT at most once per Stats call no matter
+// how many rows need an answer; this is what lets a test hold it to
+// that claim instead of trusting the doc comment.
+func countingPermProbeResponse(result driver.Value, calls *int) objQueryResponse {
+	return objQueryResponse{
+		match: func(q string) bool { return strings.Contains(q, "HAS_PERMS_BY_NAME") },
+		handle: func(args []driver.NamedValue) (driver.Rows, error) {
+			*calls++
+			return &fakeStaticRows{
+				cols:  []string{""},
+				types: []string{"INT"},
+				data:  [][]driver.Value{{result}},
+			}, nil
+		},
+	}
+}
+
 // moduleRowResponse matches module.sql (identified by its unique
 // sys.sql_modules join) and answers it with one row: found=false
 // simulates the "obj disappeared" recheck (zero rows), matching

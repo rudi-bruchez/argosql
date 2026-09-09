@@ -34,6 +34,7 @@
 IF SUSER_ID(N'asq_test_q') IS NOT NULL DROP LOGIN asq_test_q;
 IF SUSER_ID(N'asq_test_i') IS NOT NULL DROP LOGIN asq_test_i;
 IF SUSER_ID(N'asq_test_s') IS NOT NULL DROP LOGIN asq_test_s;
+IF SUSER_ID(N'asq_test_metadata_only') IS NOT NULL DROP LOGIN asq_test_metadata_only;
 GO
 
 CREATE LOGIN asq_test_q WITH PASSWORD = N'__Q_PASSWORD__', CHECK_POLICY = OFF;
@@ -43,6 +44,16 @@ CREATE LOGIN asq_test_i WITH PASSWORD = N'__I_PASSWORD__', CHECK_POLICY = OFF;
 GO
 
 CREATE LOGIN asq_test_s WITH PASSWORD = N'__S_PASSWORD__', CHECK_POLICY = OFF;
+GO
+
+-- Task 14's own fourth fixture principal: object metadata access
+-- without SELECT (design spec line 176's first case). It sees catalog
+-- rows (VIEW DEFINITION) but holds no SELECT anywhere, so
+-- sys.dm_db_stats_properties' own properties read must come back
+-- empty for every statistic - "stats list" reports that as
+-- unavailable, never a guessed permission_denied (see stats.go's own
+-- doc comment).
+CREATE LOGIN asq_test_metadata_only WITH PASSWORD = N'__METADATA_ONLY_PASSWORD__', CHECK_POLICY = OFF;
 GO
 
 DECLARE @major int = CAST(SERVERPROPERTY('ProductMajorVersion') AS int);
@@ -58,11 +69,13 @@ GO
 IF USER_ID(N'asq_test_q') IS NOT NULL DROP USER asq_test_q;
 IF USER_ID(N'asq_test_i') IS NOT NULL DROP USER asq_test_i;
 IF USER_ID(N'asq_test_s') IS NOT NULL DROP USER asq_test_s;
+IF USER_ID(N'asq_test_metadata_only') IS NOT NULL DROP USER asq_test_metadata_only;
 GO
 
 CREATE USER asq_test_q FOR LOGIN asq_test_q;
 CREATE USER asq_test_i FOR LOGIN asq_test_i;
 CREATE USER asq_test_s FOR LOGIN asq_test_s;
+CREATE USER asq_test_metadata_only FOR LOGIN asq_test_metadata_only;
 GO
 
 GRANT CONNECT TO asq_test_q, asq_test_i, asq_test_s;
@@ -117,4 +130,24 @@ GO
 -- reads NULL and HAS_PERMS_BY_NAME(...,'VIEW DEFINITION') reads 0 for
 -- Q. Measured directly (objects_test.go's TestObjCodePermissionDenied).
 GRANT EXECUTE ON dbo.ExecuteOnlyProc TO asq_test_q;
+GO
+
+-- Task 14's own fourth fixture principal (continued): CONNECT and
+-- VIEW DEFINITION only, deliberately no CONNECT-level VIEW DATABASE
+-- STATE and no SELECT anywhere in AppDB. It can resolve dbo.StatsFixture
+-- and see its sys.stats rows, but sys.dm_db_stats_properties must come
+-- back empty for every one of them.
+GRANT CONNECT TO asq_test_metadata_only;
+GRANT VIEW DEFINITION TO asq_test_metadata_only;
+GO
+
+-- dbo.MissingIndexHiddenFromS (objects.sql): S already holds VIEW
+-- DEFINITION database-wide; this per-object DENY removes only this one
+-- table's own catalog visibility for S - measured, like
+-- dbo.DeniedDefinitionProc above, to remove the sys.objects row
+-- entirely rather than merely masking its definition text. "idx
+-- missing" as S must still return this object's own missing-index
+-- evidence row, with schema_name/object_name NULL, rather than losing
+-- the row outright.
+DENY VIEW DEFINITION ON dbo.MissingIndexHiddenFromS TO asq_test_s;
 GO

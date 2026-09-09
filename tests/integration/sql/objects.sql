@@ -330,3 +330,104 @@ GO
 
 ALTER INDEX CSI_SizeColumnstore ON AppDB.dbo.SizeColumnstore REORGANIZE WITH (COMPRESS_ALL_ROW_GROUPS = ON);
 GO
+
+-- Task 14's own fixture objects, for idx usage/idx missing/stats list.
+
+-- dbo.UsageFixture: one index actually queried below (a seek on
+-- Category), and one index created but never referenced by any
+-- statement in this script - "idx usage"'s own never_observed case,
+-- as opposed to a fabricated zero (design spec: "Do not include a
+-- stale verdict in v0.1"). IX_UsageFixture_NeverQueried is created
+-- AFTER the INSERT below, deliberately: measured against a real
+-- engine, an index that already existed at INSERT time gets a
+-- sys.dm_db_index_usage_stats row from that write alone (user_updates
+-- nonzero), even though it is never read - that row's mere existence
+-- would make it 'observed' rather than genuinely untouched. Creating
+-- it last means no later statement in this script ever writes to or
+-- reads through it, so it keeps no DMV row at all.
+IF OBJECT_ID(N'dbo.UsageFixture') IS NULL
+BEGIN
+    CREATE TABLE dbo.UsageFixture (
+        Id INT IDENTITY(1,1) PRIMARY KEY,
+        Category NVARCHAR(50) NOT NULL,
+        Note NVARCHAR(200) NULL
+    );
+    CREATE NONCLUSTERED INDEX IX_UsageFixture_Category ON dbo.UsageFixture (Category);
+    INSERT INTO dbo.UsageFixture (Category, Note) VALUES (N'a', N'x'), (N'b', N'y'), (N'c', N'z');
+    CREATE NONCLUSTERED INDEX IX_UsageFixture_NeverQueried ON dbo.UsageFixture (Note);
+END
+GO
+
+DECLARE @UsageFixtureSeek NVARCHAR(50);
+SELECT @UsageFixtureSeek = Category FROM dbo.UsageFixture WHERE Category = N'b';
+GO
+
+-- dbo.MissingIndexFixture: an unindexed, selective predicate column
+-- (Status), queried below just selectively enough that the optimizer
+-- records a real sys.dm_db_missing_index_details suggestion - a
+-- covering-index decision the optimizer makes at compile time, not
+-- dependent on repeated execution or a Query Store flush.
+IF OBJECT_ID(N'dbo.MissingIndexFixture') IS NULL
+BEGIN
+    CREATE TABLE dbo.MissingIndexFixture (
+        Id INT IDENTITY(1,1) PRIMARY KEY,
+        Status NVARCHAR(20) NOT NULL,
+        Payload NVARCHAR(400) NOT NULL
+    );
+    INSERT INTO dbo.MissingIndexFixture (Status, Payload)
+    SELECT CASE WHEN rn = 1 THEN N'rare' ELSE N'common' END, REPLICATE(N'x', 400)
+    FROM (
+        SELECT TOP (200000) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS rn
+        FROM sys.all_objects AS a CROSS JOIN sys.all_objects AS b
+    ) AS n;
+END
+GO
+
+DECLARE @MissingIndexFixtureHit INT;
+SELECT @MissingIndexFixtureHit = Id FROM dbo.MissingIndexFixture WHERE Status = N'rare';
+GO
+
+-- dbo.MissingIndexHiddenFromS: an identical fixture. principals.sql's
+-- own per-object DENY VIEW DEFINITION to asq_test_s makes this
+-- object's catalog row invisible to S while leaving its instance-level
+-- DMV evidence visible (design spec: "Use left joins for optional
+-- local names so metadata visibility cannot silently remove DMV
+-- evidence") - the real-engine counterpart to
+-- TestMissingCellValuesLeftJoinAndOrder's own fake-driver proof.
+IF OBJECT_ID(N'dbo.MissingIndexHiddenFromS') IS NULL
+BEGIN
+    CREATE TABLE dbo.MissingIndexHiddenFromS (
+        Id INT IDENTITY(1,1) PRIMARY KEY,
+        Status NVARCHAR(20) NOT NULL,
+        Payload NVARCHAR(400) NOT NULL
+    );
+    INSERT INTO dbo.MissingIndexHiddenFromS (Status, Payload)
+    SELECT CASE WHEN rn = 1 THEN N'rare' ELSE N'common' END, REPLICATE(N'x', 400)
+    FROM (
+        SELECT TOP (200000) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS rn
+        FROM sys.all_objects AS a CROSS JOIN sys.all_objects AS b
+    ) AS n;
+END
+GO
+
+DECLARE @MissingIndexHiddenFromSHit INT;
+SELECT @MissingIndexHiddenFromSHit = Id FROM dbo.MissingIndexHiddenFromS WHERE Status = N'rare';
+GO
+
+-- dbo.StatsFixture: two independent single-column statistics, so a
+-- principal with column-level SELECT on exactly one of them sees
+-- mixed availability within the same "stats list" table (design spec
+-- line 176: "SELECT on only one statistic's columns (mixed
+-- availability)").
+IF OBJECT_ID(N'dbo.StatsFixture') IS NULL
+BEGIN
+    CREATE TABLE dbo.StatsFixture (
+        Id INT IDENTITY(1,1) PRIMARY KEY,
+        Granted NVARCHAR(50) NOT NULL,
+        Withheld NVARCHAR(50) NOT NULL
+    );
+    INSERT INTO dbo.StatsFixture (Granted, Withheld) VALUES (N'a', N'x'), (N'b', N'y'), (N'c', N'z');
+    CREATE STATISTICS St_Granted ON dbo.StatsFixture (Granted);
+    CREATE STATISTICS St_Withheld ON dbo.StatsFixture (Withheld);
+END
+GO
