@@ -2,6 +2,8 @@ package artifacts
 
 import (
 	"bytes"
+	"encoding/json"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -42,6 +44,58 @@ func TestManifestNeverCarriesPreviewState(t *testing.T) {
 		if strings.Contains(string(data), key) {
 			t.Fatalf("manifest must never carry PreviewState, found key %s in %s", key, data)
 		}
+	}
+}
+
+// TestManifestNoticeCountSurvivesTruncation proves maxManifestNotices
+// is not dead weight: once the run has accumulated 51 notices, the
+// manifest's embedded list is capped at 50, AND notice_count still
+// carries the true total (51). The second property matters more than
+// the first: it is what makes this an honest, visible truncation
+// rather than the 51st notice silently vanishing with no trace it ever
+// existed. Replacing maxManifestNotices with a much larger number, or
+// removing the cap altogether, must make this test fail.
+func TestManifestNoticeCountSurvivesTruncation(t *testing.T) {
+	c, err := New(t.TempDir(), "json", Limits{Rows: 10, Bytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Begin(intSpec("x")); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Row([]model.Cell{int64(0)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.End(true, true); err != nil {
+		t.Fatal(err)
+	}
+
+	const total = 51
+	for i := 0; i < total; i++ {
+		c.Notice(model.Notice{Kind: "warning", Message: fmt.Sprintf("notice %d", i), Table: "x"})
+	}
+
+	result, err := c.Finish(model.ContextInfo{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := os.ReadFile(result.ManifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Notices     []json.RawMessage `json:"notices"`
+		NoticeCount int               `json:"notice_count"`
+	}
+	if err := json.Unmarshal(data, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if len(doc.Notices) != maxManifestNotices {
+		t.Fatalf("embedded notices list must be capped at %d, got %d", maxManifestNotices, len(doc.Notices))
+	}
+	if doc.NoticeCount != total {
+		t.Fatalf("notice_count must carry the true total (%d), got %d - the 51st notice must never silently disappear", total, doc.NoticeCount)
 	}
 }
 
@@ -255,5 +309,48 @@ func TestManifestReservationFailsCode6WithoutClaimingComplete(t *testing.T) {
 		if e.Name() == "manifest.json" {
 			t.Fatal("no manifest.json must exist when Finish reports it could not write one")
 		}
+	}
+}
+
+// TestFinishManifestErrorOverridesCollectionError proves, end to end,
+// the brief's own rule verbatim: "Finish reçoit l'erreur de collecte et
+// la conserve, sauf erreur fichier ultérieure vers 6." Finish is handed
+// a collection error that already happened (a row-limit breach, code 7,
+// or a diagnostic failure, code 5) and, independently, a manifest that
+// cannot fit its byte budget at all (no incomplete artifact exists to
+// reclaim space from). The later, file-level error must win: Finish
+// reports exit code 6, not the collection error it was handed - this
+// was previously correct only by reading the code, never exercised by
+// a test that combines both failures in the same run.
+func TestFinishManifestErrorOverridesCollectionError(t *testing.T) {
+	for _, runErr := range []error{
+		&model.PublicError{Code: 7, Kind: "collection_limit", Message: "row limit exceeded"},
+		&model.PublicError{Code: 5, Kind: "execution", Message: "diagnostic failed"},
+	} {
+		t.Run(fmt.Sprintf("code_%d", model.ExitCode(runErr)), func(t *testing.T) {
+			c, err := New(t.TempDir(), "json", Limits{Rows: 1000, Bytes: 100 * 1024})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := c.Begin(intSpec("x")); err != nil {
+				t.Fatal(err)
+			}
+			if err := c.Row([]model.Cell{int64(0)}); err != nil {
+				t.Fatal(err)
+			}
+			if err := c.End(true, true); err != nil {
+				t.Fatal(err)
+			}
+
+			// A manifest this large cannot fit the 100 KiB budget no
+			// matter what is reclaimed - there is nothing incomplete
+			// here to reclaim at all.
+			hugeServer := strings.Repeat("s", 400*1024)
+
+			_, finishErr := c.Finish(model.ContextInfo{Server: hugeServer}, runErr)
+			if code := model.ExitCode(finishErr); code != 6 {
+				t.Fatalf("an unfittable manifest must override the preexisting collection error %v: got exit code %d (%v)", runErr, code, finishErr)
+			}
+		})
 	}
 }

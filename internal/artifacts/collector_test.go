@@ -2,6 +2,7 @@ package artifacts
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,7 +10,21 @@ import (
 	"time"
 
 	"github.com/rudi-bruchez/argosql/internal/model"
+	"github.com/rudi-bruchez/argosql/internal/output"
 )
+
+// failingWriter always refuses a write with a fresh error. It never
+// closes anything and never touches a real file - unlike closing an
+// *os.File out from under an encoder (which, on the very next Close,
+// fails to write its own flush AND fails a second time closing the
+// file itself, so a missing check on either return value goes
+// unnoticed - see the two TestDiskFailureDuring* tests below), this
+// isolates a pure write failure on the artifact's own writer.
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) {
+	return 0, errors.New("artifacts test: injected write failure")
+}
 
 func intSpec(name string) model.TableSpec {
 	return model.TableSpec{Name: name, Columns: []model.Column{{Name: "n", SQLType: "int"}}}
@@ -35,6 +50,46 @@ func TestRowLimit(t *testing.T) {
 	err = c.Row([]model.Cell{int64(2)})
 	if model.ExitCode(err) != 7 {
 		t.Fatalf("limit error: %v", err)
+	}
+}
+
+// TestBeginRefusesSecondTableWithoutHeaderRoom proves Begin's own guard
+// (measuring even an empty table's size against the remaining budget
+// before ever creating the real file) is not dead code: once a first
+// table has consumed the entire collection budget, a second table -
+// with no room even for its own empty header - must be refused, not
+// silently opened. Without this guard, accounted usage can exceed
+// Limits.Bytes outright: a correctness review measured it reaching
+// double the promised budget for two same-shaped tables.
+func TestBeginRefusesSecondTableWithoutHeaderRoom(t *testing.T) {
+	emptyBytes, err := measureTotal("json", intSpec("a"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c, err := New(t.TempDir(), "json", Limits{Rows: 10, Bytes: manifestReserveBytes + emptyBytes})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Begin(intSpec("a")); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.End(true, true); err != nil {
+		t.Fatal(err)
+	}
+
+	usedBeforeSecond := c.store.used
+	collectionBudget := c.limits.Bytes - manifestReserveBytes
+
+	err = c.Begin(intSpec("b"))
+	if model.ExitCode(err) != 7 {
+		t.Fatalf("a second table with no room even for its own empty header must be refused with code 7, got %v", err)
+	}
+	if c.store.used != usedBeforeSecond {
+		t.Fatalf("a refused Begin must not change accounted usage: before=%d after=%d", usedBeforeSecond, c.store.used)
+	}
+	if c.store.used > collectionBudget {
+		t.Fatalf("accounted usage %d must never exceed the collection budget %d - a cap that can be doubled is not a cap", c.store.used, collectionBudget)
 	}
 }
 
@@ -192,6 +247,48 @@ func TestBytesLimitBeforeAtAfter(t *testing.T) {
 	})
 }
 
+// TestRowByteAccountingMatchesDiskSize proves rowSeparatorBytes is not
+// dead weight: the cumulative byte count Row predicts for a table
+// (c.artifacts[0].Bytes, and store.used alongside it) must equal the
+// artifact's actual size on disk once several rows have been written,
+// in both formats. A drift of one byte per row after the first -
+// exactly what a rowSeparatorBytes that always returned 0 would cause
+// - is invisible on a single row and only shows up once there is more
+// than one: this is why 5 rows, not 1, are written here.
+func TestRowByteAccountingMatchesDiskSize(t *testing.T) {
+	for _, format := range []string{"json", "tsv"} {
+		t.Run(format, func(t *testing.T) {
+			c, err := New(t.TempDir(), format, Limits{Rows: 1000, Bytes: 1 << 30})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := c.Begin(intSpec("x")); err != nil {
+				t.Fatal(err)
+			}
+			for i := 0; i < 5; i++ {
+				if err := c.Row([]model.Cell{int64(i)}); err != nil {
+					t.Fatalf("row %d: %v", i, err)
+				}
+			}
+			if err := c.End(true, true); err != nil {
+				t.Fatal(err)
+			}
+
+			data, err := os.ReadFile(c.artifacts[0].Path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			actual := int64(len(data))
+			if c.artifacts[0].Bytes != actual {
+				t.Fatalf("%s: accounted artifact size %d does not match actual file size %d", format, c.artifacts[0].Bytes, actual)
+			}
+			if c.store.used != actual {
+				t.Fatalf("%s: accounted store usage %d does not match actual file size %d", format, c.store.used, actual)
+			}
+		})
+	}
+}
+
 // TestFileLimitSingleSource proves File()'s overflow sentinel on an
 // indivisible source object: a source exactly as large as the
 // remaining budget is kept in full, and a source one byte larger is
@@ -286,35 +383,79 @@ func TestFileCollisionAvoidsSymlink(t *testing.T) {
 	}
 }
 
-// TestDiskFailureDuringClose injects a real write failure - not a
-// collection-limit breach - by closing the table's underlying file out
-// from under the still-open encoder before End flushes it. End must
-// report a distinct, file-error exit code (6), not the collection-limit
-// code (7): the two causes must never be confused.
-func TestDiskFailureDuringClose(t *testing.T) {
+// TestDiskFailureDuringFlush proves End reports a distinct file-error
+// exit code (6) - not the collection-limit code (7) - when flushing the
+// table's buffered content actually fails to write. The injection
+// replaces the open table's encoder with one writing to a writer that
+// always refuses, while the table's real file is left open and healthy
+// throughout: only the flush fails, so this is the one case that
+// exercises finalizeCurrent's closeErr check in isolation. Closing the
+// real *os.File early instead (as an earlier, hollow version of this
+// test did) makes both Close calls fail for confounded reasons and
+// proves nothing about closeErr specifically - a correctness review
+// measured that removing the closeErr check entirely left that version
+// green.
+func TestDiskFailureDuringFlush(t *testing.T) {
 	c, err := New(t.TempDir(), "json", Limits{Rows: 1000, Bytes: 1 << 30})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Begin(intSpec("x")); err != nil {
+	spec := intSpec("x")
+	if err := c.Begin(spec); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.Row([]model.Cell{int64(0)}); err != nil {
 		t.Fatal(err)
 	}
-	// Fault injection: close the real file's descriptor directly,
-	// out-of-band from the Collector's own lifecycle, so the buffered
-	// JSON encoder's flush-on-Close fails with a genuine write error.
+
+	// Fault injection: swap the table's encoder for one over a writer
+	// that always fails, so Close's flush hits a genuine write error.
+	// The real file (c.current.file) is untouched and still perfectly
+	// closeable.
+	faulty, err := output.NewTableEncoder(failingWriter{}, "json", spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.current.real = faulty
+
+	err = c.End(true, true)
+	if code := model.ExitCode(err); code != 6 {
+		t.Fatalf("a flush failure while closing the artifact's encoder must be exit code 6, got %d (%v)", code, err)
+	}
+}
+
+// TestDiskFailureDuringFileClose proves End reports the same exit code
+// (6) when the table's own file fails to close, even though the
+// encoder's own flush succeeded cleanly moments before. The injection
+// replaces the open table's encoder with one over an in-memory buffer
+// (so its Close always succeeds, isolating the failure to the file),
+// then closes the real file early so the file.Close inside End is a
+// genuine second close on an already-closed descriptor.
+func TestDiskFailureDuringFileClose(t *testing.T) {
+	c, err := New(t.TempDir(), "json", Limits{Rows: 1000, Bytes: 1 << 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := intSpec("x")
+	if err := c.Begin(spec); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Row([]model.Cell{int64(0)}); err != nil {
+		t.Fatal(err)
+	}
+
+	harmless, err := output.NewTableEncoder(&bytes.Buffer{}, "json", spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.current.real = harmless
 	if err := c.current.file.Close(); err != nil {
 		t.Fatal(err)
 	}
 
 	err = c.End(true, true)
-	if err == nil {
-		t.Fatal("expected a write failure, got nil")
-	}
 	if code := model.ExitCode(err); code != 6 {
-		t.Fatalf("a file error closing the artifact must be exit code 6, got %d (%v)", code, err)
+		t.Fatalf("a file-close failure must be exit code 6, got %d (%v)", code, err)
 	}
 }
 
