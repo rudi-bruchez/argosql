@@ -1,7 +1,9 @@
 -- principals.sql creates the three SQL logins this suite's permission
 -- tests run as, following the exact bundles the design spec defines:
 --   Q (Query Store)        : CONNECT, VIEW DATABASE STATE
---   I (inspection)         : Q, plus VIEW DEFINITION and SELECT on dbo
+--   I (inspection)         : Q, plus VIEW DEFINITION and SELECT on dbo,
+--                            plus (2022 only) VIEW DATABASE PERFORMANCE
+--                            STATE and VIEW SECURITY DEFINITION
 --   S (instance diagnostics): I, plus the instance-level state permission
 -- Each is an independent SQL login/user: SQL Server has no login
 -- inheritance, so I and S repeat everything Q and I already hold rather
@@ -69,6 +71,22 @@ GO
 
 GRANT VIEW DEFINITION TO asq_test_i, asq_test_s;
 GRANT SELECT ON SCHEMA::dbo TO asq_test_i, asq_test_s;
+GO
+
+-- Design spec, line 149: for size collection through
+-- sys.dm_db_partition_stats, I (and S, which is I plus the instance
+-- permission) must additionally hold VIEW DATABASE PERFORMANCE STATE and
+-- VIEW SECURITY DEFINITION on 2022, "granted explicitly in the 2022
+-- fixture". Both are new in SQL Server 2022 (major 16) and do not exist
+-- as grantable permissions on 2019 (major 15) at all - granting either
+-- there is a SQL error, not a no-op - so this is gated exactly like the
+-- instance permission above, inside the script itself.
+DECLARE @major2022 int = CAST(SERVERPROPERTY('ProductMajorVersion') AS int);
+IF @major2022 >= 16
+BEGIN
+    EXEC('GRANT VIEW DATABASE PERFORMANCE STATE TO asq_test_i, asq_test_s;');
+    EXEC('GRANT VIEW SECURITY DEFINITION TO asq_test_i, asq_test_s;');
+END
 GO
 
 -- Restricted carries an explicit DENY for I and S even though neither was

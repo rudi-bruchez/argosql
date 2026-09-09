@@ -52,11 +52,11 @@ WHERE s.name = @schema AND o.name = @name`
 // permission with Probe: an object that does not exist, probed directly
 // with HAS_PERMS_BY_NAME, comes back Denied exactly like an object that
 // exists but the principal cannot use - see the package doc on Probe and
-// tests/integration/permissions_test.go's TestProbeOnAbsentObjectIsDenied
-// for the measured demonstration. Resolving first, and only probing a
-// name Resolve already found, is the only thing that keeps this program
-// from answering "permission denied" about an object that was never
-// there.
+// tests/integration/permissions_test.go's TestPermissions subtest
+// "probing an absent object directly is denied, not unknown" for the
+// measured demonstration. Resolving first, and only probing a name
+// Resolve already found, is the only thing that keeps this program from
+// answering "permission denied" about an object that was never there.
 func Resolve(ctx context.Context, conn *sql.Conn, qualified string) (Object, error) {
 	schema, name, err := splitTwoPart(qualified)
 	if err != nil {

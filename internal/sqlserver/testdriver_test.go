@@ -38,6 +38,37 @@ type fakeConn struct {
 	execErr    error // returned by ExecContext for the SET LOCK_TIMEOUT statement
 	execBlocks bool  // ExecContext blocks on ctx.Done() instead of answering
 	closeErr   error // returned by Close, to prove Session.Close surfaces it
+
+	// permsResult, when non-nil, is what a HAS_PERMS_BY_NAME query
+	// (issued by either Probe or ServerProbe) reports back: Valid=false
+	// simulates the malformed-probe NULL, Int64=0/Valid=true simulates
+	// Denied, Int64!=0/Valid=true simulates Allowed. permsQueryErr, when
+	// set, makes the query fail outright instead. Exactly one of the two
+	// must be set for a test that issues such a query, or the fake
+	// reports an error rather than guessing.
+	permsResult   *sql.NullInt64
+	permsQueryErr error
+
+	// resolveRow and resolveNoRows configure what Resolve's
+	// sys.objects/sys.schemas join query reports back: resolveRow answers
+	// with that one row, resolveNoRows simulates zero rows (io.EOF on the
+	// first Next, same as sql.ErrNoRows through QueryRowContext), and
+	// resolveQueryErr makes the query fail outright. Exactly one of the
+	// three must be set for a test that issues this query.
+	resolveRow      *fakeResolvedRow
+	resolveNoRows   bool
+	resolveQueryErr error
+}
+
+// fakeResolvedRow is the one catalog row fakeConn answers Resolve's query
+// with when resolveRow is set: object_id, schema name, object name, and
+// the raw (unpadded or padded - either works, since Resolve trims it)
+// sys.objects.type value.
+type fakeResolvedRow struct {
+	objectID int64
+	schema   string
+	name     string
+	typ      string
 }
 
 func (c *fakeConn) log(event string) {
@@ -111,8 +142,52 @@ func (c *fakeConn) QueryContext(ctx context.Context, query string, args []driver
 			return nil, c.majorErr
 		}
 		return &fakeScalarRows{col: "major", value: int64(c.major)}, nil
+	case strings.Contains(query, "HAS_PERMS_BY_NAME"):
+		c.log("query:has-perms-by-name")
+		if _, ok := namedArg(args, "permission"); !ok {
+			return nil, fmt.Errorf("fakeConn: HAS_PERMS_BY_NAME query %q is missing its @permission parameter", query)
+		}
+		if c.permsQueryErr != nil {
+			return nil, c.permsQueryErr
+		}
+		if c.permsResult == nil {
+			return nil, fmt.Errorf("fakeConn: HAS_PERMS_BY_NAME probed but the test configured neither permsResult nor permsQueryErr")
+		}
+		return &fakeNullIntRows{value: *c.permsResult}, nil
+	case strings.Contains(query, "sys.objects"):
+		c.log("query:resolve-object")
+		if _, ok := namedArg(args, "schema"); !ok {
+			return nil, fmt.Errorf("fakeConn: resolve query %q is missing its @schema parameter", query)
+		}
+		if _, ok := namedArg(args, "name"); !ok {
+			return nil, fmt.Errorf("fakeConn: resolve query %q is missing its @name parameter", query)
+		}
+		if c.resolveQueryErr != nil {
+			return nil, c.resolveQueryErr
+		}
+		if c.resolveRow != nil {
+			return &fakeResolveRows{row: c.resolveRow}, nil
+		}
+		if c.resolveNoRows {
+			return &fakeResolveRows{}, nil
+		}
+		return nil, fmt.Errorf("fakeConn: resolve query issued but the test configured neither resolveRow nor resolveNoRows nor resolveQueryErr")
 	}
 	return nil, fmt.Errorf("fakeConn: unexpected query %q", query)
+}
+
+// namedArg looks up a driver.NamedValue by Name (case-insensitively, as
+// go-mssqldb itself treats @-prefixed parameter names), returning its
+// Value and whether it was found at all. Used to prove a query this
+// package builds actually carries the parameter it is supposed to,
+// rather than trusting the query text's own @placeholder alone.
+func namedArg(args []driver.NamedValue, name string) (driver.Value, bool) {
+	for _, a := range args {
+		if strings.EqualFold(a.Name, name) {
+			return a.Value, true
+		}
+	}
+	return nil, false
 }
 
 // ResetSession implements driver.SessionResetter. database/sql calls it on
@@ -143,6 +218,55 @@ func (r *fakeScalarRows) Next(dest []driver.Value) error {
 		return io.EOF
 	}
 	dest[0] = r.value
+	r.done = true
+	return nil
+}
+
+// fakeNullIntRows is a driver.Rows over exactly one nullable integer
+// column and one row, enough to simulate HAS_PERMS_BY_NAME's single
+// result - including the NULL case (driver.Value nil), which
+// fakeScalarRows above has no way to produce.
+type fakeNullIntRows struct {
+	value sql.NullInt64
+	done  bool
+}
+
+func (r *fakeNullIntRows) Columns() []string { return []string{"result"} }
+func (r *fakeNullIntRows) Close() error      { return nil }
+func (r *fakeNullIntRows) Next(dest []driver.Value) error {
+	if r.done {
+		return io.EOF
+	}
+	if r.value.Valid {
+		dest[0] = r.value.Int64
+	} else {
+		dest[0] = nil
+	}
+	r.done = true
+	return nil
+}
+
+// fakeResolveRows is a driver.Rows over Resolve's four-column
+// sys.objects/sys.schemas join: object_id, schema name, object name,
+// type. A nil row answers with zero rows (immediate io.EOF), simulating
+// "not found or not visible" exactly as a real zero-row result set does.
+type fakeResolveRows struct {
+	row  *fakeResolvedRow
+	done bool
+}
+
+func (r *fakeResolveRows) Columns() []string {
+	return []string{"object_id", "schema_name", "object_name", "type"}
+}
+func (r *fakeResolveRows) Close() error { return nil }
+func (r *fakeResolveRows) Next(dest []driver.Value) error {
+	if r.row == nil || r.done {
+		return io.EOF
+	}
+	dest[0] = r.row.objectID
+	dest[1] = r.row.schema
+	dest[2] = r.row.name
+	dest[3] = r.row.typ
 	r.done = true
 	return nil
 }
@@ -197,6 +321,12 @@ type fakeOptions struct {
 	closeErr            error
 	connectErr          error
 	connectBlocks       bool
+
+	permsResult     *sql.NullInt64
+	permsQueryErr   error
+	resolveRow      *fakeResolvedRow
+	resolveNoRows   bool
+	resolveQueryErr error
 }
 
 // newFakeDB builds a *sql.DB backed by a fakeConn/fakeConnector pair
@@ -211,6 +341,11 @@ func newFakeDB(opts fakeOptions) (*sql.DB, *[]string) {
 		execErr:             opts.execErr,
 		execBlocks:          opts.execBlocks,
 		closeErr:            opts.closeErr,
+		permsResult:         opts.permsResult,
+		permsQueryErr:       opts.permsQueryErr,
+		resolveRow:          opts.resolveRow,
+		resolveNoRows:       opts.resolveNoRows,
+		resolveQueryErr:     opts.resolveQueryErr,
 	}
 	connector := &fakeConnector{
 		conn:          conn,
@@ -260,6 +395,30 @@ func openRecordedSession(t *testing.T) (*Session, *[]string) {
 		t.Fatalf("open: %v", err)
 	}
 	return s, events
+}
+
+// openFakeConn opens a Session through the fake driver configured by
+// opts and returns its held *sql.Conn, registering the Session's Close
+// as test cleanup. It exists for permissions_test.go and objects_test.go
+// to exercise Probe, ServerProbe and Resolve's actual SQL paths -
+// parameter binding, row scanning, the NULL and zero-row branches -
+// without a real server: before this helper existed, those paths had no
+// unit coverage at all, and a change to, say, Resolve's not-found code
+// could only be caught by the integration suite under Docker. If
+// opts.major is left at zero, it defaults to 16 (any supported major
+// works equally for these tests; 16 needs no extra justification).
+func openFakeConn(t *testing.T, opts fakeOptions) *sql.Conn {
+	t.Helper()
+	if opts.major == 0 {
+		opts.major = 16
+	}
+	db, _ := newFakeDB(opts)
+	s, err := open(context.Background(), db)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	return s.Conn
 }
 
 // sqlError is a small helper so tests can build a mssql.Error carrying a

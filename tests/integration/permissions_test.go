@@ -248,6 +248,65 @@ func TestPermissions(t *testing.T) {
 		}
 	})
 
+	t.Run("I holds the 2022-only granular database permissions", func(t *testing.T) {
+		if major < 16 {
+			t.Skip("VIEW DATABASE PERFORMANCE STATE and VIEW SECURITY DEFINITION do not exist as grantable permissions before major 16")
+		}
+		sess, err := sqlserver.Open(ctx, iProfile)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		defer sess.Close()
+		for _, permission := range []string{"VIEW DATABASE PERFORMANCE STATE", "VIEW SECURITY DEFINITION"} {
+			got, err := sqlserver.Probe(ctx, sess.Conn, "", "DATABASE", permission)
+			if err != nil {
+				t.Fatalf("%s: %v", permission, err)
+			}
+			if got != sqlserver.Allowed {
+				t.Fatalf("%s: got %v, want Allowed", permission, got)
+			}
+		}
+	})
+
+	// Q was only ever granted the older, broader VIEW DATABASE STATE (and
+	// CONNECT), never either 2022-only granular permission explicitly.
+	// Measured on this same server: VIEW DATABASE STATE implies VIEW
+	// DATABASE PERFORMANCE STATE (it is the backward-compatible successor
+	// of exactly the performance-related visibility VIEW DATABASE STATE
+	// always granted - the 2022 split lets a future principal be granted
+	// only the narrow one, but the broad one still covers it), while it
+	// does NOT imply VIEW SECURITY DEFINITION, a capability VIEW DATABASE
+	// STATE never covered. So Q is Allowed on the first and Denied on
+	// the second - not Denied on both, which is what an untested
+	// assumption would have guessed and what this test originally
+	// asserted before being corrected against the real engine.
+	t.Run("Q's VIEW DATABASE STATE implies VIEW DATABASE PERFORMANCE STATE but not VIEW SECURITY DEFINITION", func(t *testing.T) {
+		if major < 16 {
+			t.Skip("VIEW DATABASE PERFORMANCE STATE and VIEW SECURITY DEFINITION do not exist as grantable permissions before major 16")
+		}
+		sess, err := sqlserver.Open(ctx, qProfile)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		defer sess.Close()
+
+		got, err := sqlserver.Probe(ctx, sess.Conn, "", "DATABASE", "VIEW DATABASE PERFORMANCE STATE")
+		if err != nil {
+			t.Fatalf("VIEW DATABASE PERFORMANCE STATE: %v", err)
+		}
+		if got != sqlserver.Allowed {
+			t.Fatalf("VIEW DATABASE PERFORMANCE STATE: got %v, want Allowed (implied by VIEW DATABASE STATE)", got)
+		}
+
+		got, err = sqlserver.Probe(ctx, sess.Conn, "", "DATABASE", "VIEW SECURITY DEFINITION")
+		if err != nil {
+			t.Fatalf("VIEW SECURITY DEFINITION: %v", err)
+		}
+		if got != sqlserver.Denied {
+			t.Fatalf("VIEW SECURITY DEFINITION: got %v, want Denied (not implied by VIEW DATABASE STATE, never granted explicitly)", got)
+		}
+	})
+
 	t.Run("S instance probe is allowed", func(t *testing.T) {
 		sess, err := sqlserver.Open(ctx, sProfile)
 		if err != nil {
@@ -375,7 +434,22 @@ func TestEveryProbeIsWellFormed(t *testing.T) {
 	defer sess.Close()
 	logEngineIdentity(t, lab, sess.Major)
 
-	for _, pr := range sqlserver.AllProbes(sess.Major) {
+	probes := sqlserver.AllProbes(sess.Major)
+	// A registry that silently lost an entry - for example the two
+	// 2022-only granular permissions (VIEW DATABASE PERFORMANCE STATE,
+	// VIEW SECURITY DEFINITION) quietly not being emitted on major 16 -
+	// would otherwise pass this test by ranging over a shorter list and
+	// finding nothing wrong in it. Pinning the count on both images
+	// forces that omission to surface here rather than disappearing.
+	wantCount := 5
+	if sess.Major >= 16 {
+		wantCount = 7
+	}
+	if len(probes) != wantCount {
+		t.Fatalf("AllProbes(%d) returned %d entries, want %d: %v", sess.Major, len(probes), wantCount, probes)
+	}
+
+	for _, pr := range probes {
 		got, err := pr.Run(ctx, sess.Conn, "dbo.Orders")
 		if err != nil {
 			t.Fatalf("%s: %v", pr.Label, err)
@@ -389,12 +463,19 @@ func TestEveryProbeIsWellFormed(t *testing.T) {
 	// returns NULL for securable_class 'SERVER' (it is not a valid class
 	// for this function, unlike for fn_my_permissions). If this assertion
 	// ever saw anything but Unknown, the distinction this whole package
-	// is built on would have silently stopped holding.
+	// is built on would have silently stopped holding. Checked against
+	// both the Permission value and the accompanying error's Code/Kind:
+	// a reviewer proved that checking only perm != Unknown and err == nil
+	// (without looking at what Code or Kind the error actually carried)
+	// let Probe's malformed-error mapping drift to a wrong code and kind
+	// without this test - or any test - noticing.
 	perm, err := sqlserver.Probe(ctx, sess.Conn, "", "SERVER", "VIEW SERVER STATE")
 	if perm != sqlserver.Unknown {
 		t.Fatalf("class SERVER: got %v, want Unknown (err=%v)", perm, err)
 	}
-	if err == nil {
-		t.Fatal("class SERVER: expected a probe_malformed error, got none")
+	assertPublicErrorCode(t, err, 5)
+	var public *model.PublicError
+	if errors.As(err, &public) && public.Kind != "probe_malformed" {
+		t.Fatalf("class SERVER: got kind %q, want probe_malformed", public.Kind)
 	}
 }

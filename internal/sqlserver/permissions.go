@@ -61,6 +61,17 @@ const hasPermsByNameQuery = "SELECT HAS_PERMS_BY_NAME(@securable, @class, @permi
 // because a NULL here is a defect in how this package built the probe,
 // not a fact this program may report to a user as "permission denied" or
 // "permission unknown".
+//
+// Probing class "OBJECT", permission "SELECT" only ever reflects a
+// table-or-wider grant: measured, a principal with SELECT granted on a
+// subset of columns and no table-level SELECT at all still probes this
+// exact call to Denied, even though it can genuinely read those columns.
+// HAS_PERMS_BY_NAME only surfaces that through its five-argument column
+// form, HAS_PERMS_BY_NAME(name, "OBJECT", "SELECT", columnName,
+// "COLUMN"), which this call does not make. A caller that only needs
+// specific columns must not treat this probe's Denied as grounds to
+// refuse the work outright - see AllProbes' object:SELECT entry for the
+// same note where the registry actually emits this probe.
 func Probe(ctx context.Context, conn *sql.Conn, name, class, permission string) (Permission, error) {
 	securable := sql.NullString{String: name, Valid: name != ""}
 	var result sql.NullInt64
@@ -146,16 +157,25 @@ type ProbeSpec struct {
 //   - Q (Query Store): CONNECT and VIEW DATABASE STATE, both DATABASE-class.
 //   - I (inspection): Q plus VIEW DEFINITION (DATABASE-class, so catalog
 //     metadata across the whole fixture database is visible) and SELECT
-//     on fixture tables (OBJECT-class, resolved-name-scoped).
+//     on fixture tables (OBJECT-class, resolved-name-scoped). For size
+//     collection through sys.dm_db_partition_stats, the design spec (line
+//     149) additionally requires, on Major 16 and later only, the two
+//     narrower permissions SQL Server 2022 introduced for exactly this:
+//     VIEW DATABASE PERFORMANCE STATE and VIEW SECURITY DEFINITION, both
+//     DATABASE-class. They do not exist as grantable permissions before
+//     Major 16, so they are absent from the registry below that major,
+//     never merely unprobed: granting either on Major 15 is itself a SQL
+//     error, not a Denied result.
 //   - S (instance diagnostics): I plus the version-dependent instance-level
 //     state permission.
 //
-// It depends on major only through that last entry: the instance
-// permission differs between Major 15 (VIEW SERVER STATE) and Major 16
-// or later (VIEW SERVER PERFORMANCE STATE).
+// The registry therefore has two version-dependent shapes, not one:
+// Major 15 gets five entries, Major 16 and later get seven (the two 2022
+// grants above, plus the narrower instance permission - see
+// instanceStatePermission).
 func AllProbes(major int) []ProbeSpec {
 	instancePermission := instanceStatePermission(major)
-	return []ProbeSpec{
+	probes := []ProbeSpec{
 		{
 			Label: "database:CONNECT",
 			Run: func(ctx context.Context, conn *sql.Conn, _ string) (Permission, error) {
@@ -174,17 +194,47 @@ func AllProbes(major int) []ProbeSpec {
 				return Probe(ctx, conn, "", "DATABASE", "VIEW DEFINITION")
 			},
 		},
-		{
+	}
+	if major >= 16 {
+		probes = append(probes,
+			ProbeSpec{
+				Label: "database:VIEW DATABASE PERFORMANCE STATE",
+				Run: func(ctx context.Context, conn *sql.Conn, _ string) (Permission, error) {
+					return Probe(ctx, conn, "", "DATABASE", "VIEW DATABASE PERFORMANCE STATE")
+				},
+			},
+			ProbeSpec{
+				Label: "database:VIEW SECURITY DEFINITION",
+				Run: func(ctx context.Context, conn *sql.Conn, _ string) (Permission, error) {
+					return Probe(ctx, conn, "", "DATABASE", "VIEW SECURITY DEFINITION")
+				},
+			},
+		)
+	}
+	probes = append(probes,
+		// Measured: an OBJECT/SELECT probe only ever reflects a
+		// table-or-wider grant. A principal with GRANT SELECT on a
+		// subset of columns (no table-level SELECT at all) probes this
+		// exact (name, "OBJECT", "SELECT") to 0 (Denied) even though it
+		// can genuinely SELECT those columns - HAS_PERMS_BY_NAME only
+		// reports that with its five-argument form,
+		// HAS_PERMS_BY_NAME(name, "OBJECT", "SELECT", columnName,
+		// "COLUMN"), which this probe does not use. A command that only
+		// needs specific columns must not refuse a principal on this
+		// probe's Denied alone; it would wrongly deny work a column-level
+		// grant already allows.
+		ProbeSpec{
 			Label: "object:SELECT",
 			Run: func(ctx context.Context, conn *sql.Conn, name string) (Permission, error) {
 				return Probe(ctx, conn, name, "OBJECT", "SELECT")
 			},
 		},
-		{
+		ProbeSpec{
 			Label: "instance:" + instancePermission,
 			Run: func(ctx context.Context, conn *sql.Conn, _ string) (Permission, error) {
 				return ServerProbe(ctx, conn, instancePermission)
 			},
 		},
-	}
+	)
+	return probes
 }
