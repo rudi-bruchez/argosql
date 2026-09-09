@@ -38,3 +38,6 @@ go.work.sum
 
 # Instructions locales à la machine, jamais publiées
 CLAUDE.local.md
+
+# Documents personnels du propriétaire du dépôt, jamais publiés
+docs/TASKS01.md
