@@ -93,9 +93,27 @@ const queryStoreMarker = "AsqFixtureQueryStoreMarker"
 
 // flushPollDeadline bounds the wait for the flushed marker to become
 // visible in Query Store; flushPollDelay is the short interval between
-// polls, never one fixed sleep for the whole wait.
+// polls, never one fixed sleep for the whole wait. flushPollBudget is
+// the context budget of the whole round trip, workload and flush
+// included, and is the context of the two functions that poll.
+//
+// Why these numbers, and why the ordering between them matters (fix 1's
+// B9, raised here rather than in the pass that deferred it): nothing
+// guarantees that sp_query_store_flush_db makes a query visible through
+// the catalog views synchronously, so this wait is a poll and its only
+// correct bound is "longer than the engine has ever taken". 30 seconds
+// was not: it failed twice in six runs for a reviewer under CPU load,
+// and once more here during the verification of that pass, with two
+// containers competing for the machine.
+//
+// flushPollDeadline must stay strictly BELOW flushPollBudget. Raising
+// the deadline past the context budget would not extend the wait at
+// all: the polling query itself dies of its context first, and the
+// failure then arrives as an opaque driver error from the poll instead
+// of the message below, which names the marker and the bound it waited.
 const (
-	flushPollDeadline = 30 * time.Second
+	flushPollBudget   = 150 * time.Second
+	flushPollDeadline = 120 * time.Second
 	flushPollDelay    = 300 * time.Millisecond
 )
 
@@ -108,7 +126,7 @@ const (
 // built on it later would be guessing.
 func TestFixtureQueryStoreFlush(t *testing.T) {
 	lab := NewLab(t, os.Getenv("ASQ_TEST_IMAGE"))
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), flushPollBudget)
 	defer cancel()
 
 	var major int
@@ -160,7 +178,7 @@ func TestFixtureQueryStoreFlush(t *testing.T) {
 // reuses it verbatim rather than redefining it.
 func (lab *Lab) QueryID(t *testing.T, marker string) int64 {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), flushPollBudget)
 	defer cancel()
 
 	load := strings.ReplaceAll(workloadScript, "{{MARKER}}", marker)
