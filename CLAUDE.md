@@ -201,12 +201,30 @@ plans d'un même `query_id` dans deux intervalles distincts. C'est le cas non d�
 dépend toute preuve de jointure vers les plans.
 
 Rien ne garantit que `sp_query_store_flush_db` rende une requête **visible par les vues de
-catalogue de façon synchrone**. Toute attente de ce genre est un sondage, jamais un
-`sleep` fixe, et sa borne doit être plus longue que tout ce que le moteur a jamais pris :
-trente secondes ont échoué trois fois sous charge processeur, deux minutes tiennent. Et le
-délai de sondage doit rester **strictement inférieur au budget de contexte** de la requête
-qui sonde, sans quoi c'est la requête qui meurt d'abord et l'échec arrive sous forme
-d'erreur de pilote opaque au lieu du message qui nomme ce qu'on attendait.
+catalogue**, et le mode d'échec n'est pas une latence : c'est une **capture qui n'a pas eu
+lieu**. Mesuré ici, une exécution unique d'un lot n'est pas fiablement capturée là où cinq
+exécutions du même lot le sont, et sous pression mémoire la tâche d'arrière-plan qui capture
+est affamée. Conséquence : une attente plus longue ne produit jamais une ligne que le moteur
+n'a pas capturée. Un sondage doit **réémettre sa charge** et reforcer un vidage
+périodiquement, pas seulement dormir. Et son délai doit rester **strictement inférieur au
+budget de contexte** de la requête qui sonde, sans quoi c'est la requête qui meurt d'abord et
+l'échec arrive sous forme d'erreur de pilote opaque.
+
+Les avertissements d'un plan d'exécution s'expriment **en attributs de l'élément `Warnings`
+autant qu'en enfants**. `<Warnings NoJoinPredicate="1"/>` est une forme que le moteur produit
+réellement, mesurée sur 2019 et 2022 avec une jointure croisée : un lecteur qui ne parcourt que
+les enfants perd l'avertissement en silence. Et **les avertissements réels ont eux-mêmes des
+enfants imbriqués**, `ColumnsWithNoStatistics` portant des `ColumnReference`, donc un lecteur
+sans garde de profondeur transforme chaque descendant en avertissement et sature son plafond.
+Les deux faits tirent en sens inverse et se tiennent ensemble.
+
+`sys.query_store_plan.query_plan` est de type **`nvarchar` et nullable**, pas `xml`. Vérifié
+par sonde sur `sys.all_columns`, sur les deux versions.
+
+Le XML de plan produit par les fixtures de ce projet fait environ **4 500 octets, sans aucun
+CRLF ni caractère non ASCII**, sur 2019 comme sur 2022. Toute preuve d'identité octet à octet
+qui compterait sur les données du moteur pour couvrir ces deux caractéristiques ne couvre rien :
+il faut une charge synthétique dédiée.
 
 ## Méthode : la cassure
 
