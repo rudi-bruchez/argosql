@@ -66,12 +66,28 @@ type Cell any // nil, string, bool, int64, float64 ; SQL exact en string si néc
 // sérialiser en valeur nue plutôt qu'en {"Value":"abc"}, un type nu n'exige
 // rien. Mesuré identique octet pour octet. Les consommateurs font leur
 // type-switch sur la Cell elle-même, pas sur un champ de la Cell.
-// Vocabulaire fermé des raisons de réduction. Toute autre valeur est un défaut.
+// Vocabulaire fermé des raisons de réduction, NORMATIF et tiré de la spec
+// ligne 101, qui l'énumère : row_limit, byte_limit, cell_limit,
+// collection_limit, property_unavailable. Toute autre valeur est un défaut.
+// La première rédaction de ce plan avait inventé quatre valeurs à la place,
+// sans enregistrer qu'elle amendait l'autorité ; deux relecteurs indépendants
+// l'ont relevé à la tâche 7 et la mesure a confirmé qu'un consommateur fidèle
+// à la spec ne reconnaissait aucune raison reçue.
 const (
-    ReasonPreviewOmitted     = "preview_omitted"     // cellule trop grosse pour le budget
-    ReasonRowsTruncated      = "rows_truncated"      // lignes retirées pour tenir
-    ReasonCellTruncated      = "cell_truncated"      // troncature par runes
-    ReasonEncodingNormalized = "encoding_normalized" // remplacement de séquence invalide
+    ReasonRowLimit            = "row_limit"            // lignes au-delà de --preview N
+    ReasonByteLimit           = "byte_limit"           // lignes ou cellules retirées pour tenir dans le budget stdout
+    ReasonCellLimit           = "cell_limit"           // cellule tronquée par compte de runes
+    ReasonCollectionLimit     = "collection_limit"     // la collecte elle-même s'est arrêtée à un plafond
+    ReasonPropertyUnavailable = "property_unavailable" // propriété optionnelle illisible
+)
+// Ces deux-là ne sont PAS des raisons d'omission et n'entrent jamais dans
+// omitted_reasons. `preview_omitted` est un booléen de la réponse compacte
+// (spec ligne 105) et l'étiquette de l'état « zéro ligne affichée alors que
+// des lignes ont été collectées » (spec ligne 101). `encoding_normalized` est
+// un fait enregistré pour lui-même (spec ligne 91), porté par un model.Notice.
+const (
+    KindPreviewOmitted     = "preview_omitted"
+    KindEncodingNormalized = "encoding_normalized"
 )
 // Enveloppe de dernier recours quand le résultat lui-même ne tient pas dans le
 // budget. Type dédié : model.Result ne peut pas produire ce littéral, et
@@ -427,7 +443,7 @@ func TestOversizedCellIsNotEmpty(t *testing.T) {
 ```
 
 - [ ] Rouge : `go test ./internal/output -run 'TestOversizedCellIsNotEmpty|TestPreviewBudget' -v` ; attendu : 2 tests. Le filtre nomme les tests, il n'utilise pas `Test.*Preview`, qui masque une absence derrière une correspondance large.
-- [ ] Appliquer cet ordre : tronquer cellules par runes -> réserver enveloppe/métadonnées -> parts égales entre tables non vides -> lignes entières -> redistribuer dans l'ordre de la spec -> réencoder et vérifier la taille incluant newline. Retirer la dernière ligne candidate si le calcul exact augmente avec les métadonnées. Gérer fallback manifeste puis erreur fixe sans chemin. Ce littéral se sérialise depuis `model.FallbackError` défini à la tâche 1, jamais depuis `model.Result` : mesuré, `Result` produit en plus `context`, `tables` et `sql_number`, et `omitempty` ferait disparaître `"ok":false`. Les raisons de réduction viennent du vocabulaire fermé de la tâche 1 ; ne pas inventer de chaîne locale.
+- [ ] Appliquer cet ordre : tronquer cellules par runes -> réserver enveloppe/métadonnées -> parts égales entre tables non vides -> lignes entières -> redistribuer dans l'ordre de la spec -> réencoder et vérifier la taille incluant newline. Retirer la dernière ligne candidate si le calcul exact augmente avec les métadonnées. Gérer DEUX paliers de repli distincts, que la spec ligne 105 définit et qu'une première implémentation avait réduits à un seul. Palier A : quand les métadonnées seules dépassent le plafond, émettre une réponse compacte portant le chemin du manifeste et `preview_omitted=true`, les métadonnées complètes restant dans le manifeste. Palier B, seulement si la réponse compacte elle-même ne tient pas : code 6 avec l'enveloppe d'erreur fixe et bornée, sans chemin embarqué. Sauter directement au palier B quand `ManifestPath` est renseigné et tiendrait est un défaut : c'est perdre la seule information qui permettrait à l'utilisateur de retrouver ses données. Ce littéral se sérialise depuis `model.FallbackError` défini à la tâche 1, jamais depuis `model.Result` : mesuré, `Result` produit en plus `context`, `tables` et `sql_number`, et `omitempty` ferait disparaître `"ok":false`. Les raisons de réduction viennent du vocabulaire fermé de la tâche 1 ; ne pas inventer de chaîne locale.
 
 ```json
 {"schema_version":1,"ok":false,"error":{"code":6,"kind":"output_budget","message":"response metadata exceeds output budget"}}
