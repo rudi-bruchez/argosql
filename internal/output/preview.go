@@ -1049,7 +1049,7 @@ func encodeResultTSV(r model.Result) ([]byte, error) {
 		// (zero collected, collection complete), which the spec is
 		// explicit must still be callable empty.
 		if t.Preview.RowsShown == 0 && t.State.RowsCollected > 0 {
-			tableFields = append(tableFields, "preview_omitted=true")
+			tableFields = append(tableFields, fmt.Sprintf("%s=true", model.KindPreviewOmitted))
 		}
 		appendTSVLine(&buf, tableFields...)
 		names := make([]string, len(t.Spec.Columns)+1)
