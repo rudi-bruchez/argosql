@@ -67,6 +67,16 @@ type tableWork struct {
 	cellTrunc  []bool
 	byteTrunc  []bool
 
+	// byteCappedAtGather is true when gatherTable stopped reading
+	// candidate rows early because the loose per-table byte reservation
+	// (cumulative+sz>ByteLimit) tripped, rather than because --preview N
+	// (options.Rows) was reached or the source was exhausted. It
+	// disambiguates why len(candidates) can be less than collected: that
+	// gap is row_limit when this is false (the row cap is what stopped
+	// gathering) and byte_limit when this is true (the byte budget is
+	// what stopped it), never both for the same table.
+	byteCappedAtGather bool
+
 	// selected is how many of candidates (always a prefix, in
 	// collection order) are currently part of the output.
 	selected int
@@ -105,18 +115,21 @@ func Render(result model.Result, options PreviewOptions, format string) ([]byte,
 	// measuring the response exactly as it would be with every table
 	// showing zero rows. This is usually, but not provably always, a
 	// floor the trimming loop below can fall back to: the
-	// rows_truncated text in each omitted table's omitted_reasons has
-	// its own cost, which can exceed what a single small retained row
-	// would have cost (a one-digit int cell is a real example). When
-	// that happens, the loop below still terminates correctly - it just
-	// reaches its own fallbackTierB call rather than this early one.
+	// omitted_reasons text in each omitted table's preview has its own
+	// cost, which can exceed what a single small retained row would have
+	// cost (a one-digit int cell is a real example), and a row that
+	// needs its own cell_limit or byte_limit truncation once shown costs
+	// more than the zero-row envelope assumed, since the envelope never
+	// shows any row and so never pays for those two reasons. When either
+	// happens, the loop below still terminates correctly - it just
+	// reaches its own fallback call rather than this early one.
 	envelope, err := encodeResult(format, buildZeroResult(result, works))
 	if err != nil {
 		return nil, err
 	}
 	effectiveLimit := int64(options.ByteLimit) - finalNewlineBytes(envelope)
 	if int64(len(envelope)) > effectiveLimit {
-		return fallbackTierB(result.SchemaVersion)
+		return fallback(result, options)
 	}
 	remaining := effectiveLimit - int64(len(envelope))
 
@@ -155,7 +168,7 @@ func Render(result model.Result, options PreviewOptions, format string) ([]byte,
 	// never silently empty).
 	for iterations := 0; ; iterations++ {
 		if iterations > 100000 {
-			return fallbackTierB(result.SchemaVersion)
+			return fallback(result, options)
 		}
 		enc, err := encodeResult(format, buildResult(result, works))
 		if err != nil {
@@ -185,7 +198,7 @@ func Render(result model.Result, options PreviewOptions, format string) ([]byte,
 		// does not rule this out - see its comment on rows that cost
 		// less than their own omission reason). Fall back rather than
 		// emit something over budget.
-		return fallbackTierB(result.SchemaVersion)
+		return fallback(result, options)
 	}
 }
 
@@ -228,6 +241,7 @@ func gatherTable(t model.TableResult, artifacts []model.Artifact, options Previe
 			return w, err
 		}
 		if i > 0 && cumulative+sz > int64(options.ByteLimit) {
+			w.byteCappedAtGather = true
 			break
 		}
 		cumulative += sz
@@ -523,24 +537,65 @@ func rowBytes(format string, cols []model.Column, row []model.Cell, idx int) (in
 	return int64(len(line)), nil
 }
 
+// tableReasons derives, for one table, which of the closed vocabulary's
+// five conditions apply when exactly selected of w.candidates are shown:
+//
+//   - rowLimited: gathering itself never saw every collected row, and the
+//     byte budget was not why (w.byteCappedAtGather is false) - --preview
+//     N is what capped it.
+//   - byteLimited: either gathering stopped early to stay within the
+//     byte budget (w.byteCappedAtGather), or the final selection shows
+//     fewer rows than were actually gathered (selected < len(candidates),
+//     room for them existed but the output budget did not), or one of
+//     the selected rows itself needed a byte-level shrink
+//     (w.byteTrunc[j]) to fit.
+//   - cellLimited: one of the selected rows needed rune-count truncation
+//     (w.cellTrunc[j]).
+//
+// These two sources of "rows left out" are deliberately kept apart: a row
+// beyond --preview N and a row dropped to stay under the stdout byte cap
+// are different facts a caller needs to tell apart, and the code that
+// used to conflate them into one rows_truncated reason is exactly the
+// defect this function exists to correct. rowLimited and byteLimited can
+// both be true for the same table at once (more rows exist beyond what
+// --preview N let through, and what did get gathered still didn't all
+// fit the byte budget) - they are independent facts, not alternatives.
+func tableReasons(w tableWork, selected int) (rowLimited, byteLimited, cellLimited bool) {
+	rowLimited = !w.byteCappedAtGather && w.collected > int64(len(w.candidates))
+	byteLimited = w.byteCappedAtGather || selected < len(w.candidates)
+	for j := 0; j < selected; j++ {
+		if w.cellTrunc[j] {
+			cellLimited = true
+		}
+		if w.byteTrunc[j] {
+			byteLimited = true
+		}
+	}
+	return rowLimited, byteLimited, cellLimited
+}
+
 // buildPreviewState is the single place that turns a table's collected
-// count, how many rows ended up shown, and whether any cell truncation
-// happened, into model.PreviewState - including the reasons vocabulary,
-// which is the closed set from internal/model and nothing else. shown <
-// collected always sets ReasonRowsTruncated: whatever caused it (a low
-// --preview count, --preview 0, or the byte budget), the caller reading
-// rows_shown next to rows_collected must see that rows were left out, not
-// infer an empty table.
-func buildPreviewState(collected, shown int64, cellTrunc, byteTrunc bool) model.PreviewState {
+// count, how many rows ended up shown, and the specific limiting causes
+// that applied, into model.PreviewState - including the reasons
+// vocabulary, which is the closed set from internal/model.ReasonRowLimit
+// etc. and nothing else. The five conditions are independent facts: a
+// table can carry more than one omitted_reasons entry at once.
+func buildPreviewState(collected, shown int64, rowLimited, byteLimited, cellLimited, collectionLimited, propertyUnavailable bool) model.PreviewState {
 	reasons := []string{}
-	if cellTrunc {
-		reasons = append(reasons, model.ReasonCellTruncated)
+	if rowLimited {
+		reasons = append(reasons, model.ReasonRowLimit)
 	}
-	if byteTrunc {
-		reasons = append(reasons, model.ReasonPreviewOmitted)
+	if byteLimited {
+		reasons = append(reasons, model.ReasonByteLimit)
 	}
-	if shown < collected {
-		reasons = append(reasons, model.ReasonRowsTruncated)
+	if cellLimited {
+		reasons = append(reasons, model.ReasonCellLimit)
+	}
+	if collectionLimited {
+		reasons = append(reasons, model.ReasonCollectionLimit)
+	}
+	if propertyUnavailable {
+		reasons = append(reasons, model.ReasonPropertyUnavailable)
 	}
 	return model.PreviewState{
 		RowsShown:       shown,
@@ -560,20 +615,13 @@ func buildResult(result model.Result, works []tableWork) model.Result {
 		w := works[i]
 		rows := make([][]model.Cell, w.selected)
 		copy(rows, w.candidates[:w.selected])
-		var cellTrunc, byteTrunc bool
-		for j := 0; j < w.selected; j++ {
-			if w.cellTrunc[j] {
-				cellTrunc = true
-			}
-			if w.byteTrunc[j] {
-				byteTrunc = true
-			}
-		}
+		rowLimited, byteLimited, cellLimited := tableReasons(w, w.selected)
 		out.Tables[i] = model.TableResult{
-			Spec:    t.Spec,
-			Rows:    rows,
-			State:   t.State,
-			Preview: buildPreviewState(w.collected, int64(w.selected), cellTrunc, byteTrunc),
+			Spec:  t.Spec,
+			Rows:  rows,
+			State: t.State,
+			Preview: buildPreviewState(w.collected, int64(w.selected), rowLimited, byteLimited, cellLimited,
+				!t.State.CollectionComplete, !t.State.PropertiesComplete),
 		}
 	}
 	return out
@@ -591,14 +639,66 @@ func buildZeroResult(result model.Result, works []tableWork) model.Result {
 	out.Tables = make([]model.TableResult, len(result.Tables))
 	for i, t := range result.Tables {
 		w := works[i]
+		rowLimited, byteLimited, cellLimited := tableReasons(w, 0)
 		out.Tables[i] = model.TableResult{
-			Spec:    t.Spec,
-			Rows:    nil,
-			State:   t.State,
-			Preview: buildPreviewState(w.collected, 0, false, false),
+			Spec:  t.Spec,
+			Rows:  nil,
+			State: t.State,
+			Preview: buildPreviewState(w.collected, 0, rowLimited, byteLimited, cellLimited,
+				!t.State.CollectionComplete, !t.State.PropertiesComplete),
 		}
 	}
 	return out
+}
+
+// fallback picks between Render's two degraded tiers (design spec, line
+// 105) once neither the full response nor any amount of trimming fits
+// ByteLimit: tier A (the manifest path plus preview_omitted=true) when it
+// itself fits, tier B (the fixed, bounded error envelope, no embedded
+// path) otherwise.
+func fallback(result model.Result, options PreviewOptions) ([]byte, error) {
+	if b, ok, err := fallbackTierA(result, options.ByteLimit); err != nil {
+		return nil, err
+	} else if ok {
+		return b, nil
+	}
+	return fallbackTierB(result.SchemaVersion)
+}
+
+// fallbackTierA is Render's first fallback tier: when the zero-row
+// envelope itself does not fit ByteLimit, a compact response carrying
+// only result.ManifestPath and preview_omitted=true may still fit, and is
+// far more useful to a caller than tier B's fixed error envelope - it
+// names exactly where to find everything that was actually collected,
+// rather than nothing at all. It reports ok=false (never an error) when
+// no such response fits, or when result.ManifestPath is empty to begin
+// with (nothing to point a caller at); a response that does fit is
+// returned with a nil error, exactly like Render's normal path, because
+// tier A is a valid, bounded, parseable answer, not a failure of this
+// package. Like tier B, it is always JSON, regardless of the format the
+// caller asked for, for the same reason: it is meant to be the one
+// response that reliably fits and parses once the normal TSV/JSON choice
+// has already failed.
+func fallbackTierA(result model.Result, byteLimit int) (b []byte, ok bool, err error) {
+	if result.ManifestPath == "" {
+		return nil, false, nil
+	}
+	mr := model.ManifestOnlyResult{
+		SchemaVersion:  result.SchemaVersion,
+		OK:             result.OK,
+		ManifestPath:   result.ManifestPath,
+		PreviewOmitted: true,
+		Error:          result.Error,
+	}
+	enc, err := json.Marshal(mr)
+	if err != nil {
+		return nil, false, err
+	}
+	enc = appendFinalNewline(enc)
+	if int64(len(enc)) > int64(byteLimit) {
+		return nil, false, nil
+	}
+	return enc, true, nil
 }
 
 // fallbackTierB is the last resort: response metadata alone (or Render's

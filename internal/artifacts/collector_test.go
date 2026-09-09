@@ -502,7 +502,7 @@ func TestFinishClosesAbandonedTable(t *testing.T) {
 // TestEncodingNormalizedNoticeEmitted proves the collector, not the
 // encoder, is the one that speaks: when the encoder detects it silently
 // substituted invalid UTF-8 bytes with U+FFFD, the collector emits
-// exactly one model.Notice carrying model.ReasonEncodingNormalized.
+// exactly one model.Notice carrying model.KindEncodingNormalized.
 func TestEncodingNormalizedNoticeEmitted(t *testing.T) {
 	c, err := New(t.TempDir(), "json", Limits{Rows: 1000, Bytes: 1 << 30})
 	if err != nil {
@@ -522,7 +522,7 @@ func TestEncodingNormalizedNoticeEmitted(t *testing.T) {
 
 	var matches []model.Notice
 	for _, n := range c.notices {
-		if n.Kind == model.ReasonEncodingNormalized {
+		if n.Kind == model.KindEncodingNormalized {
 			matches = append(matches, n)
 		}
 	}
@@ -554,7 +554,7 @@ func TestEncodingNormalizedNoticeAbsentForCleanInput(t *testing.T) {
 	}
 
 	for _, n := range c.notices {
-		if n.Kind == model.ReasonEncodingNormalized {
+		if n.Kind == model.KindEncodingNormalized {
 			t.Fatalf("expected zero encoding_normalized notices for clean input, got %+v", n)
 		}
 	}

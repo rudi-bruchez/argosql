@@ -94,7 +94,7 @@ func (e *jsonEncoder) Close() error {
 // not valid UTF-8. This encoder only detects and exposes that fact; it
 // never refuses to write the value and never decides what to do about
 // it - deciding belongs to whichever later stage holds a model.Sink (and
-// can therefore emit a model.Notice carrying model.ReasonEncodingNormalized),
+// can therefore emit a model.Notice carrying model.KindEncodingNormalized),
 // not to this encoder. See jsonEncoder.encodingNormalized's doc comment.
 func (e *jsonEncoder) EncodingNormalized() bool {
 	return e.encodingNormalized

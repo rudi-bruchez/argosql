@@ -264,7 +264,7 @@ type encodingNormalizer interface {
 // it, and it never refuses to write the value: a legitimate database
 // under an old, non-UTF-8 collation must stay usable through this
 // package. Deciding belongs to whichever later stage holds a model.Sink
-// and can emit a model.Notice carrying model.ReasonEncodingNormalized.
+// and can emit a model.Notice carrying model.KindEncodingNormalized.
 func (e *Encoder) EncodingNormalized() bool {
 	if r, ok := e.inner.(encodingNormalizer); ok {
 		return r.EncodingNormalized()

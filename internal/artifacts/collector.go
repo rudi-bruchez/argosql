@@ -271,7 +271,7 @@ func (c *Collector) finalizeCurrent(collectionComplete, propertiesComplete bool)
 
 	if t.real.EncodingNormalized() {
 		c.Notice(model.Notice{
-			Kind:    model.ReasonEncodingNormalized,
+			Kind:    model.KindEncodingNormalized,
 			Message: fmt.Sprintf("table %q: invalid UTF-8 byte sequences were replaced with U+FFFD while encoding", t.spec.Name),
 			Table:   t.spec.Name,
 		})

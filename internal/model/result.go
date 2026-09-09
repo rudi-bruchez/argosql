@@ -16,12 +16,34 @@ import (
 // type-switch on a Cell directly rather than on a field of it.
 type Cell any
 
-// Closed vocabulary of reduction reasons. Any other value is a defect.
+// Closed vocabulary of omission reasons (design spec, line 101). This is
+// the only vocabulary TableResult.Preview.OmittedReasons may ever carry;
+// any other value there is a defect. The five are independent facts, not
+// mutually exclusive - a table can carry more than one at once.
 const (
-	ReasonPreviewOmitted     = "preview_omitted"     // cell too large for the budget
-	ReasonRowsTruncated      = "rows_truncated"      // rows dropped to fit
-	ReasonCellTruncated      = "cell_truncated"      // truncation by rune count
-	ReasonEncodingNormalized = "encoding_normalized" // invalid sequence replaced
+	ReasonRowLimit            = "row_limit"            // rows beyond --preview N
+	ReasonByteLimit           = "byte_limit"           // rows or cells removed to fit the stdout budget
+	ReasonCellLimit           = "cell_limit"           // cell truncated by rune count
+	ReasonCollectionLimit     = "collection_limit"     // collection itself stopped at a ceiling
+	ReasonPropertyUnavailable = "property_unavailable" // optional property unreadable
+)
+
+// Kind values that are facts about a run, not reasons a preview omitted
+// something - neither ever belongs in OmittedReasons.
+//
+// KindPreviewOmitted is the boolean field name of Render's tier-A compact
+// response (design spec, line 105): the whole-response counterpart of the
+// per-table state "zero rows shown while rows were collected" that line
+// 101 also calls preview_omitted, as distinct from a table that is
+// legitimately empty.
+//
+// KindEncodingNormalized is the Notice.Kind the collector emits (design
+// spec, line 91) when it had to replace an invalid byte sequence while
+// encoding a table artifact - a fact recorded for its own sake, not a
+// reason any preview left something out.
+const (
+	KindPreviewOmitted     = "preview_omitted"
+	KindEncodingNormalized = "encoding_normalized"
 )
 
 // Column describes one collected column. SQLType must be the exact
@@ -108,6 +130,25 @@ type Result struct {
 	Artifacts     []Artifact    `json:"artifacts"`
 	ManifestPath  string        `json:"manifest_path"`
 	Error         *PublicError  `json:"error"`
+}
+
+// ManifestOnlyResult is Render's tier-A fallback (design spec, line 105):
+// when a run's metadata alone - every table rendered with zero rows -
+// still does not fit ByteLimit, but the manifest path that can recover
+// everything collected does, this is what Render returns instead of the
+// usual Result. Full metadata stays on disk in the manifest;
+// PreviewOmitted is always true here, the whole-response analogue of a
+// single table reporting rows_shown=0 despite rows collected. It is a
+// dedicated type, not a degenerate Result, for the same reason
+// FallbackError is one: Result's own fields (context, tables, ...) would
+// still be present under omitempty, and this response must never carry
+// them - only the two facts a caller needs to recover the run's data.
+type ManifestOnlyResult struct {
+	SchemaVersion  int          `json:"schema_version"`
+	OK             bool         `json:"ok"`
+	ManifestPath   string       `json:"manifest_path"`
+	PreviewOmitted bool         `json:"preview_omitted"`
+	Error          *PublicError `json:"error"`
 }
 
 // Sink receives one table's rows and, optionally, files and notices, as a
