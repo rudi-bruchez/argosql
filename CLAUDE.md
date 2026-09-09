@@ -233,6 +233,28 @@ enfants imbriqués**, `ColumnsWithNoStatistics` portant des `ColumnReference`, d
 sans garde de profondeur transforme chaque descendant en avertissement et sature son plafond.
 Les deux faits tirent en sens inverse et se tiennent ensemble.
 
+**Révoquer une permission qui est IMPLIQUÉE par une autre ne la retire pas**, et une mesure
+construite sur un `REVOKE` ne prouve donc rien. Microsoft documente
+`sys.dm_db_partition_stats` comme exigeant, sur 2022 et au-delà, « VIEW DATABASE PERFORMANCE
+STATE and VIEW SECURITY DEFINITION permissions on the database », et la table des
+implications de `GRANT` donne `VIEW SECURITY DEFINITION` comme impliquée par
+`VIEW DEFINITION`. Un principal qui détient `VIEW DEFINITION`, ce que ces commandes exigent
+de toute façon, conserve donc la permission après révocation de son octroi explicite, et la
+commande continue de réussir. Seul un `DENY` sépare les deux hypothèses. C'est la même
+distinction que celle déjà consignée plus haut pour `VIEW DEFINITION`, et elle s'est
+présentée une seconde fois sous la forme d'un correctif qui retirait une permission du texte
+d'aide sur la foi d'une mesure qui ne pouvait pas la départager. Formulation qui reste juste
+dans les deux cas : nommer la permission en disant par quoi elle est impliquée, ce qui
+n'exige aucun octroi supplémentaire de l'opérateur.
+
+L'ordre de retour naturel de `sys.dm_db_partition_stats` **satisfait déjà** les deux clés
+secondaires de l'ordre que la spec déclare, `partition_number` puis type d'allocation : sur
+les fixtures de ce projet, retirer l'une ou l'autre de la clause `ORDER BY` ne change pas
+une ligne de la sortie, et seule la perte de `index_id` se voit. Une assertion d'ordre
+comparée à une lecture indépendante épingle donc ce qu'elle peut, et l'absence de cassure
+sur les deux autres clés est un fait du moteur et non une assertion creuse. Le rapporter
+ainsi plutôt que de fabriquer une fixture artificielle pour faire mordre une cassure.
+
 `sys.query_store_plan.query_plan` est de type **`nvarchar` et nullable**, pas `xml`. Vérifié
 par sonde sur `sys.all_columns`, sur les deux versions.
 

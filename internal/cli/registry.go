@@ -691,18 +691,26 @@ func sizeTableCommand() Command {
 		// than "in addition to the above" - VIEW DATABASE STATE implies
 		// VIEW DATABASE PERFORMANCE STATE (measured, see CLAUDE.md), so
 		// the operator does not need to grant it separately. VIEW
-		// SECURITY DEFINITION, which the previous line asked for, was
-		// measured and removed: with it revoked from I (VIEW DATABASE
-		// PERFORMANCE STATE kept), size table still succeeded against
-		// dbo.Orders on 2022 - the design spec's own text claims this
-		// DMV needs it, but that claim does not hold for this command's
-		// actual query against this fixture object. principals.sql's
-		// own grant is left as is (a deliberate over-grant costs
-		// nothing); this is a correction to what help tells an
-		// operator is REQUIRED, not to the fixture.
+		// SECURITY DEFINITION is named too, and named as IMPLIED rather
+		// than dropped. Fix-2 first removed it on the strength of a
+		// measurement - revoked from I, VIEW DATABASE PERFORMANCE STATE
+		// kept, and size table still succeeded on 2022 - and that
+		// measurement cannot support the conclusion. Microsoft documents
+		// sys.dm_db_partition_stats as requiring "VIEW DATABASE
+		// PERFORMANCE STATE and VIEW SECURITY DEFINITION permissions on
+		// the database" for 2022 and later, and the GRANT table lists
+		// VIEW SECURITY DEFINITION as implied by VIEW DEFINITION, which
+		// this command requires anyway. A REVOKE of the explicit grant
+		// therefore leaves the implied permission in place: the same
+		// "revoking is not denying" distinction this project already
+		// paid for once on VIEW DEFINITION (see CLAUDE.md). Only a DENY
+		// would have separated the two hypotheses, and it was not run.
+		// This wording is correct under both: it asks the operator for
+		// no extra grant while still naming what the DMV needs.
 		Permissions: []string{
 			"VIEW DATABASE STATE, VIEW DEFINITION, SELECT (2019)",
 			"VIEW DATABASE PERFORMANCE STATE (2022+; implied by VIEW DATABASE STATE)",
+			"VIEW SECURITY DEFINITION (2022+; implied by VIEW DEFINITION)",
 		},
 		Versions: []string{"2019", "2022"},
 		Tables:   []model.TableSpec{diagnostics.TableTable, diagnostics.AllocationsTable},
