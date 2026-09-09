@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -26,8 +27,10 @@ type captureSink struct {
 }
 
 type capturedTable struct {
-	spec model.TableSpec
-	rows [][]model.Cell
+	spec               model.TableSpec
+	rows               [][]model.Cell
+	collectionComplete bool
+	propertiesComplete bool
 }
 
 func (s *captureSink) Begin(spec model.TableSpec) error {
@@ -43,10 +46,17 @@ func (s *captureSink) Row(row []model.Cell) error {
 	return nil
 }
 
-func (s *captureSink) End(_, _ bool) error {
+// End records both completeness flags diagnostics.Info/diagnostics.Status
+// pass it, rather than discarding them: TestInfo and TestStatus assert on
+// collectionComplete/propertiesComplete below, so a command that reports
+// incomplete data by mistake (or a refactor that starts passing false)
+// shows up here instead of only downstream in internal/model.Completeness.
+func (s *captureSink) End(collectionComplete, propertiesComplete bool) error {
 	if s.cur == nil {
 		return fmt.Errorf("captureSink: End called with no open table")
 	}
+	s.cur.collectionComplete = collectionComplete
+	s.cur.propertiesComplete = propertiesComplete
 	s.tables = append(s.tables, *s.cur)
 	s.cur = nil
 	return nil
@@ -67,13 +77,40 @@ func (s *captureSink) table(name string) *capturedTable {
 	return nil
 }
 
+// requireComplete asserts that tbl's table was Begin/Row/End'd with both
+// completeness flags true. Every diagnostics.Info/diagnostics.Status table
+// is complete by construction at this stage (no truncation, no partial
+// read), so true is the value every caller of this helper expects.
+func requireComplete(t *testing.T, tbl *capturedTable, name string) {
+	t.Helper()
+	if !tbl.collectionComplete {
+		t.Fatalf("%s: collectionComplete got false, want true", name)
+	}
+	if !tbl.propertiesComplete {
+		t.Fatalf("%s: propertiesComplete got false, want true", name)
+	}
+}
+
 // TestInfo proves diagnostics.Info actually reads the engine it is
-// connected to - SERVERPROPERTY, DB_NAME(), USER_NAME(), and the
-// connected database's compatibility level - rather than anything
-// carried over from config.Profile: the design spec requires info to
-// carry "no connection string or secrets", so this also checks that
-// neither the admin password nor the raw host:port ever appears in
-// what Info wrote.
+// connected to, rather than anything carried over from config.Profile
+// or a hardcoded literal: the server cell is checked against
+// SERVERPROPERTY('ServerName') queried independently through lab.Admin
+// (a separate connection, never through diagnostics.Info itself), and
+// the database cell and compatibility level are checked against the
+// known fixture values. Checking the server cell this way, rather than
+// only forbidding known secret values, is what actually catches a
+// hardcoded literal standing in for SERVERPROPERTY: measured, swapping
+// SERVERPROPERTY('ServerName') for the fixed literal 'localhost:1433'
+// in info.sql does not contain lab.Profile's real host or port (podman
+// publishes SQL Server on a random ephemeral port, never 1433, and
+// lab.Profile.Host measures "127.0.0.1", not "localhost"), so a loop
+// that only forbids those two real values lets that substitution pass;
+// comparing the cell against the independently queried real server name
+// does not. The design spec also requires info to carry "no connection
+// string or secrets", so this additionally checks that neither the
+// admin password nor lab's own host:port (combined, and the port alone)
+// ever appears in any cell, and that Info reports both completeness
+// flags true.
 func TestInfo(t *testing.T) {
 	lab := NewLab(t, os.Getenv("ASQ_TEST_IMAGE"))
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -86,6 +123,11 @@ func TestInfo(t *testing.T) {
 	defer sess.Close()
 	logEngineIdentity(t, lab, sess.Major)
 
+	var wantServer string
+	if err := lab.Admin.QueryRowContext(ctx, "SELECT CONVERT(nvarchar(128), SERVERPROPERTY('ServerName'))").Scan(&wantServer); err != nil {
+		t.Fatalf("querying SERVERPROPERTY('ServerName') independently: %v", err)
+	}
+
 	sink := &captureSink{}
 	if err := diagnostics.Info(ctx, sess, sink); err != nil {
 		t.Fatalf("info: %v", err)
@@ -95,16 +137,32 @@ func TestInfo(t *testing.T) {
 	if identity == nil || len(identity.rows) != 1 {
 		t.Fatalf("identity table missing or wrong row count: %+v", sink.tables)
 	}
+	requireComplete(t, identity, "identity")
 	row := identity.rows[0]
+	if got, ok := row[0].(string); !ok || got != wantServer {
+		t.Fatalf("server: got %#v, want %q (independently queried SERVERPROPERTY('ServerName'))", row[0], wantServer)
+	}
 	if got, ok := row[1].(string); !ok || got != "AppDB" {
 		t.Fatalf("database: got %#v, want AppDB", row[1])
 	}
 	if got, ok := row[5].(int64); !ok || got == 0 {
 		t.Fatalf("compatibility_level: got %#v, want a nonzero integer", row[5])
 	}
+	hostPort := fmt.Sprintf("%s:%d", lab.Profile.Host, lab.Profile.Port)
+	port := strconv.Itoa(lab.Profile.Port)
 	for i, cell := range row {
-		if s, ok := cell.(string); ok && strings.Contains(s, lab.Profile.Password) {
+		s, ok := cell.(string)
+		if !ok {
+			continue
+		}
+		if strings.Contains(s, lab.Profile.Password) {
 			t.Fatalf("column %d leaks the connection password: %#v", i, cell)
+		}
+		if strings.Contains(s, hostPort) {
+			t.Fatalf("column %d leaks the connection host:port %q: %#v", i, hostPort, cell)
+		}
+		if strings.Contains(s, port) {
+			t.Fatalf("column %d leaks the connection port %q: %#v", i, port, cell)
 		}
 	}
 }
@@ -207,6 +265,7 @@ func TestStatus(t *testing.T) {
 		if statusTable == nil || len(statusTable.rows) != 1 {
 			t.Fatalf("status table missing or wrong row count: %+v", sink.tables)
 		}
+		requireComplete(t, statusTable, "status")
 		statusRow := statusTable.rows[0]
 		if got, ok := statusRow[0].(string); !ok || got != "READ_WRITE" {
 			t.Fatalf("desired_state: got %#v, want READ_WRITE", statusRow[0])
@@ -225,6 +284,7 @@ func TestStatus(t *testing.T) {
 		if coverage == nil || len(coverage.rows) != 1 {
 			t.Fatalf("coverage table missing or wrong row count: %+v", sink.tables)
 		}
+		requireComplete(t, coverage, "coverage")
 		coverageRow := coverage.rows[0]
 		if coverageRow[0] != nil {
 			t.Fatalf("oldest_interval: got %#v, want nil (no invented coverage window)", coverageRow[0])
@@ -249,6 +309,7 @@ func TestStatus(t *testing.T) {
 			if coverage == nil || len(coverage.rows) != 1 {
 				t.Fatalf("coverage table missing or wrong row count: %+v", sink.tables)
 			}
+			requireComplete(t, coverage, "coverage")
 			row = coverage.rows[0]
 			hasHistory, ok := row[2].(bool)
 			if !ok {
@@ -289,8 +350,81 @@ func TestStatus(t *testing.T) {
 		if statusTable == nil || len(statusTable.rows) != 1 {
 			t.Fatalf("status table missing or wrong row count: %+v", sink.tables)
 		}
+		requireComplete(t, statusTable, "status")
 		if got, ok := statusTable.rows[0][1].(string); !ok || got != "OFF" {
 			t.Fatalf("actual_state: got %#v, want OFF", statusTable.rows[0][1])
+		}
+	})
+
+	// t.Run("a READ_ONLY database separates desired from actual state and
+	// still succeeds at code 0") is built on the exact sequence measured
+	// against a disposable SQL Server 2022 CU26 container:
+	//
+	//	CREATE DATABASE RO;
+	//	ALTER DATABASE RO SET QUERY_STORE = ON (OPERATION_MODE = READ_WRITE, INTERVAL_LENGTH_MINUTES = 1);
+	//	ALTER DATABASE RO SET READ_ONLY WITH ROLLBACK IMMEDIATE;
+	//
+	// which measured as desired_state_desc=READ_WRITE,
+	// actual_state_desc=READ_ONLY, readonly_reason=1,
+	// query_capture_mode_desc=AUTO. This one scenario is the spec's other
+	// named code-0 state besides OFF (no test covered READ_ONLY before
+	// this), it is the first state where desired_state and actual_state
+	// genuinely differ (a prior bug swapping statusRow[0] and
+	// statusRow[1] in health.go would pass every other subtest in this
+	// file but fail here), and readonly_reason=1 is bit 0, so
+	// readonly_reason_decoded must come back exactly
+	// "database_read_only" - the first time DecodeReadOnly's bit table is
+	// exercised against a real engine value rather than a value this
+	// file fabricates.
+	t.Run("a READ_ONLY database separates desired from actual state and still succeeds at code 0", func(t *testing.T) {
+		dbName := createThrowawayDatabase(ctx, t, lab, "asq_ro_")
+		if _, err := lab.Admin.ExecContext(ctx, "ALTER DATABASE ["+dbName+"] SET QUERY_STORE = ON (OPERATION_MODE = READ_WRITE, INTERVAL_LENGTH_MINUTES = 1)"); err != nil {
+			t.Fatalf("enabling Query Store: %v", err)
+		}
+		if _, err := lab.Admin.ExecContext(ctx, "ALTER DATABASE ["+dbName+"] SET READ_ONLY WITH ROLLBACK IMMEDIATE"); err != nil {
+			t.Fatalf("setting database READ_ONLY: %v", err)
+		}
+		// Registered after createThrowawayDatabase's own t.Cleanup above,
+		// so t.Cleanup's LIFO order runs this one first: a READ_ONLY
+		// database cannot be DROPped, so this restores READ_WRITE before
+		// that cleanup's own DROP DATABASE runs.
+		t.Cleanup(func() {
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), podmanCmdTimeout)
+			defer cleanupCancel()
+			if _, err := lab.Admin.ExecContext(cleanupCtx, "ALTER DATABASE ["+dbName+"] SET READ_WRITE WITH ROLLBACK IMMEDIATE"); err != nil {
+				t.Logf("cleanup: restoring %s to READ_WRITE: %v", dbName, err)
+			}
+		})
+
+		roProfile := lab.Profile
+		roProfile.Database = dbName
+		roSess, err := sqlserver.Open(ctx, roProfile)
+		if err != nil {
+			t.Fatalf("open on a READ_ONLY database: %v", err)
+		}
+		defer roSess.Close()
+
+		sink := &captureSink{}
+		if err := diagnostics.Status(ctx, roSess, sink); err != nil {
+			t.Fatalf("status on a READ_ONLY database should succeed at code 0, got: %v", err)
+		}
+		statusTable := sink.table("status")
+		if statusTable == nil || len(statusTable.rows) != 1 {
+			t.Fatalf("status table missing or wrong row count: %+v", sink.tables)
+		}
+		requireComplete(t, statusTable, "status")
+		statusRow := statusTable.rows[0]
+		if got, ok := statusRow[0].(string); !ok || got != "READ_WRITE" {
+			t.Fatalf("desired_state: got %#v, want READ_WRITE", statusRow[0])
+		}
+		if got, ok := statusRow[1].(string); !ok || got != "READ_ONLY" {
+			t.Fatalf("actual_state: got %#v, want READ_ONLY", statusRow[1])
+		}
+		if got, ok := statusRow[2].(int64); !ok || got != 1 {
+			t.Fatalf("readonly_reason: got %#v, want 1", statusRow[2])
+		}
+		if got, ok := statusRow[3].(string); !ok || got != "database_read_only" {
+			t.Fatalf("readonly_reason_decoded: got %#v, want \"database_read_only\"", statusRow[3])
 		}
 	})
 }

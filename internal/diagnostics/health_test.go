@@ -134,3 +134,41 @@ func TestHealthFromCellsRejectsWrongShape(t *testing.T) {
 		t.Fatalf("got code %d, want 5", pub.Code)
 	}
 }
+
+// TestHealthFromCellsAcceptsErrorState covers the one state the design
+// spec names (line 83) as a required code-0 success alongside OFF and
+// READ_ONLY that no test before this one ever fed healthFromCells: no
+// disposable container reaches sys.database_query_store_options'
+// actual_state_desc = ERROR reliably (it marks internal corruption of
+// Query Store's own data), so this fixtures the state at the
+// healthFromCells boundary instead, per the design spec's own
+// instruction to "fixture the otherwise nondeterministic ERROR state at
+// the backend boundary". healthFromCells does not special-case
+// actual_state's text at all - it only type-asserts each cell - so
+// there is no reason to expect it to reject this row, and this proves
+// it does not; DecodeReadOnly on the resulting Health falls through to
+// its existing no_reason_reported branch (ERROR matches neither the
+// READ_ONLY/READ_ONLY nor the READ_WRITE case), already covered for
+// readonly_reason=0 by TestReasonZeroOtherState's "error" case above -
+// this test instead reaches that same outcome through healthFromCells
+// itself, not through a Health literal this file constructs by hand.
+func TestHealthFromCellsAcceptsErrorState(t *testing.T) {
+	cells := make([]model.Cell, colHasHistory+1)
+	cells[colDesired] = "READ_WRITE"
+	cells[colActual] = "ERROR"
+	cells[colReadOnlyReason] = int64(0)
+	cells[colHasHistory] = false
+
+	h, err := healthFromCells(cells)
+	if err != nil {
+		t.Fatalf("healthFromCells on an ERROR row: %v", err)
+	}
+	if h.Actual != "ERROR" {
+		t.Fatalf("Actual: got %q, want ERROR", h.Actual)
+	}
+	got := DecodeReadOnly(h)
+	want := []string{"no_reason_reported"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("DecodeReadOnly on ERROR with readonly_reason=0: got %v, want %v", got, want)
+	}
+}
