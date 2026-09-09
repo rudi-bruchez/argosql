@@ -35,3 +35,6 @@ go.work.sum
 /bin/
 /dist/
 /test-results/
+
+# Instructions locales à la machine, jamais publiées
+CLAUDE.local.md

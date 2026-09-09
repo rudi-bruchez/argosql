@@ -4,9 +4,11 @@ CLI Go nommé `asq` qui diagnostique SQL Server via le Query Store et les vues d
 catalogue, et rend ses résultats dans un format dimensionné pour qu'un agent IA
 les consomme sans noyer son contexte.
 
-Ce fichier porte les règles propres à **ce dépôt**. Elles ont d'abord vécu dans
-des prompts de dispatch, répétées huit fois, ce qui est huit occasions de les
-écrire différemment. Elles sont ici une fois.
+Ce fichier porte les règles propres à **ce dépôt**, et rien qui soit propre à une
+machine. Les conteneurs présents sur un poste donné, les fichiers personnels qui
+traînent dans une copie de travail et les outils installés localement vont dans
+`CLAUDE.local.md`, qui est gitignoré. **Si ce que vous allez écrire cesse d'être
+vrai sur une autre machine, ce n'est pas ici que ça va.**
 
 ## L'autorité, et pourquoi elle compte ici plus qu'ailleurs
 
@@ -27,20 +29,17 @@ spec qui la concernent et les comparer à son brief.** Ne pas se fier au brief
 seul. Et quand on cite une clause dans un prompt, la citer **verbatim avec son
 numéro de ligne**, parce que la reformuler refait exactement la perte.
 
-## Conteneurs : six ne sont pas à nous
-
-`sql2022`, `sql2025`, `sqltop-test`, `sqltop-test-2019`, `sqlgopace-mssql`, et un
-`act-Release-...` préexistent sur cette machine et **n'appartiennent pas à ce
-projet**.
-
-`sql2025`, sur le port 11533, **appartient à l'utilisateur et tourne**. Ne pas
-s'en servir comme fixture, ne pas le modifier, ne pas l'arrêter.
+## Conteneurs
 
 Les tests d'intégration créent leurs propres conteneurs, étiquetés
-`io.argosql.test=<id du run>`, et les retirent eux-mêmes. Ne nettoyer que ce que
-le run a créé, en filtrant sur cette étiquette, jamais en balayant par nom.
-Vérifier à la fin qu'aucun `asq-test-*` ne survit et que la liste des six est
-identique à l'arrivée.
+`io.argosql.test=<id du run>`, et les retirent eux-mêmes. **Ne nettoyer que ce
+que le run a créé**, en filtrant sur cette étiquette et jamais en balayant par
+nom : une machine de développement porte d'autres conteneurs SQL Server, dont
+certains en service.
+
+La liste de ceux qui préexistent sur un poste donné, et celui qu'il ne faut
+surtout pas toucher, sont dans `CLAUDE.local.md`. **La lire avant de lancer quoi
+que ce soit qui parle à Podman.**
 
 ## Secrets
 
@@ -61,13 +60,13 @@ place. **Ne jamais le commiter après y avoir tapé un vrai mot de passe.**
 
 ## Fichiers qui ne nous appartiennent pas
 
-`docs/TASKS01.md` est une conversation sauvegardée par l'utilisateur. Elle est
-suivie par git et peut apparaître modifiée dans `git status` : **ne pas y
-toucher, ne pas la commiter, ne pas l'écraser.**
+Une copie de travail peut contenir des documents personnels du propriétaire du
+dépôt, suivis par git et parfois modifiés. `CLAUDE.local.md` les nomme. **Ne pas
+y toucher, ne pas les commiter, ne pas les écraser.** C'est la raison pour
+laquelle la règle du `git add` nommé, plus bas, n'est pas négociable.
 
-Un implémenteur de tâche ne touche ni à `docs/` ni à `.superpowers/`, à
-l'exception de son propre fichier de rapport sous
-`.superpowers/sdd/<plan>/`.
+Un implémenteur de tâche ne touche ni à `docs/` ni à l'espace de travail du plan,
+à l'exception de son propre fichier de rapport.
 
 ## Git
 
