@@ -6,9 +6,11 @@ package cli
 import (
 	"context"
 	"fmt"
+	"math"
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/rudi-bruchez/argosql/internal/diagnostics"
 	"github.com/rudi-bruchez/argosql/internal/model"
@@ -174,16 +176,17 @@ func globalFlags() []Flag {
 	}
 }
 
-// NewRegistry builds the registry this build of asq serves: help, info
-// and qs status. help's Execute closes over the finished registry
+// NewRegistry builds the registry this build of asq serves: help, info,
+// qs status and qs top. help's Execute closes over the finished registry
 // through reg, a pointer to the slice NewRegistry is about to return:
 // by the time help actually runs, reg has been fully populated by the
 // composite literal below, even though help's own entry is built first.
 func NewRegistry() Registry {
-	reg := make(Registry, 3)
+	reg := make(Registry, 4)
 	reg[0] = helpCommand(&reg)
 	reg[1] = infoCommand()
 	reg[2] = qsStatusCommand()
+	reg[3] = qsTopCommand()
 	return reg
 }
 
@@ -212,7 +215,7 @@ var helpCommandsTableSpec = model.TableSpec{
 // each land in their own column, rather than one "; "-joined cell per
 // command the way helpCommandsTableSpec's other list fields do: a
 // command that accepts nine global flags plus several of its own -
-// "qs top" will, once task 10 adds it - pushes a single flattened cell
+// "qs top" does, since task 10 added it - pushes a single flattened cell
 // well past the project's 200-code-point preview cell limit, which
 // truncates help's own inventory by default; the design spec (line 45)
 // requires that inventory to carry "parameters, defaults, and
@@ -349,6 +352,75 @@ func qsStatusCommand() Command {
 		Tables:      []model.TableSpec{diagnostics.StatusTable, diagnostics.CoverageTable},
 		Execute: func(ctx context.Context, s *sqlserver.Session, _ Request, dst model.Sink) error {
 			return diagnostics.Status(ctx, s, dst)
+		},
+	}
+}
+
+// qsTopCommand registers "qs top": the exact Query Store ranking of
+// queries by total or average CPU, duration, logical reads, or
+// executions over a requested window (design spec). Tables is
+// diagnostics.TopQueriesTable itself, for the same reason infoCommand
+// above uses diagnostics.InfoTable.
+//
+// --by and --aggregate are validated by a static Enum here, never by
+// free text in Execute (design spec: the metric name is one of a fixed
+// list); --hours is mutually exclusive with --since/--until
+// (ExclusiveWith), matching the design spec's "accept either --hours N
+// ... or both --since --until"; --min-executions and --hours declare
+// Max explicitly (math.MaxInt64) because Flag.Validate only range-checks
+// when at least one of Min/Max is nonzero, and leaving Max at its zero
+// value once Min is set would reject every value including the default.
+func qsTopCommand() Command {
+	return Command{
+		Name:    "qs top",
+		Summary: "Rank Query Store queries by total or average CPU, duration, logical reads, or executions over a requested window.",
+		Examples: []string{
+			"asq --ctx client --db AppDB qs top --by cpu --hours 24 --top 10",
+			"asq --ctx client --db AppDB qs top --by reads --aggregate avg --since 2026-09-01T00:00:00Z --until 2026-09-02T00:00:00Z",
+		},
+		Units: []string{
+			"cpu_total_ms, cpu_avg_ms, duration_total_ms, duration_avg_ms: milliseconds",
+			"reads_total, reads_avg: 8-KB logical page reads",
+		},
+		// sys.query_store_runtime_stats itself requires VIEW DATABASE
+		// STATE before 2022 and VIEW DATABASE PERFORMANCE STATE from
+		// 2022 on; task 8 measured, against a real server, that VIEW
+		// DATABASE STATE implies VIEW DATABASE PERFORMANCE STATE, so
+		// granting the former alone suffices on both versions - kept
+		// short enough to stay under the project's 200-code-point cell
+		// limit (see TestHelpOfflineNoCellTruncated).
+		Permissions: []string{
+			"VIEW DATABASE STATE (2019)",
+			"VIEW DATABASE PERFORMANCE STATE (2022+; implied by VIEW DATABASE STATE)",
+		},
+		Versions: []string{"2019", "2022"},
+		Tables:   []model.TableSpec{diagnostics.TopQueriesTable},
+		Flags: []Flag{
+			{Name: "object", Kind: FlagString},
+			{Name: "min-executions", Kind: FlagInt64, Default: int64(1), Min: 1, Max: math.MaxInt64},
+			{Name: "by", Kind: FlagString, Enum: []string{"cpu", "duration", "reads", "executions"}, Default: "cpu"},
+			{Name: "aggregate", Kind: FlagString, Enum: []string{"total", "avg"}, Default: "total"},
+			{Name: "hours", Kind: FlagInt64, Default: int64(24), Min: 1, Max: math.MaxInt64, ExclusiveWith: []string{"since", "until"}},
+			{Name: "since", Kind: FlagString, ExclusiveWith: []string{"hours"}},
+			{Name: "until", Kind: FlagString, ExclusiveWith: []string{"hours"}},
+			{Name: "top", Kind: FlagInt64, Default: int64(10), Min: 1, Max: 100},
+			{Name: "include-internal", Kind: FlagBool, Default: false},
+		},
+		Execute: func(ctx context.Context, s *sqlserver.Session, req Request, dst model.Sink) error {
+			win, err := diagnostics.ParseWindow(time.Now(), req.Hours, req.Since, req.Until)
+			if err != nil {
+				return err
+			}
+			opts := diagnostics.TopOptions{
+				Window:          win,
+				By:              req.By,
+				Aggregate:       req.Aggregate,
+				Object:          req.Object,
+				Top:             req.Top,
+				MinExecutions:   req.MinExecutions,
+				IncludeInternal: req.IncludeInternal,
+			}
+			return diagnostics.Top(ctx, s, opts, dst)
 		},
 	}
 }

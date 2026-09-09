@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	_ "embed"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -18,6 +19,14 @@ import (
 //
 //go:embed sql/bootstrap.sql
 var bootstrapScript string
+
+// workloadScript is sql/workload.sql: the load Lab.QueryID (below) runs,
+// with its {{MARKER}} placeholder substituted, to generate one Query
+// Store entry a test can discover by query_id rather than guessing or
+// hardcoding one.
+//
+//go:embed sql/workload.sql
+var workloadScript string
 
 // splitBatches cuts a sqlcmd-style script into batches on lines that are,
 // once trimmed, exactly "GO" (case-insensitively, as sqlcmd itself
@@ -124,6 +133,55 @@ func TestFixtureQueryStoreFlush(t *testing.T) {
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("query store marker did not appear within %s of flush", flushPollDeadline)
+		}
+		time.Sleep(flushPollDelay)
+	}
+}
+
+// QueryID runs sql/workload.sql's load against lab.Admin (AppDB), with
+// {{MARKER}} replaced by marker, flushes Query Store, and polls -
+// bounded by flushPollDeadline, the same 30s budget
+// TestFixtureQueryStoreFlush proves reliable above - until a query
+// carrying marker in its text is visible in Query Store, returning its
+// query_id.
+//
+// This is task 10's own fixture-discovery mechanism, exposed as a Lab
+// method so every later diagnostics task that needs a real, uniquely
+// identifiable Query Store entry reaches for this helper instead of
+// discovering (or worse, hardcoding) a query_id of its own - task 11
+// reuses it verbatim rather than redefining it.
+func (lab *Lab) QueryID(t *testing.T, marker string) int64 {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	load := strings.ReplaceAll(workloadScript, "{{MARKER}}", marker)
+	for i := 0; i < 5; i++ {
+		var count int
+		if err := lab.Admin.QueryRowContext(ctx, load).Scan(&count); err != nil {
+			t.Fatalf("running marked workload %q: %v", marker, err)
+		}
+	}
+
+	if _, err := lab.Admin.ExecContext(ctx, "EXEC sys.sp_query_store_flush_db"); err != nil {
+		t.Fatalf("sp_query_store_flush_db: %v", err)
+	}
+
+	findID := "SELECT q.query_id FROM sys.query_store_query_text AS qt " +
+		"JOIN sys.query_store_query AS q ON q.query_text_id = qt.query_text_id " +
+		"WHERE qt.query_sql_text LIKE '%' + @p1 + '%'"
+	deadline := time.Now().Add(flushPollDeadline)
+	for {
+		var id int64
+		err := lab.Admin.QueryRowContext(ctx, findID, marker).Scan(&id)
+		if err == nil {
+			return id
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("polling for query_id of marker %q: %v", marker, err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("query store marker %q did not appear within %s of flush", marker, flushPollDeadline)
 		}
 		time.Sleep(flushPollDelay)
 	}

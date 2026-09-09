@@ -1,0 +1,263 @@
+package diagnostics
+
+import (
+	"context"
+	"database/sql"
+	_ "embed"
+	"fmt"
+	"strings"
+
+	"github.com/rudi-bruchez/argosql/internal/model"
+	"github.com/rudi-bruchez/argosql/internal/output"
+	"github.com/rudi-bruchez/argosql/internal/sqlserver"
+)
+
+// topQuery2019 and topQuery2022 are sql/top_2019.sql and sql/top_2022.sql
+// (see each file's own doc comment for what it reads and why the two
+// differ) - embedded here, rather than in embed.go, because they are
+// this file's own concern alone.
+var (
+	//go:embed sql/top_2019.sql
+	topQuery2019 string
+
+	//go:embed sql/top_2022.sql
+	topQuery2022 string
+)
+
+// OrderPlaceholder is the literal token both embedded queries carry in
+// their ORDER BY clause; orderColumnFor below resolves it to one of a
+// fixed set of literal column names before the query text is ever sent
+// to the server. Exported so tests/integration's synthetic aggregation
+// fixture (which runs the real query text, via TopQuerySQL, against
+// temp tables standing in for the catalog views) can resolve it the
+// same way Top itself does, rather than duplicating the literal.
+const OrderPlaceholder = "@@ORDER_COLUMN@@"
+
+// TopQueriesTable is the one table "qs top" emits: one ranked row per
+// (query_id[, replica_group_id]) (design spec: declared table order
+// "qs top: queries"). internal/cli's registry uses this exact TableSpec
+// as "qs top"'s declared Command.Tables, so help's advertised schema and
+// what Top actually writes can never drift apart.
+var TopQueriesTable = model.TableSpec{
+	Name: "queries",
+	Columns: []model.Column{
+		{Name: "query_id", SQLType: "BIGINT"},
+		{Name: "replica_group_id", SQLType: "BIGINT"},
+		{Name: "executions", SQLType: "BIGINT"},
+		{Name: "cpu_total_ms", SQLType: "FLOAT"},
+		{Name: "cpu_avg_ms", SQLType: "FLOAT"},
+		{Name: "duration_total_ms", SQLType: "FLOAT"},
+		{Name: "duration_avg_ms", SQLType: "FLOAT"},
+		{Name: "reads_total", SQLType: "FLOAT"},
+		{Name: "reads_avg", SQLType: "FLOAT"},
+	},
+}
+
+// TopOptions is one resolved "qs top" request: the already-parsed
+// Window (window.go's ParseWindow), the ranking metric/aggregate, an
+// optional parent-module filter, the row cap, and the minimum-execution
+// and internal-query filters.
+type TopOptions struct {
+	Window          Window
+	By, Aggregate   string
+	Object          string
+	Top             int
+	MinExecutions   int64
+	IncludeInternal bool
+}
+
+// nonCollectingStates are the sys.database_query_store_options
+// actual_state_desc values the design spec names (line 83) as needing a
+// readable runtime history for "qs top"/"qs query" to permit analysis at
+// all: OFF, READ_ONLY and ERROR. READ_WRITE (the ordinary collecting
+// state) and READ_CAPTURE_SECONDARY (a readable secondary's own
+// collecting state) are deliberately not in this set.
+var nonCollectingStates = map[string]bool{"OFF": true, "READ_ONLY": true, "ERROR": true}
+
+// orderColumns maps every valid (--by, --aggregate) combination to the
+// one literal output column name that combination ranks by. Both inputs
+// are already restricted to a fixed Enum by internal/cli's registry
+// (never free text) by the time Top runs; --by=executions has no "avg"
+// entry because --aggregate avg is rejected for it before connection
+// (internal/cli's Parse), so that combination never reaches here.
+var orderColumns = map[string]map[string]string{
+	"cpu":        {"total": "cpu_total_ms", "avg": "cpu_avg_ms"},
+	"duration":   {"total": "duration_total_ms", "avg": "duration_avg_ms"},
+	"reads":      {"total": "reads_total", "avg": "reads_avg"},
+	"executions": {"total": "executions"},
+}
+
+// orderColumnFor resolves --by/--aggregate to the literal SQL column
+// name orderPlaceholder is substituted with. An unrecognized combination
+// here is this package's own defect (every real caller's by/aggregate
+// values are already Enum-validated by internal/cli before Top ever
+// runs), not a user input to report as a flag error.
+func orderColumnFor(by, aggregate string) (string, error) {
+	byCols, ok := orderColumns[by]
+	if !ok {
+		return "", fmt.Errorf("diagnostics: unknown --by %q", by)
+	}
+	col, ok := byCols[aggregate]
+	if !ok {
+		return "", fmt.Errorf("diagnostics: --by %q does not support --aggregate %q", by, aggregate)
+	}
+	return col, nil
+}
+
+// topAllowedObjectTypes are the sys.objects.type codes "qs top"'s
+// --object filter accepts: SQL stored procedures (P), scalar/inline-
+// table/multi-statement-table functions (FN/IF/TF), and triggers (TR).
+// A resolved table or any other object type is rejected with code 2
+// (design spec: "Accept procedures, functions and triggers; reject a
+// resolved table or other unsupported object type with code 2").
+var topAllowedObjectTypes = map[string]bool{"P": true, "FN": true, "IF": true, "TF": true, "TR": true}
+
+// Top runs "qs top": the exact Query Store ranking of queries by total
+// or average CPU, duration, logical reads, or executions over
+// opts.Window (design spec: "qs top": "Rank queries by total CPU,
+// duration, logical reads, or executions").
+//
+// Every Query Store command reads health first (design spec). A state
+// that cannot be collecting at all (OFF, READ_ONLY, ERROR) with no
+// readable runtime history anywhere in the database fails at code 4 -
+// never an empty ranking pretending the window was merely unmatched. A
+// window that genuinely matches no rows, by contrast, is an empty
+// ranking at code 0 (design spec: "no matching intervals within
+// retained history returns an empty ranking, not unavailable").
+func Top(ctx context.Context, s *sqlserver.Session, opts TopOptions, dst model.Sink) error {
+	health, err := ReadHealth(ctx, s)
+	if err != nil {
+		return err
+	}
+	if nonCollectingStates[health.Actual] && !health.HasHistory {
+		return &model.PublicError{
+			Code:    4,
+			Kind:    "query_store_unavailable",
+			Message: fmt.Sprintf("Query Store is %s with no readable runtime history", health.Actual),
+		}
+	}
+
+	orderColumn, err := orderColumnFor(opts.By, opts.Aggregate)
+	if err != nil {
+		return &model.PublicError{Code: 5, Kind: "execution", Message: err.Error()}
+	}
+
+	var objectID sql.NullInt64
+	if opts.Object != "" {
+		obj, err := sqlserver.Resolve(ctx, s.Conn, opts.Object)
+		if err != nil {
+			return err
+		}
+		if !topAllowedObjectTypes[obj.Type] {
+			return &model.PublicError{
+				Code:    2,
+				Kind:    "invalid_argument",
+				Message: fmt.Sprintf("--object %q resolves to object type %q: qs top accepts procedures, functions and triggers only", opts.Object, obj.Type),
+			}
+		}
+		objectID = sql.NullInt64{Int64: obj.ID, Valid: true}
+	}
+
+	// ReplaceAll, not Replace(...,1): both embedded files also mention
+	// OrderPlaceholder once in their own doc comment, ahead of the real
+	// ORDER BY occurrence - a count-limited replace would silently
+	// consume that comment match instead and leave the ORDER BY clause's
+	// own placeholder unresolved, exactly as measured against a real
+	// server (SQL Server reports it as an undeclared scalar variable).
+	query := strings.ReplaceAll(topQueryFor(s.Major), OrderPlaceholder, orderColumn)
+	rows, err := queryRows(ctx, s.Conn, query,
+		sql.Named("since", opts.Window.Since),
+		sql.Named("until", opts.Window.Until),
+		sql.Named("include_internal", opts.IncludeInternal),
+		sql.Named("object_id", objectID),
+		sql.Named("min_executions", opts.MinExecutions),
+		sql.Named("top", opts.Top),
+	)
+	if err != nil {
+		return err
+	}
+
+	// Two independent facts, never claiming exhaustiveness beyond what
+	// each actually says: "capture" is about the engine's own collecting
+	// state (this ranking may not reflect every execution while Query
+	// Store is not READ_WRITE), "coverage" is about this database
+	// having no runtime history at all yet. Both can be true together;
+	// neither implies the other.
+	if nonCollectingStates[health.Actual] {
+		dst.Notice(model.Notice{
+			Kind:    "capture",
+			Message: fmt.Sprintf("Query Store is %s; this ranking may not reflect every execution in the requested window", health.Actual),
+			Table:   TopQueriesTable.Name,
+		})
+	}
+	if !health.HasHistory {
+		dst.Notice(model.Notice{
+			Kind:    "coverage",
+			Message: "this database has no Query Store runtime history yet",
+			Table:   TopQueriesTable.Name,
+		})
+	}
+
+	if err := dst.Begin(TopQueriesTable); err != nil {
+		return err
+	}
+	for _, row := range rows {
+		if err := dst.Row(row); err != nil {
+			return err
+		}
+	}
+	return dst.End(true, true)
+}
+
+// topQueryFor picks top_2019.sql or top_2022.sql by major version: 16
+// (2022) and 17 (2025, smoke-tested only per the design spec) both carry
+// rs.replica_group_id, so both use the 2022 form; only 15 (2019) ever
+// reaches the 2019 branch - sqlserver.Open already rejects every other
+// major version outright.
+func topQueryFor(major int) string {
+	if major >= 16 {
+		return topQuery2022
+	}
+	return topQuery2019
+}
+
+// TopQuerySQL exposes the exact embedded query text Top runs for major -
+// OrderPlaceholder still unresolved. tests/integration's synthetic
+// aggregation fixture runs this real text (with only its FROM/JOIN
+// table names substituted) against temp tables, rather than a
+// hand-duplicated copy of the formula, so a defect introduced into this
+// actual query is what that fixture is built to catch.
+func TopQuerySQL(major int) string { return topQueryFor(major) }
+
+// queryRows runs query (optionally parameterized, e.g. with sql.Named
+// values) and scans every returned row through output.ScanRow - the
+// same sanctioned SQL-value-to-model.Cell conversion queryOneRow (see
+// info.go) uses for its single row. Zero rows is not an error: a nil
+// slice, nil error.
+func queryRows(ctx context.Context, conn *sql.Conn, query string, args ...any) ([][]model.Cell, error) {
+	rows, err := conn.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, classifyQueryError(err, "ranking query failed")
+	}
+	defer rows.Close()
+
+	var types []*sql.ColumnType
+	var result [][]model.Cell
+	for rows.Next() {
+		if types == nil {
+			types, err = rows.ColumnTypes()
+			if err != nil {
+				return nil, &model.PublicError{Code: 5, Kind: "execution", Message: fmt.Sprintf("reading column types: %s", err.Error())}
+			}
+		}
+		cells, err := output.ScanRow(rows, types)
+		if err != nil {
+			return nil, &model.PublicError{Code: 5, Kind: "execution", Message: fmt.Sprintf("scanning ranking row: %s", err.Error())}
+		}
+		result = append(result, cells)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, classifyQueryError(err, "reading ranking rows")
+	}
+	return result, nil
+}

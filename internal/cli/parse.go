@@ -139,6 +139,15 @@ func Parse(args []string) (Request, *Command, error) {
 		req.Format = "json"
 	}
 
+	// "qs top --by executions --aggregate avg" is rejected here, before
+	// any connection is opened (design spec: "For executions, total is
+	// sum(count_executions) and --aggregate avg is rejected with code
+	// 2") - a cross-field rule Flag's own Enum cannot express, since
+	// each flag is validated independently of the other's value.
+	if cmd.Name == "qs top" && req.By == "executions" && req.Aggregate == "avg" {
+		return req, nil, &model.PublicError{Code: 2, Kind: "flag", Message: "--aggregate avg is not valid with --by executions"}
+	}
+
 	if !cmd.Offline && req.ContextName == "" {
 		return req, nil, &model.PublicError{Code: 2, Kind: "flag", Message: "--ctx is required"}
 	}
@@ -186,6 +195,24 @@ func assignRequestField(req *Request, name string, v any) error {
 		req.NoTruncate = v.(bool)
 	case "out-dir":
 		req.OutDir = v.(string)
+	case "object":
+		req.Object = v.(string)
+	case "min-executions":
+		req.MinExecutions = v.(int64)
+	case "by":
+		req.By = v.(string)
+	case "aggregate":
+		req.Aggregate = v.(string)
+	case "hours":
+		req.Hours = int(v.(int64))
+	case "since":
+		req.Since = v.(string)
+	case "until":
+		req.Until = v.(string)
+	case "top":
+		req.Top = int(v.(int64))
+	case "include-internal":
+		req.IncludeInternal = v.(bool)
 	case "json":
 		// handled by Parse directly after this loop.
 	default:

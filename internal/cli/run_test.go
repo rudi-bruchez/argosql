@@ -166,11 +166,11 @@ func helpFlagRows(t *testing.T) map[string]helpFlagRow {
 // registry: TestHelpOffline alone only checks the exit code and that
 // stdout parses as JSON, which stays green even if help's row loop is
 // deleted entirely (a reviewer demonstrated exactly that by removing
-// it). This test fails the moment any of the three registered commands
+// it). This test fails the moment any of the four registered commands
 // is missing from the rendered inventory, by name.
 func TestHelpOfflineListsAllCommands(t *testing.T) {
 	rows := helpCommandRows(t)
-	want := []string{"help", "info", "qs status"}
+	want := []string{"help", "info", "qs status", "qs top"}
 	for _, name := range want {
 		if _, ok := rows[name]; !ok {
 			t.Fatalf("help output is missing command %q: got %v", name, rows)

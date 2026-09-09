@@ -1,0 +1,12 @@
+-- workload.sql is the load tests/integration/fixture_test.go's
+-- Lab.QueryID runs against a Lab's AppDB to generate one Query Store
+-- entry identifiable by a caller-chosen marker.
+--
+-- {{MARKER}} becomes a result column alias, substituted by Go before
+-- this text is ever sent to the server - never a SQL comment: measured
+-- against a real container (see fixture_test.go's queryStoreMarker doc
+-- comment, which established this same technique first), SQL Server's
+-- own simple parameterization rewrites this query's literal before
+-- Query Store ever sees it and discards any comment outright, but a
+-- column alias survives that rewrite.
+SELECT COUNT(*) AS {{MARKER}} FROM dbo.Widgets WHERE Quantity >= 0;
