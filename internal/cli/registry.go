@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/rudi-bruchez/argosql/internal/diagnostics"
 	"github.com/rudi-bruchez/argosql/internal/model"
 	"github.com/rudi-bruchez/argosql/internal/sqlserver"
 )
@@ -311,20 +312,11 @@ func flagsFor(c Command) []Flag {
 	return append(flags, c.Flags...)
 }
 
-// notImplemented is the placeholder Execute for every command task 9b
-// has not replaced yet: a stable, typed error (exit code 5, kind
-// not_implemented) rather than a panic or a silent empty result, so a
-// caller driving this build before 9b lands gets a clear, machine
-// readable signal instead of a misleading success.
-func notImplemented(name string) error {
-	return &model.PublicError{Code: 5, Kind: "not_implemented", Message: fmt.Sprintf("%s is not implemented yet", name)}
-}
-
-// infoCommand registers "info". Its Tables and Execute are scaffolding
-// for task 9b: the columns below follow the design spec's description
-// (resolved identity, product version, edition, compatibility level,
-// current principal) but are not binding on 9b's own SQL, which may
-// adjust them once it writes the actual query.
+// infoCommand registers "info": resolved server/database identity,
+// product version, edition, compatibility level, and current
+// principal (design spec). Tables is diagnostics.InfoTable itself,
+// not a local copy, so help's advertised schema and what
+// diagnostics.Info actually writes can never drift apart.
 func infoCommand() Command {
 	return Command{
 		Name:        "info",
@@ -333,27 +325,19 @@ func infoCommand() Command {
 		Units:       []string{"compatibility_level: integer"},
 		Permissions: []string{"CONNECT"},
 		Versions:    []string{"2019", "2022"},
-		Tables: []model.TableSpec{{
-			Name: "identity",
-			Columns: []model.Column{
-				{Name: "server", SQLType: "NVARCHAR"},
-				{Name: "database", SQLType: "NVARCHAR"},
-				{Name: "principal", SQLType: "NVARCHAR"},
-				{Name: "product_version", SQLType: "NVARCHAR"},
-				{Name: "edition", SQLType: "NVARCHAR"},
-				{Name: "compatibility_level", SQLType: "INT"},
-			},
-		}},
-		Execute: func(context.Context, *sqlserver.Session, Request, model.Sink) error {
-			return notImplemented("info")
+		Tables:      []model.TableSpec{diagnostics.InfoTable},
+		Execute: func(ctx context.Context, s *sqlserver.Session, _ Request, dst model.Sink) error {
+			return diagnostics.Info(ctx, s, dst)
 		},
 	}
 }
 
-// qsStatusCommand registers "qs status". Tables follow the design
-// spec's declared order (status, coverage) and field list; like info's,
-// they are 9a's scaffolding for 9b's actual query and may be adjusted
-// there.
+// qsStatusCommand registers "qs status": desired/actual Query Store
+// state, decoded read-only reason, capture mode, storage usage/limit,
+// retention/interval settings, and stored interval coverage, in the
+// design spec's declared table order (status, coverage). Tables is
+// diagnostics.StatusTable and diagnostics.CoverageTable themselves, for
+// the same reason infoCommand above uses diagnostics.InfoTable.
 func qsStatusCommand() Command {
 	return Command{
 		Name:        "qs status",
@@ -362,32 +346,9 @@ func qsStatusCommand() Command {
 		Units:       []string{"current_storage_mb, max_storage_mb: MiB", "retention_days: days", "interval_minutes: minutes"},
 		Permissions: []string{"VIEW DATABASE STATE"},
 		Versions:    []string{"2019", "2022"},
-		Tables: []model.TableSpec{
-			{
-				Name: "status",
-				Columns: []model.Column{
-					{Name: "desired_state", SQLType: "NVARCHAR"},
-					{Name: "actual_state", SQLType: "NVARCHAR"},
-					{Name: "readonly_reason", SQLType: "BIGINT"},
-					{Name: "readonly_reason_decoded", SQLType: "NVARCHAR"},
-					{Name: "capture_mode", SQLType: "NVARCHAR"},
-					{Name: "current_storage_mb", SQLType: "DECIMAL(10,2)"},
-					{Name: "max_storage_mb", SQLType: "DECIMAL(10,2)"},
-					{Name: "retention_days", SQLType: "INT"},
-					{Name: "interval_minutes", SQLType: "INT"},
-				},
-			},
-			{
-				Name: "coverage",
-				Columns: []model.Column{
-					{Name: "oldest_interval", SQLType: "DATETIME2"},
-					{Name: "newest_interval", SQLType: "DATETIME2"},
-					{Name: "has_history", SQLType: "BIT"},
-				},
-			},
-		},
-		Execute: func(context.Context, *sqlserver.Session, Request, model.Sink) error {
-			return notImplemented("qs status")
+		Tables:      []model.TableSpec{diagnostics.StatusTable, diagnostics.CoverageTable},
+		Execute: func(ctx context.Context, s *sqlserver.Session, _ Request, dst model.Sink) error {
+			return diagnostics.Status(ctx, s, dst)
 		},
 	}
 }

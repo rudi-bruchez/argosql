@@ -371,23 +371,24 @@ func TestHelpOfflineExplicitPreviewStillApplies(t *testing.T) {
 
 // fakeLoadConfig and fakeOpenSession let run_test.go drive run (the
 // unexported body behind Run) against a fabricated profile and a
-// fabricated *sqlserver.Session - built directly from its exported
-// fields, Conn and Major - without a config file or a network
-// connection. This is what makes the Major==17/16 notice test below
-// possible without a live SQL Server: sqlserver.Session's own package
-// already exercises Probe/Resolve/etc. against a fake database/sql/driver
-// (see its testdriver_test.go); this package only ever needs a Session
-// value, never a live Conn, because the stub info/qs status Execute
-// below never touches Conn at all.
+// fabricated *sqlserver.Session, without a config file or a network
+// connection. info and qs status now dispatch straight into
+// internal/diagnostics, which queries Session.Conn for real (task 9a's
+// placeholder Execute never did), so fakeOpenSession hands back a
+// Session built on newFakeSession (testdriver_test.go): a real *sql.Conn
+// over a fake database/sql/driver that answers internal/diagnostics'
+// three embedded queries from canned rows, the same technique
+// internal/sqlserver's own package uses for Probe/Resolve (see its
+// testdriver_test.go) - never a live server.
 func fakeLoadConfig(profile config.Profile) configLoader {
 	return func(path, name, databaseOverride string, getenv func(string) string) (config.Profile, error) {
 		return profile, nil
 	}
 }
 
-func fakeOpenSession(major int) sessionOpener {
+func fakeOpenSession(t *testing.T, major int) sessionOpener {
 	return func(ctx context.Context, p config.Profile) (*sqlserver.Session, error) {
-		return &sqlserver.Session{Major: major}, nil
+		return newFakeSession(t, major), nil
 	}
 }
 
@@ -435,7 +436,7 @@ func TestRunEmitsUnvalidatedVersionNotice(t *testing.T) {
 		t.Run(fmt.Sprintf("major %d", c.major), func(t *testing.T) {
 			var out, errout bytes.Buffer
 			args := []string{"--ctx", "x", "--format", "json", "--out-dir", t.TempDir(), "info"}
-			run(context.Background(), args, &out, &errout, fakeLoadConfig(profile), fakeOpenSession(c.major))
+			run(context.Background(), args, &out, &errout, fakeLoadConfig(profile), fakeOpenSession(t, c.major))
 			n, err := countNoticeKind(out.Bytes(), "unvalidated_version")
 			if err != nil {
 				t.Fatalf("invalid JSON output: %v (%s)", err, out.String())
@@ -447,41 +448,58 @@ func TestRunEmitsUnvalidatedVersionNotice(t *testing.T) {
 	}
 }
 
-// TestRunStubCommandsReportNotImplemented proves 9a's placeholder form
-// for info and qs status: a stable *model.PublicError (code 5, kind
-// not_implemented), not a panic or a silent success, until 9b replaces
-// their Execute.
-func TestRunStubCommandsReportNotImplemented(t *testing.T) {
+// TestRunDispatchesInfoAndStatus proves 9b's replacement for 9a's
+// placeholder Execute: info and qs status now reach
+// internal/diagnostics for real and their result flows all the way
+// through Run to stdout - code 0, ok:true, and the tables each command
+// declares in the registry actually present with a row - rather than
+// the stable not_implemented error task 9a's scaffolding returned.
+func TestRunDispatchesInfoAndStatus(t *testing.T) {
 	profile := config.Profile{Host: "fake", Database: "db", Username: "user", Password: "secret", Port: 1433, TrustServerCertificate: true}
-	for _, name := range []string{"info", "qs status"} {
-		t.Run(name, func(t *testing.T) {
+
+	cases := []struct {
+		command string
+		tables  []string
+	}{
+		{"info", []string{"identity"}},
+		{"qs status", []string{"status", "coverage"}},
+	}
+	for _, c := range cases {
+		t.Run(c.command, func(t *testing.T) {
 			var out, errout bytes.Buffer
-			args := append([]string{"--ctx", "x", "--format", "json", "--out-dir", t.TempDir()}, splitName(name)...)
-			code := run(context.Background(), args, &out, &errout, fakeLoadConfig(profile), fakeOpenSession(16))
-			if code != 5 {
-				t.Fatalf("got code %d, want 5 (%s / %s)", code, out.String(), errout.String())
+			args := append([]string{"--ctx", "x", "--format", "json", "--out-dir", t.TempDir()}, splitName(c.command)...)
+			code := run(context.Background(), args, &out, &errout, fakeLoadConfig(profile), fakeOpenSession(t, 16))
+			if code != 0 {
+				t.Fatalf("got code %d, want 0 (%s / %s)", code, out.String(), errout.String())
 			}
 			if !json.Valid(out.Bytes()) {
 				t.Fatalf("stdout is not valid JSON: %s", out.String())
 			}
 			var env struct {
-				Error struct {
-					Code    int    `json:"code"`
-					Kind    string `json:"kind"`
-					Message string `json:"message"`
-				} `json:"error"`
+				OK     bool `json:"ok"`
+				Tables []struct {
+					Spec struct {
+						Name string `json:"name"`
+					} `json:"spec"`
+					Rows [][]any `json:"rows"`
+				} `json:"tables"`
 			}
 			if err := json.Unmarshal(out.Bytes(), &env); err != nil {
 				t.Fatalf("invalid JSON: %v (%s)", err, out.String())
 			}
-			if env.Error.Code != 5 {
-				t.Fatalf("error.code = %d, want 5", env.Error.Code)
+			if !env.OK {
+				t.Fatalf("ok=false: %s", out.String())
 			}
-			if env.Error.Kind != "not_implemented" {
-				t.Fatalf("error.kind = %q, want not_implemented", env.Error.Kind)
+			if len(env.Tables) != len(c.tables) {
+				t.Fatalf("got %d tables, want %d (%s)", len(env.Tables), len(c.tables), out.String())
 			}
-			if !strings.Contains(env.Error.Message, name) {
-				t.Fatalf("error.message = %q, does not name the command %q", env.Error.Message, name)
+			for i, wantName := range c.tables {
+				if env.Tables[i].Spec.Name != wantName {
+					t.Fatalf("table %d: got name %q, want %q", i, env.Tables[i].Spec.Name, wantName)
+				}
+				if len(env.Tables[i].Rows) != 1 {
+					t.Fatalf("table %q: got %d rows, want 1", wantName, len(env.Tables[i].Rows))
+				}
 			}
 		})
 	}
