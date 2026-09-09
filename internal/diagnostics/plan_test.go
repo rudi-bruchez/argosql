@@ -33,15 +33,22 @@ func (r *fakePlanRows) Next(dest []driver.Value) error {
 	return nil
 }
 
-// fakePlanConn is a minimal database/sql/driver.Conn answering
-// sql/plan.sql's own query alone - Plan (unlike Top and Query) never
-// reads health first (design spec: "plan can export a retained plan
-// even if no runtime history remains"), so this fake never needs to
-// answer health.sql or coverage.sql at all.
+// fakePlanConn is a minimal database/sql/driver.Conn answering both of
+// the two queries Plan issues: the shared health.sql read (fix 1's A4
+// - Plan reads health first, like every other Query Store command,
+// even though its own exit code is never gated on it) and sql/plan.sql's
+// own lookup. actual/captureMode/noHistory configure fakeHealthRows
+// (top_test.go, this same package) exactly like fakeTopConn does;
+// left at their zero value, ReadHealth sees a plain, fully-collecting
+// READ_WRITE/ALL database with history, so a test that does not care
+// about health gets no notice at all from it.
 type fakePlanConn struct {
 	row  []driver.Value // nil means zero rows (not found/mismatch)
 	args []driver.NamedValue
 	err  error
+
+	actual, captureMode string
+	noHistory           bool
 }
 
 func (c *fakePlanConn) Prepare(query string) (driver.Stmt, error) {
@@ -52,18 +59,22 @@ func (c *fakePlanConn) Begin() (driver.Tx, error) {
 	return nil, errors.New("fakePlanConn: Begin not supported")
 }
 func (c *fakePlanConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
-	if !strings.Contains(query, "query_store_plan") {
+	switch {
+	case strings.Contains(query, "database_query_store_options"):
+		return &fakeHealthRows{actual: c.actual, captureMode: c.captureMode, noHistory: c.noHistory}, nil
+	case strings.Contains(query, "query_store_plan"):
+		c.args = args
+		if c.err != nil {
+			return nil, c.err
+		}
+		var data [][]driver.Value
+		if c.row != nil {
+			data = [][]driver.Value{c.row}
+		}
+		return &fakePlanRows{data: data}, nil
+	default:
 		return nil, errors.New("fakePlanConn: unexpected query: " + query)
 	}
-	c.args = args
-	if c.err != nil {
-		return nil, c.err
-	}
-	var data [][]driver.Value
-	if c.row != nil {
-		data = [][]driver.Value{c.row}
-	}
-	return &fakePlanRows{data: data}, nil
 }
 
 type fakePlanDriver struct{}
@@ -130,6 +141,44 @@ func TestPlanUnavailableWhenQueryPlanIsNull(t *testing.T) {
 	}
 	if pub.Kind != "plan_unavailable" {
 		t.Fatalf("kind: got %q, want %q", pub.Kind, "plan_unavailable")
+	}
+}
+
+// TestPlanEmitsCaptureNoticeWhenNotReadWrite is fix 1's A4, the
+// reviewer's own repro reproduced at the unit level: after Query Store
+// goes OFF (or otherwise leaves READ_WRITE), Plan must still export at
+// code 0, but it must also emit the same "capture" notice
+// emitQueryStoreNotices already gives Top and Query for the identical
+// fact - never silently exporting as if the collection were live.
+func TestPlanEmitsCaptureNoticeWhenNotReadWrite(t *testing.T) {
+	sess := newFakePlanSession(t, &fakePlanConn{row: []driver.Value{planXMLFixture}, actual: "OFF"})
+	sink := &queryCaptureSink{}
+	if err := Plan(context.Background(), sess, 4821, 9033, false, sink); err != nil {
+		t.Fatalf("Plan on an OFF database should still succeed, got: %v", err)
+	}
+	if n := sink.noticeWithKind("capture"); n == nil {
+		t.Fatal("no capture notice emitted for a non-READ_WRITE Query Store state")
+	}
+	if len(sink.files) != 1 {
+		t.Fatalf("files: got %d, want 1 (export must still happen)", len(sink.files))
+	}
+}
+
+// TestPlanEmitsNoNoticeWhenReadWrite is the negative control: a plain,
+// fully-collecting database emits neither a "capture" nor a
+// "capture_mode" notice - the fake driver's own zero-value defaults
+// (READ_WRITE, ALL, history present).
+func TestPlanEmitsNoNoticeWhenReadWrite(t *testing.T) {
+	sess := newFakePlanSession(t, &fakePlanConn{row: []driver.Value{planXMLFixture}})
+	sink := &queryCaptureSink{}
+	if err := Plan(context.Background(), sess, 4821, 9033, false, sink); err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	if n := sink.noticeWithKind("capture"); n != nil {
+		t.Fatalf("unexpected capture notice for a READ_WRITE database: %+v", n)
+	}
+	if n := sink.noticeWithKind("capture_mode"); n != nil {
+		t.Fatalf("unexpected capture_mode notice for capture mode ALL: %+v", n)
 	}
 }
 

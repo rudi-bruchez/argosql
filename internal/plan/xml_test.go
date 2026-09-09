@@ -112,3 +112,47 @@ func TestNormalizeXMLDeclarationAlreadyUTF8(t *testing.T) {
 		t.Fatalf("output not byte-identical: got %q, want %q", out.String(), input)
 	}
 }
+
+// TestNormalizeXMLIgnoresDeclarationInsideComment is fix 1's A8,
+// exercised with the reviewer's own repro byte for byte: a
+// declaration-shaped string sitting inside an XML comment, nowhere
+// near the start of the document, must never be recognized as a real
+// declaration. The previous, unanchored regexp matched it anywhere in
+// the first bytes of the document and rewrote it, altering the raw
+// content it was supposed to leave untouched.
+func TestNormalizeXMLIgnoresDeclarationInsideComment(t *testing.T) {
+	input := `<ShowPlanXML><!-- <?xml version="1.0" encoding="utf-16"?> --></ShowPlanXML>`
+	var out bytes.Buffer
+	changed, err := NormalizeXML(strings.NewReader(input), &out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed {
+		t.Fatal("a declaration-shaped comment is not a real declaration: normalized should be false")
+	}
+	if out.String() != input {
+		t.Fatalf("output not byte-identical: got %q (%d bytes), want %q (%d bytes) - the comment must not be altered", out.String(), out.Len(), input, len(input))
+	}
+}
+
+// TestNormalizeXMLDetectsDeclarationPastOldWindow is fix 1's A8's
+// second repro: a legal XML declaration whose own "encoding"
+// pseudo-attribute starts well past byte 512 (the previous, too-short
+// peek window) must still be found and normalized - the declaration
+// itself is anchored at byte 0, and the scan for its own terminating
+// "?>" is bounded by declMaxScanBytes, not by an arbitrary short
+// prologue window.
+func TestNormalizeXMLDetectsDeclarationPastOldWindow(t *testing.T) {
+	input := `<?xml version="1.0" ` + strings.Repeat(" ", 512) + `encoding="utf-16"?><ShowPlanXML/>`
+	if len(input) <= 512 {
+		t.Fatalf("fixture too small to exercise the old 512-byte window: %d bytes", len(input))
+	}
+	var out bytes.Buffer
+	changed, err := NormalizeXML(strings.NewReader(input), &out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed || strings.Contains(out.String(), "utf-16") || !strings.Contains(out.String(), "utf-8") {
+		t.Fatalf("declaration past the old 512-byte window was not normalized: changed=%v out=%q", changed, out.String())
+	}
+}

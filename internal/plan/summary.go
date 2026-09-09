@@ -80,25 +80,28 @@ const (
 // operatorCandidate is one RelOp Summarize has seen, whether or not it
 // survives in the final top-operatorCap cut.
 type operatorCandidate struct {
-	seq                   int // document (traversal) order, assigned once per RelOp encountered
 	nodeID                int64
 	physicalOp, logicalOp string
 	cost                  float64
 }
 
 // operatorWorse reports whether a is a worse operator to keep than b:
-// lower estimated subtree cost is worse; cost tied, the one seen LATER
-// in the document (higher seq) is worse (design spec, line 89: "Order
-// operator ties by statement traversal order then NodeId" - an earlier
-// operator survives a later one at the same cost); cost and seq both
-// tied (never possible in practice - seq is unique per RelOp) falls
-// back to NodeId, purely for a fully deterministic order.
+// lower estimated subtree cost is worse; cost tied, the design spec's
+// own tie-break applies (line 89: "Order operator ties by statement
+// traversal order then NodeId") - fix 1's A7: a Query Store plan always
+// carries exactly one statement (measured fact, CLAUDE.md), so
+// "statement traversal order" is the SAME for every operator this
+// function ever sees and never distinguishes two tied candidates; the
+// tie-break that actually applies is NodeId, directly, ascending among
+// the kept set. The previous form used a monotonic seq counter instead
+// - unique per RelOp by construction, so the "then NodeId" half was
+// dead code, unreachable because no two seq values were ever equal -
+// and produced document-encounter order on a tie instead of NodeId
+// order, exactly the defect fix 1 measured (NodeId 9, 2, 1 kept in
+// that order instead of 1, 2, 9).
 func operatorWorse(a, b operatorCandidate) bool {
 	if a.cost != b.cost {
 		return a.cost < b.cost
-	}
-	if a.seq != b.seq {
-		return a.seq > b.seq
 	}
 	return a.nodeID > b.nodeID
 }
@@ -142,19 +145,16 @@ func considerOperator(h *operatorHeap, c operatorCandidate) {
 }
 
 // sortOperatorsForDisplay orders ops for the operators table's own
-// rows: highest estimated subtree cost first, ties broken by earlier
-// traversal order then by NodeId - the display-order mirror of
-// operatorWorse above (design spec, line 89's ordering rule stated
-// once, in the direction it is actually consumed twice: to decide
-// what to evict, and to decide what to print).
+// rows: highest estimated subtree cost first, ties broken by NodeId
+// ascending - the display-order mirror of operatorWorse above (design
+// spec, line 89's ordering rule stated once, in the direction it is
+// actually consumed twice: to decide what to evict, and to decide
+// what to print).
 func sortOperatorsForDisplay(ops []operatorCandidate) {
 	sort.Slice(ops, func(i, j int) bool {
 		a, b := ops[i], ops[j]
 		if a.cost != b.cost {
 			return a.cost > b.cost
-		}
-		if a.seq != b.seq {
-			return a.seq < b.seq
 		}
 		return a.nodeID < b.nodeID
 	})
@@ -209,11 +209,33 @@ func relOpValues(t xml.StartElement) (nodeID int64, cost float64, ok bool) {
 // trimBrackets strips one layer of SQL Server's own "[...]" delimited-
 // identifier quoting from a showplan Object attribute value
 // ("[dbo]" -> "dbo"), leaving anything not shaped that way untouched.
+// Fix 1's A6: a delimited identifier escapes a literal "]" inside it
+// as "]]" (the same doubling rule QUOTENAME/bracket-quoted names use
+// everywhere in SQL Server), so "[a]]b]" names the single identifier
+// "a]b", not the four-character string "a]]b" the previous form
+// returned by only ever removing the outer pair.
 func trimBrackets(s string) string {
 	if len(s) >= 2 && strings.HasPrefix(s, "[") && strings.HasSuffix(s, "]") {
-		return s[1 : len(s)-1]
+		return strings.ReplaceAll(s[1:len(s)-1], "]]", "]")
 	}
 	return s
+}
+
+// referenceKey builds a dedup key for r that cannot collide between
+// two genuinely different references. Fix 1's A6: the previous key,
+// r.database+"|"+r.schema+"|"+r.table+"|"+r.index, used "|" as a field
+// separator even though "|" is a legal character inside a delimited
+// identifier - (Database=[D], Schema=[a|b], Table=[c]) and
+// (Database=[D], Schema=[a], Table=[b|c]) produced the identical
+// string "D|a|b|c|" and were merged into one reference. Prefixing each
+// field with its own byte length (a standard length-prefixed, or
+// netstring-style, encoding) makes the key injective: reconstructing
+// the original four fields from the key is unambiguous, so two
+// different tuples can never produce the same string, regardless of
+// what characters any field contains.
+func referenceKey(r referenceRow) string {
+	field := func(s string) string { return strconv.Itoa(len(s)) + ":" + s }
+	return field(r.database) + field(r.schema) + field(r.table) + field(r.index)
 }
 
 // objectValues reads Database/Schema/Table/Index off an Object start
@@ -254,12 +276,47 @@ func warningDetail(t xml.StartElement) string {
 	return strings.Join(parts, "; ")
 }
 
+// appendWarning records one warning row (warnType, detail) into
+// warnings, or marks *truncated once warningCap is reached - shared by
+// both of Summarize's two sources of a warning (fix 1's A1): a
+// <Warnings ...attr="value".../> element's own attributes, and each of
+// its child elements (already handled before A1; see Summarize's own
+// doc comment on why both exist and neither substitutes for the
+// other).
+func appendWarning(warnings *[]warningRow, truncated *bool, warnType, detail string) {
+	if len(*warnings) < warningCap {
+		*warnings = append(*warnings, warningRow{warningType: warnType, detail: detail})
+		return
+	}
+	*truncated = true
+}
+
 // malformedXMLError builds the code-5 error Summarize returns when
 // dec.Token() itself fails - a syntax error, or any other failure
 // reading src (design spec, line 89: "reject malformed XML with code
 // 5"; the brief's own shorthand: "parse failure=5 garde son chemin").
 func malformedXMLError(err error) error {
 	return &model.PublicError{Code: 5, Kind: "malformed_plan_xml", Message: fmt.Sprintf("parsing plan XML: %s", err.Error())}
+}
+
+// summaryTruncatedError builds the code-7 error Summarize returns when
+// the references or the warnings list was capped (fix 1's A3): the
+// design spec, line 101, states "incomplete collection yields code 7"
+// without a carve-out for plan --summary, and this project's own
+// twelve other End(false, ...) callers all reach a collection-limit
+// error the same way (internal/artifacts.Collector's own Row/breach).
+// The raw plan_xml artifact and every table's own rows/notices are
+// already written and recorded by the time this returns - a later
+// error never erases what a Sink already accepted (see
+// internal/artifacts/collector.go's Finish, and diagnostics/plan.go's
+// exportAndSummarize, which exports the raw artifact before Summarize
+// ever runs).
+func summaryTruncatedError() error {
+	return &model.PublicError{
+		Code:    7,
+		Kind:    "collection_limit",
+		Message: "plan summary: the references or warnings list was truncated at its cap; see the raw plan_xml artifact for the complete plan",
+	}
 }
 
 // Summarize reads src (a complete, already-normalized plan XML
@@ -275,41 +332,56 @@ func malformedXMLError(err error) error {
 // length-capped slices - see summary_test.go's own retention test for
 // the load-bearing proof against a 10,000-operator, 80 KiB+ document.
 //
-// A statement-level cost is read from the FIRST RelOp encountered in
-// document order: xml.Decoder visits elements in that order, so the
-// first RelOp inside a plan's <QueryPlan> is always its outermost,
-// root operator, whose own EstimatedTotalSubtreeCost already IS the
-// statement's total estimated cost - Summarize never sums subtree
-// costs itself (design spec, line 87: "do not sum overlapping subtree
-// costs"), and never counts statements at all (design spec, line 89:
-// "No statement count is required in the summary" - a Query Store
-// plan always carries exactly one).
+// The statement's own estimated cost (design spec, line 87: "the
+// statement's estimated cost") is read from the StatementSubTreeCost
+// attribute of the first "Stmt*" element encountered (StmtSimple,
+// StmtCursor, ... - a Query Store plan always carries exactly one, so
+// only the first is ever consulted). Fix 1's A2: this used to read the
+// first RelOp's own EstimatedTotalSubtreeCost instead, which is the
+// same value only because the root RelOp's subtree cost happens to
+// equal the statement's cost when the root itself carries both
+// attributes - a descendant RelOp silently became "the statement's
+// cost" whenever the root was missing either one. If StatementSubTreeCost
+// is absent or unparseable, estimated_cost is reported unavailable
+// (model.ReasonPropertyUnavailable, via propertiesComplete=false) -
+// never guessed from an operator of a different scope.
 //
 // A capped references or warnings list is reported as an incomplete
 // table (End(false, true)) plus a Notice pointing at the raw artifact,
 // using the project's own closed vocabulary for this exact fact
 // (model.ReasonCollectionLimit, surfaced automatically by
 // internal/output.Render from that same completeness flag - see
-// internal/output/preview.go's tableReasons/buildPreviewState). The
-// operators table is never marked incomplete this way: retaining only
-// the top five is this summary's own declared shape (design spec: "up
-// to five operators"), not a limit unexpectedly reached.
+// internal/output/preview.go's tableReasons/buildPreviewState), AND
+// (fix 1's A3) a code-7 summaryTruncatedError once every table has
+// been written. The operators table is never marked incomplete this
+// way: retaining only the top five is this summary's own declared
+// shape (design spec: "up to five operators"), not a limit
+// unexpectedly reached.
+//
+// Fix 1's A9: the end of the token stream is not, by itself, proof the
+// document was well formed - encoding/xml.Decoder.Token() tokenizes
+// without validating that exactly one root element closes the
+// document, so "<ShowPlanXML/><ShowPlanXML/>" reached io.EOF cleanly
+// under the previous form. A second element at depth 1 is now rejected
+// as malformed (code 5), the raw export already made by the time
+// Summarize runs is untouched either way.
 func Summarize(src io.Reader, dst model.Sink) error {
 	dec := xml.NewDecoder(src)
 
 	var (
-		seq               int
-		haveStatement     bool
-		statementCost     model.Cell
-		ops               operatorHeap
-		refs              []referenceRow
-		refSeen           = map[string]bool{}
-		refsTruncated     bool
-		warnings          []warningRow
-		warningsTruncated bool
-		inWarnings        bool
-		warningsDepth     int
-		depth             int
+		statementSeen               bool
+		statementCost               model.Cell
+		statementPropertiesComplete bool
+		ops                         operatorHeap
+		refs                        []referenceRow
+		refSeen                     = map[string]bool{}
+		refsTruncated               bool
+		warnings                    []warningRow
+		warningsTruncated           bool
+		inWarnings                  bool
+		warningsDepth               int
+		depth                       int
+		rootElements                int
 	)
 
 	for {
@@ -324,22 +396,31 @@ func Summarize(src io.Reader, dst model.Sink) error {
 		switch t := tok.(type) {
 		case xml.StartElement:
 			depth++
-			switch t.Name.Local {
-			case "RelOp":
+			if depth == 1 {
+				rootElements++
+				if rootElements > 1 {
+					return malformedXMLError(fmt.Errorf("more than one root element (%q at document level)", t.Name.Local))
+				}
+			}
+			switch {
+			case strings.HasPrefix(t.Name.Local, "Stmt") && !statementSeen:
+				statementSeen = true
+				if costStr, ok := attrValue(t, "StatementSubTreeCost"); ok {
+					if c, err := strconv.ParseFloat(costStr, 64); err == nil {
+						statementCost = c
+						statementPropertiesComplete = true
+					}
+				}
+			case t.Name.Local == "RelOp":
 				nodeID, cost, ok := relOpValues(t)
 				if ok {
-					if !haveStatement {
-						statementCost = cost
-						haveStatement = true
-					}
 					physicalOp, _ := attrValue(t, "PhysicalOp")
 					logicalOp, _ := attrValue(t, "LogicalOp")
-					considerOperator(&ops, operatorCandidate{seq: seq, nodeID: nodeID, physicalOp: physicalOp, logicalOp: logicalOp, cost: cost})
-					seq++
+					considerOperator(&ops, operatorCandidate{nodeID: nodeID, physicalOp: physicalOp, logicalOp: logicalOp, cost: cost})
 				}
-			case "Object":
+			case t.Name.Local == "Object":
 				if r, ok := objectValues(t); ok {
-					key := r.database + "|" + r.schema + "|" + r.table + "|" + r.index
+					key := referenceKey(r)
 					if !refSeen[key] {
 						if len(refs) < referenceCap {
 							refSeen[key] = true
@@ -349,16 +430,21 @@ func Summarize(src io.Reader, dst model.Sink) error {
 						}
 					}
 				}
-			case "Warnings":
+			case t.Name.Local == "Warnings":
 				inWarnings = true
 				warningsDepth = depth
+				// Fix 1's A1: the engine expresses some warnings as
+				// attributes of Warnings itself (measured on both
+				// engines: <Warnings NoJoinPredicate="1"/>), not only as
+				// child elements - the only source this function read
+				// before this fix, which silently dropped exactly this
+				// shape while still reporting the table complete.
+				for _, a := range t.Attr {
+					appendWarning(&warnings, &warningsTruncated, a.Name.Local, a.Value)
+				}
 			default:
 				if inWarnings && depth == warningsDepth+1 {
-					if len(warnings) < warningCap {
-						warnings = append(warnings, warningRow{warningType: t.Name.Local, detail: warningDetail(t)})
-					} else {
-						warningsTruncated = true
-					}
+					appendWarning(&warnings, &warningsTruncated, t.Name.Local, warningDetail(t))
 				}
 			}
 		case xml.EndElement:
@@ -369,7 +455,7 @@ func Summarize(src io.Reader, dst model.Sink) error {
 		}
 	}
 
-	if err := writeStatementTable(dst, statementCost); err != nil {
+	if err := writeStatementTable(dst, statementCost, statementPropertiesComplete); err != nil {
 		return err
 	}
 	if err := writeOperatorsTable(dst, ops); err != nil {
@@ -378,17 +464,30 @@ func Summarize(src io.Reader, dst model.Sink) error {
 	if err := writeReferencesTable(dst, refs, refsTruncated); err != nil {
 		return err
 	}
-	return writeWarningsTable(dst, warnings, warningsTruncated)
+	if err := writeWarningsTable(dst, warnings, warningsTruncated); err != nil {
+		return err
+	}
+	if refsTruncated || warningsTruncated {
+		return summaryTruncatedError()
+	}
+	return nil
 }
 
-func writeStatementTable(dst model.Sink, cost model.Cell) error {
+func writeStatementTable(dst model.Sink, cost model.Cell, propertiesComplete bool) error {
 	if err := dst.Begin(StatementTable); err != nil {
 		return err
 	}
 	if err := dst.Row([]model.Cell{summarySource, cost}); err != nil {
 		return err
 	}
-	return dst.End(true, true)
+	if !propertiesComplete {
+		dst.Notice(model.Notice{
+			Kind:    "statement_cost_unavailable",
+			Message: "no Stmt* element carries a StatementSubTreeCost attribute; estimated_cost is unavailable",
+			Table:   StatementTable.Name,
+		})
+	}
+	return dst.End(true, propertiesComplete)
 }
 
 func writeOperatorsTable(dst model.Sink, h operatorHeap) error {

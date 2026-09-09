@@ -102,11 +102,23 @@ type TableResult struct {
 
 // Artifact records one exported file: its kind, path, size, and whether it
 // was written in full.
+//
+// Reason is set only for an OMITTED artifact - one that was never
+// written at all because a single collected value exceeded the
+// artifact byte quota (design spec, line 111: "return code 7 with an
+// explicit omitted-artifact record" - fix 1's A5). Path stays empty
+// (nothing was ever written) and Bytes holds however many bytes were
+// actually read before the quota breach was detected - a lower bound
+// on the source's true size, never a size that was ever committed to
+// disk. Drawn from the same closed vocabulary as every other omission
+// reason in this project (ReasonCollectionLimit); empty for every
+// ordinary, successfully written artifact.
 type Artifact struct {
 	Kind     string `json:"kind"`
 	Path     string `json:"path"`
 	Bytes    int64  `json:"bytes"`
 	Complete bool   `json:"complete"`
+	Reason   string `json:"reason,omitempty"`
 }
 
 // ContextInfo describes the connection the diagnostics ran against.

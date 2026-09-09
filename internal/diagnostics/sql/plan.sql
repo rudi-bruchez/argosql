@@ -9,10 +9,12 @@
 -- lookup cannot tell "does not exist" from "not visible" apart
 -- either; see diagnostics/plan.go's own planNotFound).
 --
--- query_plan is xml, and it is nullable: Microsoft documents the
--- closely related sys.dm_exec_query_plan.query_plan as returning NULL
--- once a plan's XML has been evicted from cache or was never
--- cacheable to begin with. A resolved (query_id, plan_id) pair whose
+-- query_plan is nvarchar, and it is nullable - measured directly
+-- against sys.all_columns on both 2019 and 2022 (fix 1's correction:
+-- this comment used to claim "xml", borrowed from the unrelated
+-- sys.dm_exec_query_plan and never itself measured against
+-- sys.query_store_plan). Nullability is the fact that matters here and
+-- it holds either way: a resolved (query_id, plan_id) pair whose
 -- query_plan is NULL is reported by Go as code 4, plan_unavailable,
 -- never a silent empty export (see diagnostics/plan.go's own
 -- planUnavailable).
@@ -22,12 +24,14 @@
 -- Go reports that as code 8, not_found_or_not_visible, mirroring
 -- query.sql's own queryStoreNotFound path.
 --
--- Unlike query.go's Query and top.go's Top, Plan never reads health
--- first and never gates on runtime history: design spec line 83's own
--- exception ("plan can export a retained plan even if no runtime
--- history remains") means this plain catalog read is Plan's entire
--- SQL surface - sys.query_store_plan outlives
--- sys.query_store_runtime_stats' own retention window.
+-- This is Plan's entire SQL surface: sys.query_store_plan outlives
+-- sys.query_store_runtime_stats' own retention window, which is why a
+-- plan can still be exported with no runtime history left at all
+-- (design spec line 83's own exception - about the EXIT CODE only,
+-- fix 1's A4). Plan still reads health first, like every other Query
+-- Store command (design spec line 81) - that read runs against
+-- health.sql, not against this file, and diagnostics/plan.go's own
+-- Plan documents why in full.
 SELECT query_plan
 FROM sys.query_store_plan
 WHERE query_id = @query_id AND plan_id = @plan_id;

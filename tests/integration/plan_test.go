@@ -10,9 +10,79 @@ import (
 	"time"
 
 	"github.com/rudi-bruchez/argosql/internal/diagnostics"
+	"github.com/rudi-bruchez/argosql/internal/model"
 	"github.com/rudi-bruchez/argosql/internal/plan"
 	"github.com/rudi-bruchez/argosql/internal/sqlserver"
 )
+
+// TestPlanSummaryWarningAttributeForm is fix 1's A1, the reviewer's
+// own exact repro run against a real engine (both 2019 and 2022): a
+// cross join with no join predicate, forced serial with
+// OPTION(MAXDOP 1), produces a real <Warnings NoJoinPredicate="1"/> -
+// an attribute of the Warnings element itself, not a child. The
+// previous implementation read only Warnings' children and reported
+// this table empty, collection_complete=true, on exactly this
+// document.
+func TestPlanSummaryWarningAttributeForm(t *testing.T) {
+	lab := NewLab(t, os.Getenv("ASQ_TEST_IMAGE"))
+	ctx, cancel := context.WithTimeout(context.Background(), flushPollBudget)
+	defer cancel()
+
+	const marker = "AsqFix1A1Crossjoin"
+	batch := "SELECT SUM(a.Quantity+b.Quantity) AS " + marker + " FROM dbo.Widgets a CROSS JOIN dbo.Widgets b OPTION(MAXDOP 1)"
+	// Five executions before the flush, matching Lab.QueryID's own
+	// resilience pattern (fixture_test.go): measured on 2019, a single
+	// execution of this batch was not reliably visible to
+	// sp_query_store_flush_db within the poll budget, unlike 2022.
+	for i := 0; i < 5; i++ {
+		if _, err := lab.Admin.ExecContext(ctx, batch); err != nil {
+			t.Fatalf("running the cross join workload: %v", err)
+		}
+	}
+	if _, err := lab.Admin.ExecContext(ctx, "EXEC sys.sp_query_store_flush_db"); err != nil {
+		t.Fatalf("sp_query_store_flush_db: %v", err)
+	}
+
+	findID := "SELECT q.query_id FROM sys.query_store_query_text AS qt " +
+		"JOIN sys.query_store_query AS q ON q.query_text_id = qt.query_text_id " +
+		"WHERE qt.query_sql_text LIKE '%' + @p1 + '%'"
+	deadline := time.Now().Add(flushPollDeadline)
+	var queryID int64
+	for {
+		err := lab.Admin.QueryRowContext(ctx, findID, marker).Scan(&queryID)
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("marker %q did not appear within %s of flush: %v", marker, flushPollDeadline, err)
+		}
+		time.Sleep(flushPollDelay)
+	}
+	planID := planIDFor(ctx, t, lab, queryID)
+
+	r, code := lab.Run(t, "Q", []string{"plan", strconv.FormatInt(queryID, 10), "--plan-id", strconv.FormatInt(planID, 10), "--summary"})
+	if code != 0 {
+		t.Fatalf("plan --summary: code=%d, error=%+v", code, r.Error)
+	}
+	var warnRows [][]model.Cell
+	for _, tbl := range r.Tables {
+		if tbl.Spec.Name == plan.WarningsTable.Name {
+			warnRows = append(warnRows, tbl.Rows...)
+		}
+	}
+	if len(warnRows) == 0 {
+		t.Fatal("warnings table: got 0 rows, want at least the NoJoinPredicate warning (fix 1's A1)")
+	}
+	found := false
+	for _, row := range warnRows {
+		if row[0] == "NoJoinPredicate" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("NoJoinPredicate warning not found: %+v", warnRows)
+	}
+}
 
 // planIDFor reads sys.query_store_plan's own plan_id for queryID
 // directly through lab.Admin - workload.sql's own load (run through
@@ -143,6 +213,9 @@ func TestPlanSummary(t *testing.T) {
 	if got, ok := stmt.Rows[0][0].(string); !ok || got != "query_store_compiled_plan_xml" {
 		t.Fatalf("statement source: got %#v, want %q", stmt.Rows[0][0], "query_store_compiled_plan_xml")
 	}
+	if stmt.Rows[0][1] == nil {
+		t.Fatal("estimated_cost: got nil, want a real StatementSubTreeCost value (fix 1's A2)")
+	}
 
 	ops := r.Tables[1]
 	if len(ops.Rows) == 0 {
@@ -155,12 +228,15 @@ func TestPlanSummary(t *testing.T) {
 // retained plan even if no runtime history remains" - a plan/query
 // pair captured while Query Store was READ_WRITE must still export
 // successfully at code 0 after Query Store is turned OFF, unlike
-// "qs top"/"qs query", which gate on runtime history for a
-// non-collecting state (see top_test.go's/query_test.go's own OFF
-// fixtures). Plan never reads health at all (diagnostics/plan.go),
-// so this is the one Query Store command this project's OFF-state
-// fixture pattern proves succeeds unconditionally, not just "succeeds
-// with a warning".
+// "qs top"/"qs query", which gate the EXIT CODE on runtime history for
+// a non-collecting state (see top_test.go's/query_test.go's own OFF
+// fixtures). Fix 1's A4: unlike this task's own original claim, Plan
+// DOES read health first, exactly like every other Query Store
+// command (design spec line 81) - measured against a real engine
+// before this fix, "plan" under Q exported at code 0 with NO notice
+// at all after the same ALTER DATABASE ... SET QUERY_STORE = OFF, so
+// this test now asserts the "capture" notice is present, not merely
+// that the export still succeeds.
 func TestPlanSucceedsWhileQueryStoreOff(t *testing.T) {
 	lab := NewLab(t, os.Getenv("ASQ_TEST_IMAGE"))
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -205,6 +281,9 @@ func TestPlanSucceedsWhileQueryStoreOff(t *testing.T) {
 	}
 	if len(sink.files) != 1 {
 		t.Fatalf("files: got %d, want 1", len(sink.files))
+	}
+	if n := sink.noticeWithKind("capture"); n == nil {
+		t.Fatalf("no capture notice emitted for a non-READ_WRITE Query Store state: notices=%+v", sink.notices)
 	}
 }
 

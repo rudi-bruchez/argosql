@@ -62,15 +62,44 @@ func planUnavailable(queryID, planID int64) error {
 // (design spec: "Verify plan belongs to query; export complete XML to
 // .sqlplan; optional bounded summary").
 //
-// Unlike Top and Query, Plan never reads Health first and never fails
-// on a non-collecting Query Store state: design spec line 83's own
-// exception ("plan can export a retained plan even if no runtime
-// history remains") and its exit-code table's own row ("Retained plan
-// export without runtime history | 0") both say a plan export is not
-// gated by runtime history the way ranking/detail commands are - it
-// reads sys.query_store_plan directly, a catalog view that outlives
-// sys.query_store_runtime_stats' own retention window.
+// Fix 1's A4 corrected a misreading of the design spec: line 81 says
+// "Every Query Store command reads health first. Emit structured
+// warnings for non-READ_WRITE state, capture restrictions, and
+// requested history outside available coverage" - with no exception
+// naming plan. Line 83's own exception ("plan can export a retained
+// plan even if no runtime history remains") is about the EXIT CODE
+// only: it says the export is not GATED on runtime history the way
+// Top/Query are (they fail at code 4 on a non-collecting state with no
+// readable history at all; Plan never does, and still does not, after
+// this fix). It never said Plan does not READ health, or that it may
+// stay silent about a Query Store that is OFF or otherwise not
+// collecting - measured against a real engine, exporting silently
+// after ALTER DATABASE ... SET QUERY_STORE = OFF hid exactly the fact
+// that the collection an agent might expect is frozen.
+//
+// Plan therefore reads health first, like every other Query Store
+// command, and reuses top.go's own emitQueryStoreNotices for the two
+// of its three named categories that apply to a command with no
+// window at all: non-READ_WRITE state ("capture") and capture
+// restrictions ("capture_mode"). The third category, line 81's
+// "requested history outside available coverage", does not apply -
+// Plan has no requested window to compare against coverage - so oldest
+// and newest are passed as nil, which also disables that check inside
+// the shared helper without needing a second, Plan-specific version of
+// it (oldest/newest nil is emitQueryStoreNotices' own guard for
+// "nothing to compare a window against"). health.HasHistory still
+// drives that helper's own independent "coverage" notice
+// ("this database has no Query Store runtime history yet") when the
+// database has never captured any runtime row at all - a plan can
+// still export in that state (it reads sys.query_store_plan, not
+// runtime_stats), and the notice says so rather than staying silent.
 func Plan(ctx context.Context, s *sqlserver.Session, queryID, planID int64, summary bool, dst model.Sink) error {
+	health, err := ReadHealth(ctx, s)
+	if err != nil {
+		return err
+	}
+	emitQueryStoreNotices(dst, "plan_xml", health, Window{}, nil, nil)
+
 	cells, found, err := queryOneOptionalRow(ctx, s.Conn, planQuery, sql.Named("query_id", queryID), sql.Named("plan_id", planID))
 	if err != nil {
 		return err

@@ -334,6 +334,39 @@ func TestFileLimitSingleSource(t *testing.T) {
 				t.Fatalf("overflowing File() must leave no artifact file, found %q", e.Name())
 			}
 		}
+
+		// Fix 1's A5: design spec line 111 requires "code 7 with an
+		// explicit omitted-artifact record", not just an error message
+		// naming the kind in a sentence. c.artifacts (and, through it,
+		// both the manifest and the live result Finish assembles) must
+		// carry a structured entry for the omitted "plan" artifact.
+		if len(c.artifacts) != 1 {
+			t.Fatalf("c.artifacts: got %d entries, want exactly 1 (the omitted artifact record): %+v", len(c.artifacts), c.artifacts)
+		}
+		omitted := c.artifacts[0]
+		if omitted.Kind != "plan" {
+			t.Fatalf("omitted artifact kind: got %q, want %q", omitted.Kind, "plan")
+		}
+		if omitted.Path != "" {
+			t.Fatalf("omitted artifact path: got %q, want empty (nothing was ever written)", omitted.Path)
+		}
+		if omitted.Complete {
+			t.Fatal("omitted artifact must not be marked complete")
+		}
+		if omitted.Reason != model.ReasonCollectionLimit {
+			t.Fatalf("omitted artifact reason: got %q, want %q", omitted.Reason, model.ReasonCollectionLimit)
+		}
+		if omitted.Bytes != budget+1 {
+			t.Fatalf("omitted artifact bytes: got %d, want %d (bytes actually read before the breach)", omitted.Bytes, budget+1)
+		}
+
+		result, finishErr := c.Finish(model.ContextInfo{}, err)
+		if finishErr == nil {
+			t.Fatal("Finish should preserve the collection-limit error")
+		}
+		if len(result.Artifacts) != 1 || result.Artifacts[0].Reason != model.ReasonCollectionLimit {
+			t.Fatalf("result.Artifacts must carry the omitted record too (shared with the manifest): %+v", result.Artifacts)
+		}
 	})
 }
 
