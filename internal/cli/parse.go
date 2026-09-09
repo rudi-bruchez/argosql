@@ -9,6 +9,7 @@ import (
 
 	"github.com/rudi-bruchez/argosql/internal/diagnostics"
 	"github.com/rudi-bruchez/argosql/internal/model"
+	"github.com/rudi-bruchez/argosql/internal/sqlserver"
 )
 
 // Parse turns args (the program's arguments, not including argv[0]) into
@@ -148,6 +149,37 @@ func Parse(args []string) (Request, *Command, error) {
 	// each flag is validated independently of the other's value.
 	if cmd.Name == "qs top" && req.By == "executions" && req.Aggregate == "avg" {
 		return req, nil, &model.PublicError{Code: 2, Kind: "flag", Message: "--aggregate avg is not valid with --by executions"}
+	}
+
+	// An explicitly given --since or --until with an EMPTY value is a
+	// malformed timestamp, never "not given": ParseWindow only ever
+	// sees the two strings, not whether they were typed at all, so
+	// "--since '' --until ''" (for example, an unset environment
+	// variable expanded blank in an operations script) would otherwise
+	// look identical to neither flag being given, and silently fall
+	// back to the relative --hours window instead of reporting the
+	// actual mistake. Checked here, against req.Explicit, which is the
+	// one place that distinguishes "empty" from "absent" - never both
+	// given (the valid case), only the explicitly-empty one.
+	if explicit["since"] && req.Since == "" {
+		return req, nil, &model.PublicError{Code: 2, Kind: "invalid_window", Message: "--since: empty value is not a valid RFC3339 timestamp"}
+	}
+	if explicit["until"] && req.Until == "" {
+		return req, nil, &model.PublicError{Code: 2, Kind: "invalid_window", Message: "--until: empty value is not a valid RFC3339 timestamp"}
+	}
+
+	// --object's two-part syntax (schema.object, bracket-quoting rules
+	// included) is checked here, before any connection opens - the same
+	// ordering already applied above to --aggregate/--by and below to
+	// the window. This is ONLY the syntactic check sqlserver.Resolve
+	// itself performs first, with no catalog access; the TYPE of the
+	// resolved object (procedure vs. table vs. anything else) still has
+	// to wait for a real connection, since only the catalog can answer
+	// that.
+	if _, ok := allowed["object"]; ok && req.Object != "" {
+		if err := sqlserver.ValidateQualifiedName(req.Object); err != nil {
+			return req, nil, err
+		}
 	}
 
 	// ParseWindow resolves --hours/--since/--until into req.Window here,

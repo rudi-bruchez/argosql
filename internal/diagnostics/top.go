@@ -87,19 +87,14 @@ var TopRankingTable = model.TableSpec{
 	},
 }
 
-// datetimeOffsetFormat and datetime2Format mirror
-// internal/output/cell.go's own DATETIMEOFFSET/DATETIME2 rendering
-// exactly, so ranking's hand-built cells look like any other
-// project-rendered timestamp. coverage.sql's oldest/newest columns can
-// come back through queryOneRow/ScanRow in either shape - see
-// reformatCoverageCell's own doc comment for the measured reason.
-// Query Store's interval timestamps carry no zone of their own, so
-// reformatCoverageCell below treats them as UTC to match
-// requested_since/requested_until's own UTC-rendered form.
-const (
-	datetimeOffsetFormat = "2006-01-02T15:04:05.9999999Z07:00"
-	datetime2Format      = "2006-01-02T15:04:05.9999999"
-)
+// datetimeOffsetFormat mirrors internal/output/cell.go's own
+// DATETIMEOFFSET rendering exactly, so ranking's hand-built cells look
+// like any other project-rendered timestamp. coverage.sql's
+// oldest/newest columns are genuinely DATETIMEOFFSET (see
+// CoverageTable's own doc comment: they were mislabeled DATETIME2 since
+// task 9b, fixed alongside this), so ScanRow always renders them in
+// exactly this one shape - there is no second format to fall back to.
+const datetimeOffsetFormat = "2006-01-02T15:04:05.9999999Z07:00"
 
 // formatDateTimeOffset renders t (already UTC; Window's own contract)
 // the same way internal/output.ScanRow would render a real
@@ -109,27 +104,15 @@ func formatDateTimeOffset(t time.Time) string {
 }
 
 // reformatCoverageCell turns one of coverage.sql's own Cell values (a
-// string, per cell.go's convention, or nil for "no interval at all")
-// into ranking's DATETIMEOFFSET-shaped form.
-//
-// It tries datetimeOffsetFormat before datetime2Format, not the
-// reverse. Measured against a real SQL Server 2022 container running
-// this exact fix's own "qs top" integration test: MIN(i.start_time)/
-// MAX(i.end_time) over sys.query_store_runtime_stats_interval -
-// declared DATETIME2 in CoverageTable, and that is still the correct
-// label for coverage.sql's own "qs status" use - came back through
-// ScanRow as "2026-09-09T08:57:00Z", the DATETIMEOFFSET-shaped form
-// cell.go's own "Z07:00" directive produces at exactly a zero offset,
-// not the plain, offset-less form datetime2Format alone would parse.
-// The *name* of a column's declared SQL type is not proof of the Go
-// string shape ScanRow actually rendered for it on this query; trying
-// the offset-aware form first, and falling back to the plain form,
-// parses either shape coverage.sql could hand back rather than
-// betting on one.
+// DATETIMEOFFSET-shaped string, per cell.go's convention, or nil for
+// "no interval at all") into ranking's own DATETIMEOFFSET-shaped form -
+// the identity transform today (CoverageTable now declares the correct
+// type), kept as its own function because Top also needs the parsed
+// time.Time for the coverage_window comparison, not just the string.
 //
 // A non-nil, non-string cell is this package's own defect:
-// coverage.sql CASTs explicitly, so ScanRow can only ever hand back a
-// string or nil for these two columns.
+// coverage.sql's columns are genuinely datetimeoffset (no CAST needed),
+// so ScanRow can only ever hand back a string or nil for these two.
 func reformatCoverageCell(c model.Cell) (model.Cell, *time.Time, error) {
 	if c == nil {
 		return nil, nil, nil
@@ -139,9 +122,6 @@ func reformatCoverageCell(c model.Cell) (model.Cell, *time.Time, error) {
 		return nil, nil, &model.PublicError{Code: 5, Kind: "execution", Message: fmt.Sprintf("coverage timestamp: unexpected value %#v", c)}
 	}
 	t, err := time.Parse(datetimeOffsetFormat, s)
-	if err != nil {
-		t, err = time.Parse(datetime2Format, s)
-	}
 	if err != nil {
 		return nil, nil, &model.PublicError{Code: 5, Kind: "execution", Message: fmt.Sprintf("parsing coverage timestamp %q: %s", s, err.Error())}
 	}
@@ -229,6 +209,19 @@ func orderColumnFor(by, aggregate string) (string, error) {
 // resolved table or other unsupported object type with code 2").
 var topAllowedObjectTypes = map[string]bool{"P": true, "FN": true, "IF": true, "TF": true, "TR": true}
 
+// captureModeMessage names mode (query_capture_mode_desc: ALL, NONE,
+// AUTO or CUSTOM) in the "capture_mode" notice's text, distinguishing
+// NONE (nothing new is being captured at all) from a merely selective
+// mode (AUTO or CUSTOM, which may still miss some queries, but is not
+// the same failure) - design spec: warn, never quantify what is
+// missing.
+func captureModeMessage(mode string) string {
+	if mode == "NONE" {
+		return "Query Store capture mode is NONE: no new queries are being captured"
+	}
+	return fmt.Sprintf("Query Store capture mode is %s: capture is selective, so this ranking may not include every query", mode)
+}
+
 // Top runs "qs top": the exact Query Store ranking of queries by total
 // or average CPU, duration, logical reads, or executions over
 // opts.Window (design spec: "qs top": "Rank queries by total CPU,
@@ -301,20 +294,34 @@ func Top(ctx context.Context, s *sqlserver.Session, opts TopOptions, dst model.S
 		return err
 	}
 
-	// Three independent facts, never claiming exhaustiveness beyond what
+	// Four independent facts, never claiming exhaustiveness beyond what
 	// each actually says, and never replacing one another: "capture" is
-	// about the engine's own collecting state (this ranking may not
-	// reflect every execution while Query Store is not READ_WRITE);
+	// about the engine's own collecting state (design spec line 81:
+	// "non-READ_WRITE state") - checked against READ_WRITE directly,
+	// not against nonCollectingStates (which deliberately excludes
+	// READ_CAPTURE_SECONDARY, a state this notice must still cover: it
+	// is not READ_WRITE either, even though it is not a code-4 state);
+	// "capture_mode" is about the capture restriction design spec line
+	// 81 names separately ("capture restrictions") - ALL, NONE, AUTO or
+	// CUSTOM, independent of the collecting state itself (a perfectly
+	// healthy READ_WRITE database can still have capture mode NONE);
 	// "coverage" is about this database having no runtime history at
 	// all, ever; "coverage_window" is about a database that DOES have
 	// history, but not covering the requested window - the empty (or
 	// partial) ranking a --since far in the past produces otherwise
 	// carries no explanation at all (design spec line 81: "requested
 	// history outside available coverage").
-	if nonCollectingStates[health.Actual] {
+	if health.Actual != "READ_WRITE" {
 		dst.Notice(model.Notice{
 			Kind:    "capture",
 			Message: fmt.Sprintf("Query Store is %s; this ranking may not reflect every execution in the requested window", health.Actual),
+			Table:   TopQueriesTable.Name,
+		})
+	}
+	if health.CaptureMode != "ALL" {
+		dst.Notice(model.Notice{
+			Kind:    "capture_mode",
+			Message: captureModeMessage(health.CaptureMode),
 			Table:   TopQueriesTable.Name,
 		})
 	}

@@ -91,6 +91,21 @@ func Resolve(ctx context.Context, conn *sql.Conn, qualified string) (Object, err
 // is rejected with a *model.PublicError{Code: 2}: this package never
 // guesses at a name it cannot parse unambiguously, and it never builds a
 // SQL statement out of pieces it has not validated this way first.
+// ValidateQualifiedName checks that qualified parses as a two-part
+// schema.object name - exactly the syntax check Resolve itself performs
+// first, before ever touching the catalog - without resolving anything
+// or opening a connection. internal/cli's Parse calls this to reject a
+// malformed --object name (a bare "dbo" with no object part, an
+// unterminated bracket, ...) with code 2 before any connection opens,
+// the same ordering fix task 10's passe 1 already applied to its other
+// flag-level validations. Resolve still re-derives the parts itself
+// when it actually runs; this is a read-only preview of the same check,
+// never a cached result Resolve trusts.
+func ValidateQualifiedName(qualified string) error {
+	_, _, err := splitTwoPart(qualified)
+	return err
+}
+
 func splitTwoPart(qualified string) (schema, name string, err error) {
 	parts, err := splitIdentifierParts(qualified)
 	if err != nil {

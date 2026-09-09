@@ -80,11 +80,16 @@ func (r *fakeTopRows) Next(dest []driver.Value) error {
 }
 
 // fakeHealthRows is a driver.Rows over health.sql's own nine columns
-// (see health.go's colDesired..colHasHistory), reporting a plain
-// READ_WRITE state with history - the baseline every fakeTopConn below
-// answers ReadHealth with, so Top proceeds straight to its own ranking
-// query without a code-4 short-circuit or a capture/coverage notice.
-type fakeHealthRows struct{ done bool }
+// (see health.go's colDesired..colHasHistory), reporting desired/actual
+// state and capture mode as configured (both default to a plain,
+// fully-collecting READ_WRITE/ALL when left empty - the baseline every
+// fakeTopConn below answers ReadHealth with, so Top proceeds straight
+// to its own ranking query without a code-4 short-circuit or a
+// capture/capture_mode notice), with history always true.
+type fakeHealthRows struct {
+	actual, captureMode string
+	done                bool
+}
 
 func (r *fakeHealthRows) Columns() []string {
 	return []string{"desired_state", "actual_state", "readonly_reason", "capture_mode", "current_storage_mb", "max_storage_mb", "retention_days", "interval_minutes", "has_history"}
@@ -106,10 +111,18 @@ func (r *fakeHealthRows) Next(dest []driver.Value) error {
 	if r.done {
 		return io.EOF
 	}
+	actual := r.actual
+	if actual == "" {
+		actual = "READ_WRITE"
+	}
+	captureMode := r.captureMode
+	if captureMode == "" {
+		captureMode = "ALL"
+	}
 	dest[0] = "READ_WRITE"
-	dest[1] = "READ_WRITE"
+	dest[1] = actual
 	dest[2] = int64(0)
-	dest[3] = "ALL"
+	dest[3] = captureMode
 	dest[4] = []byte("0.00")
 	dest[5] = []byte("10.00")
 	dest[6] = int64(30)
@@ -149,8 +162,9 @@ func (r *fakeCoverageRows) Next(dest []driver.Value) error {
 // internal/sqlserver/testdriver_test.go already established for that
 // package's own unit tests.
 type fakeTopConn struct {
-	data []fakeTopRow
-	args []driver.NamedValue
+	data                []fakeTopRow
+	args                []driver.NamedValue
+	actual, captureMode string // forwarded to fakeHealthRows; both default when empty
 }
 
 func (c *fakeTopConn) Prepare(query string) (driver.Stmt, error) {
@@ -162,7 +176,7 @@ func (c *fakeTopConn) Begin() (driver.Tx, error) {
 }
 func (c *fakeTopConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
 	if strings.Contains(query, "database_query_store_options") {
-		return &fakeHealthRows{}, nil
+		return &fakeHealthRows{actual: c.actual, captureMode: c.captureMode}, nil
 	}
 	if strings.Contains(query, "oldest_interval") {
 		return &fakeCoverageRows{}, nil
@@ -238,6 +252,17 @@ func (s *captureSink) table(name string) *capturedTable {
 	return nil
 }
 
+// noticeWithKind returns the first recorded notice of the given Kind,
+// or nil if none was emitted.
+func (s *captureSink) noticeWithKind(kind string) *model.Notice {
+	for i := range s.notices {
+		if s.notices[i].Kind == kind {
+			return &s.notices[i]
+		}
+	}
+	return nil
+}
+
 // TestTopAggregation is the task 10 brief's other red-phase test. It
 // cannot execute the real embedded SQL - this package's own unit tests
 // never touch a live server (see health_test.go: ReadHealth/Status/Info
@@ -263,18 +288,28 @@ func (s *captureSink) table(name string) *capturedTable {
 // tests/integration/top_test.go's synthetic temp-table fixture, which
 // this test's canned rows are computed to agree with.
 func TestTopAggregation(t *testing.T) {
-	wantColumns := []string{
-		"query_id", "replica_group_id", "executions",
-		"cpu_total_ms", "cpu_avg_ms",
-		"duration_total_ms", "duration_avg_ms",
-		"reads_total", "reads_avg",
+	// B6: SQLType, not just Name, is checked here too - it decides
+	// internal/output/json.go's rendering (bigint-as-string vs a bare
+	// JSON number). Measured: changing "executions" from BIGINT to
+	// FLOAT left this check green before SQLType was compared, since
+	// only the column names were verified.
+	wantColumns := []model.Column{
+		{Name: "query_id", SQLType: "BIGINT"},
+		{Name: "replica_group_id", SQLType: "BIGINT"},
+		{Name: "executions", SQLType: "BIGINT"},
+		{Name: "cpu_total_ms", SQLType: "FLOAT"},
+		{Name: "cpu_avg_ms", SQLType: "FLOAT"},
+		{Name: "duration_total_ms", SQLType: "FLOAT"},
+		{Name: "duration_avg_ms", SQLType: "FLOAT"},
+		{Name: "reads_total", SQLType: "FLOAT"},
+		{Name: "reads_avg", SQLType: "FLOAT"},
 	}
 	if len(TopQueriesTable.Columns) != len(wantColumns) {
 		t.Fatalf("TopQueriesTable: got %d columns, want %d: %+v", len(TopQueriesTable.Columns), len(wantColumns), TopQueriesTable.Columns)
 	}
-	for i, name := range wantColumns {
-		if TopQueriesTable.Columns[i].Name != name {
-			t.Fatalf("TopQueriesTable.Columns[%d]: got %q, want %q", i, TopQueriesTable.Columns[i].Name, name)
+	for i, want := range wantColumns {
+		if TopQueriesTable.Columns[i] != want {
+			t.Fatalf("TopQueriesTable.Columns[%d]: got %+v, want %+v", i, TopQueriesTable.Columns[i], want)
 		}
 	}
 
@@ -371,5 +406,153 @@ func TestTopAggregation(t *testing.T) {
 	}
 	if objArg, ok := namedArg(conn.args, "object_id"); !ok || objArg != nil {
 		t.Fatalf("@object_id: got %#v, want nil (no --object given)", objArg)
+	}
+}
+
+// newFakeTopSession builds a *sqlserver.Session backed by conn,
+// registering db's Close on t - the same fake-driver plumbing
+// TestTopAggregation builds inline, factored out for the tests below,
+// which only need Top's health/notice behavior, not its ranking rows.
+func newFakeTopSession(t *testing.T, conn *fakeTopConn) *sqlserver.Session {
+	t.Helper()
+	db := sql.OpenDB(&fakeTopConnector{conn: conn})
+	t.Cleanup(func() { db.Close() })
+	sqlConn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("db.Conn: %v", err)
+	}
+	t.Cleanup(func() { sqlConn.Close() })
+	return &sqlserver.Session{Conn: sqlConn, Major: 16}
+}
+
+// TestTopCaptureModeNotice is fix-2's A1: Health carries capture_mode,
+// and Top emits a "capture_mode" notice whenever it is not ALL -
+// independent of the collecting state itself (a READ_WRITE database
+// can still have capture mode NONE, AUTO or CUSTOM). Measured by a
+// reviewer before this fix, with a fake driver answering health.sql's
+// capture_mode cell alone: all four modes produced err=nil,
+// notices=[] from a real Top call - nothing could tell NONE from ALL.
+func TestTopCaptureModeNotice(t *testing.T) {
+	cases := []struct {
+		mode       string
+		wantNotice bool
+		wantSubstr string
+	}{
+		{"ALL", false, ""},
+		{"NONE", true, "NONE"},
+		{"AUTO", true, "AUTO"},
+		{"CUSTOM", true, "CUSTOM"},
+	}
+	for _, c := range cases {
+		t.Run(c.mode, func(t *testing.T) {
+			sess := newFakeTopSession(t, &fakeTopConn{captureMode: c.mode})
+			now := time.Now().UTC()
+			opts := TopOptions{Window: Window{Since: now.Add(-time.Hour), Until: now}, By: "cpu", Aggregate: "total", Top: 10, MinExecutions: 1}
+			sink := &captureSink{}
+			if err := Top(context.Background(), sess, opts, sink); err != nil {
+				t.Fatalf("Top: %v", err)
+			}
+			notice := sink.noticeWithKind("capture_mode")
+			if c.wantNotice && notice == nil {
+				t.Fatalf("mode %s: expected a capture_mode notice, got none: %+v", c.mode, sink.notices)
+			}
+			if !c.wantNotice && notice != nil {
+				t.Fatalf("mode %s: expected no capture_mode notice, got %+v", c.mode, notice)
+			}
+			if notice != nil && !strings.Contains(notice.Message, c.wantSubstr) {
+				t.Fatalf("mode %s: notice message %q does not mention %q", c.mode, notice.Message, c.wantSubstr)
+			}
+		})
+	}
+}
+
+// TestTopCaptureNoticeCoversReadCaptureSecondary is the other half of
+// A1: the "capture" notice (non-READ_WRITE state) must also fire for
+// READ_CAPTURE_SECONDARY, which nonCollectingStates deliberately
+// excludes (it is not a code-4 state) but which the design spec's
+// "non-READ_WRITE state" warning does not exempt.
+func TestTopCaptureNoticeCoversReadCaptureSecondary(t *testing.T) {
+	sess := newFakeTopSession(t, &fakeTopConn{actual: "READ_CAPTURE_SECONDARY"})
+	now := time.Now().UTC()
+	opts := TopOptions{Window: Window{Since: now.Add(-time.Hour), Until: now}, By: "cpu", Aggregate: "total", Top: 10, MinExecutions: 1}
+	sink := &captureSink{}
+	if err := Top(context.Background(), sess, opts, sink); err != nil {
+		t.Fatalf("Top: %v", err)
+	}
+	notice := sink.noticeWithKind("capture")
+	if notice == nil {
+		t.Fatalf("expected a capture notice for READ_CAPTURE_SECONDARY, got none: %+v", sink.notices)
+	}
+	if !strings.Contains(notice.Message, "READ_CAPTURE_SECONDARY") {
+		t.Fatalf("capture notice does not name READ_CAPTURE_SECONDARY: %q", notice.Message)
+	}
+}
+
+// TestOrderColumnForAllValidPairs is B4: every one of the seven valid
+// (--by, --aggregate) combinations must resolve to its own, distinct
+// literal column name - not just the one pair ("cpu","total") every
+// other test in this package happens to exercise. Measured: pointing
+// ("cpu","total") at "duration_total_ms" in the orderColumns map left
+// every existing test in this repository green.
+func TestOrderColumnForAllValidPairs(t *testing.T) {
+	cases := []struct{ by, aggregate, want string }{
+		{"cpu", "total", "cpu_total_ms"},
+		{"cpu", "avg", "cpu_avg_ms"},
+		{"duration", "total", "duration_total_ms"},
+		{"duration", "avg", "duration_avg_ms"},
+		{"reads", "total", "reads_total"},
+		{"reads", "avg", "reads_avg"},
+		{"executions", "total", "executions"},
+	}
+	for _, c := range cases {
+		t.Run(c.by+"/"+c.aggregate, func(t *testing.T) {
+			got, err := orderColumnFor(c.by, c.aggregate)
+			if err != nil {
+				t.Fatalf("orderColumnFor(%q, %q): %v", c.by, c.aggregate, err)
+			}
+			if got != c.want {
+				t.Fatalf("orderColumnFor(%q, %q) = %q, want %q", c.by, c.aggregate, got, c.want)
+			}
+		})
+	}
+}
+
+// TestTopRankingAndCoverageTableTypes is the rest of B6: TopRankingTable
+// (ten columns) and CoverageTable (three columns, its two timestamps
+// fixed to DATETIMEOFFSET by A5) declare exactly what they claim.
+func TestTopRankingAndCoverageTableTypes(t *testing.T) {
+	wantRanking := []model.Column{
+		{Name: "requested_since", SQLType: "DATETIMEOFFSET"},
+		{Name: "requested_until", SQLType: "DATETIMEOFFSET"},
+		{Name: "coverage_oldest", SQLType: "DATETIMEOFFSET"},
+		{Name: "coverage_newest", SQLType: "DATETIMEOFFSET"},
+		{Name: "by", SQLType: "NVARCHAR"},
+		{Name: "aggregate", SQLType: "NVARCHAR"},
+		{Name: "top", SQLType: "INT"},
+		{Name: "min_executions", SQLType: "BIGINT"},
+		{Name: "include_internal", SQLType: "BIT"},
+		{Name: "parent_module", SQLType: "NVARCHAR"},
+	}
+	if len(TopRankingTable.Columns) != len(wantRanking) {
+		t.Fatalf("TopRankingTable: got %d columns, want %d: %+v", len(TopRankingTable.Columns), len(wantRanking), TopRankingTable.Columns)
+	}
+	for i, want := range wantRanking {
+		if TopRankingTable.Columns[i] != want {
+			t.Fatalf("TopRankingTable.Columns[%d]: got %+v, want %+v", i, TopRankingTable.Columns[i], want)
+		}
+	}
+
+	wantCoverage := []model.Column{
+		{Name: "oldest_interval", SQLType: "DATETIMEOFFSET"},
+		{Name: "newest_interval", SQLType: "DATETIMEOFFSET"},
+		{Name: "has_history", SQLType: "BIT"},
+	}
+	if len(CoverageTable.Columns) != len(wantCoverage) {
+		t.Fatalf("CoverageTable: got %d columns, want %d: %+v", len(CoverageTable.Columns), len(wantCoverage), CoverageTable.Columns)
+	}
+	for i, want := range wantCoverage {
+		if CoverageTable.Columns[i] != want {
+			t.Fatalf("CoverageTable.Columns[%d]: got %+v, want %+v", i, CoverageTable.Columns[i], want)
+		}
 	}
 }

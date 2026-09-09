@@ -66,8 +66,32 @@ func ParseWindow(now time.Time, hours int, since, until string) (Window, error) 
 	}
 	sinceT = sinceT.UTC()
 	untilT = untilT.UTC()
+	if err := validateSQLDateRange("since", sinceT); err != nil {
+		return Window{}, err
+	}
+	if err := validateSQLDateRange("until", untilT); err != nil {
+		return Window{}, err
+	}
 	if !sinceT.Before(untilT) {
 		return Window{}, windowError("--since must be before --until")
 	}
 	return Window{Since: sinceT, Until: untilT}, nil
+}
+
+// validateSQLDateRange rejects a UTC-converted --since/--until that
+// falls outside SQL Server's representable datetimeoffset domain:
+// January 1, year 1 through December 31, year 9999. Go's time.Parse
+// happily accepts an RFC3339 timestamp with any offset, and converting
+// to UTC can push a value that looked fine in its own offset outside
+// this range in either direction (measured: "0001-01-01T00:00:00+01:00"
+// converts to UTC year 0; "9999-12-31T23:59:59-01:00" converts to UTC
+// year 10000) - a bound the --hours overflow guard does not cover,
+// since that guard only prevents the hours*time.Hour multiplication
+// itself from overflowing a time.Duration, never checked against this
+// SQL-specific range.
+func validateSQLDateRange(flag string, t time.Time) error {
+	if t.Year() < 1 || t.Year() > 9999 {
+		return windowError(fmt.Sprintf("--%s: %s is outside SQL Server's representable date range (years 1-9999 UTC)", flag, t.Format(time.RFC3339)))
+	}
+	return nil
 }

@@ -90,13 +90,32 @@ func runExactAggregationFixture(ctx context.Context, t *testing.T, lab *Lab, maj
 	intervalStart := since.Add(time.Minute)
 	intervalEnd := intervalStart.Add(time.Minute)
 
-	if _, err := conn.ExecContext(ctx, "INSERT INTO #interval VALUES (@p1, @p2, @p3)", int64(1), intervalStart, intervalEnd); err != nil {
+	if _, err := conn.ExecContext(ctx, "INSERT INTO #interval (runtime_stats_interval_id, start_time, end_time) VALUES (@p1, @p2, @p3)", int64(1), intervalStart, intervalEnd); err != nil {
 		t.Fatalf("seeding #interval: %v", err)
 	}
-	if _, err := conn.ExecContext(ctx, "INSERT INTO #plan (plan_id, query_id) VALUES (@p1,@p2), (@p3,@p4)", int64(10), int64(100), int64(11), int64(100)); err != nil {
+	// B3: interval 2 straddles the "since" boundary - starts one minute
+	// BEFORE since, ends thirty seconds AFTER since, i.e. it overlaps
+	// the window without being entirely contained in it. The design
+	// spec's half-open predicate (start_time < until AND end_time >
+	// since) includes this interval in full, unprorated; a broken
+	// "strict containment" predicate (start_time >= since AND end_time
+	// <= until) would exclude it outright, since its start_time is
+	// before since. Tied to query 300 below.
+	if _, err := conn.ExecContext(ctx, "INSERT INTO #interval (runtime_stats_interval_id, start_time, end_time) VALUES (@p1, @p2, @p3)",
+		int64(2), since.Add(-time.Minute), since.Add(30*time.Second)); err != nil {
+		t.Fatalf("seeding #interval (boundary): %v", err)
+	}
+
+	if _, err := conn.ExecContext(ctx, "INSERT INTO #plan (plan_id, query_id) VALUES (@p1,@p2), (@p3,@p4), (@p5,@p6), (@p7,@p8), (@p9,@p10)",
+		int64(10), int64(100), int64(11), int64(100), // query 100: plan_id/replica_group_id fixture (unchanged)
+		int64(20), int64(200), // B2: an internal query
+		int64(30), int64(300), // B3: a boundary-straddling interval
+		int64(40), int64(400), // B1: a min_executions threshold
+	); err != nil {
 		t.Fatalf("seeding #plan: %v", err)
 	}
-	if _, err := conn.ExecContext(ctx, "INSERT INTO #query (query_id, is_internal_query, object_id) VALUES (@p1, 0, NULL)", int64(100)); err != nil {
+	if _, err := conn.ExecContext(ctx, "INSERT INTO #query (query_id, is_internal_query, object_id) VALUES (@p1, 0, NULL), (@p2, 1, NULL), (@p3, 0, NULL), (@p4, 0, NULL)",
+		int64(100), int64(200), int64(300), int64(400)); err != nil {
 		t.Fatalf("seeding #query: %v", err)
 	}
 
@@ -116,6 +135,15 @@ func runExactAggregationFixture(ctx context.Context, t *testing.T, lab *Lab, maj
 		// grossly large values so an accidental inclusion cannot hide.
 		{int64(10), int64(1), int64(1), 3, int64(1000), int64(999999), int64(999999), int64(999999)},
 		{int64(10), int64(1), int64(1), 4, int64(1000), int64(999999), int64(999999), int64(999999)},
+		// B2: query 200 (plan 20) is internal - must be excluded by
+		// default, included with --include-internal.
+		{int64(20), int64(1), int64(1), 0, int64(7), int64(1000), int64(1000), int64(10)},
+		// B3: query 300 (plan 30) sits on the boundary-straddling
+		// interval 2 - must be included, in full.
+		{int64(30), int64(2), int64(1), 0, int64(3), int64(1000), int64(1000), int64(10)},
+		// B1: query 400 (plan 40), executions=5 - present at
+		// min_executions<=5, absent at min_executions=6.
+		{int64(40), int64(1), int64(1), 0, int64(5), int64(1000), int64(1000), int64(10)},
 	}
 	for _, r := range rsRows {
 		if _, err := conn.ExecContext(ctx, insertRS, r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]); err != nil {
@@ -123,13 +151,12 @@ func runExactAggregationFixture(ctx context.Context, t *testing.T, lab *Lab, maj
 		}
 	}
 
-	query := diagnostics.TopQuerySQL(major)
+	baseQuery := diagnostics.TopQuerySQL(major)
 	// ReplaceAll: the embedded file also mentions OrderPlaceholder once
 	// in its own doc comment, ahead of the real ORDER BY occurrence - see
 	// top.go's matching comment on why a count-limited replace is wrong
 	// here.
-	query = strings.ReplaceAll(query, diagnostics.OrderPlaceholder, "cpu_total_ms")
-	query = strings.NewReplacer(
+	substituteTables := strings.NewReplacer(
 		// Longer, more specific names first: NewReplacer tries patterns
 		// in argument order at each position, so the "_interval" suffix
 		// form must be offered before its own prefix.
@@ -137,28 +164,164 @@ func runExactAggregationFixture(ctx context.Context, t *testing.T, lab *Lab, maj
 		"sys.query_store_runtime_stats", "#rs",
 		"sys.query_store_plan", "#plan",
 		"sys.query_store_query", "#query",
-	).Replace(query)
+	).Replace
+	buildQuery := func(orderColumn string) string {
+		return substituteTables(strings.ReplaceAll(baseQuery, diagnostics.OrderPlaceholder, orderColumn))
+	}
 
+	// Base run: default filters (include_internal=0, min_executions=1),
+	// top raised to 50 so none of the added query_ids get truncated by
+	// TOP alongside query 100's own rows.
+	got := runSubstitutedQuery(ctx, t, conn, buildQuery("cpu_total_ms"), since, until, false, 1, 50)
+
+	const tol = 1e-9
+	if major >= 16 {
+		// Group 1 (replica_group_id=1): plan 10's own two rows
+		// (executions=10, cpu_us=28000) plus plan 11 (executions=4,
+		// cpu_us=2000) = executions=14, cpu_total_ms=30. Group 2
+		// (replica_group_id=2): plan 10's other row alone,
+		// executions=2, cpu_total_ms=10. These numbers are measured,
+		// not deduced from the formula in the abstract: see this
+		// function's own doc comment for why this exact fixture shape
+		// (plan 10 on two replica groups, plan 11 sharing plan 10's own
+		// group) is what actually separates a correct GROUP BY
+		// replica_group_id from an incorrect GROUP BY plan_id. Looked
+		// up by (query_id, replica_group_id) rather than by a fixed
+		// index: the added query_ids below share this same result set.
+		first := findAggRow(t, got, 100, 1)
+		if first.executions != 14 {
+			t.Fatalf("query 100/group 1 executions: got %d, want 14", first.executions)
+		}
+		if math.Abs(first.cpuTotalMs-30) > tol {
+			t.Fatalf("query 100/group 1 cpu_total_ms: got %v, want 30 (tolerance %v)", first.cpuTotalMs, tol)
+		}
+		wantAvg1 := 30000.0 / 14 / 1000.0
+		if math.Abs(first.cpuAvgMs-wantAvg1) > tol {
+			t.Fatalf("query 100/group 1 cpu_avg_ms: got %v, want %v (tolerance %v)", first.cpuAvgMs, wantAvg1, tol)
+		}
+		second := findAggRow(t, got, 100, 2)
+		if second.executions != 2 {
+			t.Fatalf("query 100/group 2 executions: got %d, want 2", second.executions)
+		}
+		if math.Abs(second.cpuTotalMs-10) > tol {
+			t.Fatalf("query 100/group 2 cpu_total_ms: got %v, want 10 (tolerance %v)", second.cpuTotalMs, tol)
+		}
+	} else {
+		// 2019 has no replica_group_id column at all: every one of the
+		// three (plan 10/group 1's two rows, plan 11, and plan 10's
+		// second row under what would be group 2 on 2022) combines into
+		// ONE row for query 100: executions=10+4+2=16,
+		// cpu_total_ms=(28000+2000+10000)/1000=40.
+		row := findAggRow(t, got, 100, 0)
+		if row.executions != 16 {
+			t.Fatalf("query 100 executions: got %d, want 16 (10 + 4 + 2, plans combined)", row.executions)
+		}
+		if row.replicaGroup.Valid {
+			t.Fatalf("query 100 replica_group_id: got %+v, want a typed NULL", row.replicaGroup)
+		}
+		wantTotal := 40.0
+		wantAvg := 40000.0 / 16 / 1000.0
+		if math.Abs(row.cpuTotalMs-wantTotal) > tol {
+			t.Fatalf("query 100 cpu_total_ms: got %v, want %v (tolerance %v)", row.cpuTotalMs, wantTotal, tol)
+		}
+		if math.Abs(row.cpuAvgMs-wantAvg) > tol {
+			t.Fatalf("query 100 cpu_avg_ms: got %v, want %v (tolerance %v)", row.cpuAvgMs, wantAvg, tol)
+		}
+	}
+
+	// B2: query 200 is internal and must be absent by default.
+	if findAggRowOrNil(got, 200) != nil {
+		t.Fatalf("query 200 (internal) present with include_internal=0: %+v", got)
+	}
+	// B3: query 300 sits on interval 2, which straddles the "since"
+	// boundary - it must be included, in full (executions=3), proving
+	// the half-open overlap predicate rather than strict containment.
+	q300 := findAggRowOrNil(got, 300)
+	if q300 == nil {
+		t.Fatalf("query 300 (boundary-straddling interval) absent, want present with executions=3: %+v", got)
+	}
+	if q300.executions != 3 {
+		t.Fatalf("query 300 executions: got %d, want 3 (interval counted whole, not prorated)", q300.executions)
+	}
+	// B1: query 400, executions=5, present at the base run's
+	// min_executions=1.
+	if findAggRowOrNil(got, 400) == nil {
+		t.Fatalf("query 400 absent at min_executions=1, want present with executions=5: %+v", got)
+	}
+
+	// B2, second run: --include-internal now includes query 200.
+	gotInternal := runSubstitutedQuery(ctx, t, conn, buildQuery("cpu_total_ms"), since, until, true, 1, 50)
+	q200 := findAggRowOrNil(gotInternal, 200)
+	if q200 == nil {
+		t.Fatalf("query 200 (internal) absent with include_internal=1, want present: %+v", gotInternal)
+	}
+	if q200.executions != 7 {
+		t.Fatalf("query 200 executions: got %d, want 7", q200.executions)
+	}
+
+	// B1, second run: raising min_executions above query 400's own
+	// executions (5) excludes it - the HAVING clause actually filters.
+	// Measured by a reviewer: replacing @min_executions with a literal
+	// 0 left every existing assertion in this fixture green, because
+	// nothing had ever exercised a threshold that excludes a real row.
+	gotFiltered := runSubstitutedQuery(ctx, t, conn, buildQuery("cpu_total_ms"), since, until, false, 6, 50)
+	if findAggRowOrNil(gotFiltered, 400) != nil {
+		t.Fatalf("query 400 present at min_executions=6 (executions=5), want absent: %+v", gotFiltered)
+	}
+
+	// B4/B5: every one of the seven valid (--by, --aggregate) order
+	// columns must execute without error against this same fixture.
+	// Measured by a reviewer: renaming the reads_avg alias in both SQL
+	// files to reads_average left TestTop green, because no test ever
+	// ran the substituted query with "reads_avg" as the ORDER BY column
+	// - in production that combination fails with SQL error 207
+	// (invalid column name), surfacing as code 5. This loop's literal
+	// column list intentionally duplicates orderColumns from top.go: it
+	// is the fixture's own input (which column names the SQL is
+	// expected to expose), not a test of that Go map, which
+	// TestOrderColumnForAllValidPairs already covers on its own.
+	orderColumnsForB5 := []string{
+		"cpu_total_ms", "cpu_avg_ms",
+		"duration_total_ms", "duration_avg_ms",
+		"reads_total", "reads_avg",
+		"executions",
+	}
+	for _, col := range orderColumnsForB5 {
+		rows, err := conn.QueryContext(ctx, buildQuery(col),
+			sql.Named("since", since), sql.Named("until", until),
+			sql.Named("include_internal", true), sql.Named("object_id", sql.NullInt64{}),
+			sql.Named("min_executions", int64(1)), sql.Named("top", int64(50)),
+		)
+		if err != nil {
+			t.Fatalf("ORDER BY %s: query failed: %v", col, err)
+		}
+		for rows.Next() {
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("ORDER BY %s: reading rows: %v", col, err)
+		}
+		rows.Close()
+	}
+}
+
+// runSubstitutedQuery runs query (already table-substituted, per
+// runExactAggregationFixture's own doc comment) with the given window
+// and filters, and scans every row into an aggRow.
+func runSubstitutedQuery(ctx context.Context, t *testing.T, conn *sql.Conn, query string, since, until time.Time, includeInternal bool, minExecutions, top int64) []aggRow {
+	t.Helper()
 	dbRows, err := conn.QueryContext(ctx, query,
 		sql.Named("since", since),
 		sql.Named("until", until),
-		sql.Named("include_internal", true),
+		sql.Named("include_internal", includeInternal),
 		sql.Named("object_id", sql.NullInt64{}),
-		sql.Named("min_executions", int64(1)),
-		sql.Named("top", int64(10)),
+		sql.Named("min_executions", minExecutions),
+		sql.Named("top", top),
 	)
 	if err != nil {
 		t.Fatalf("running the substituted aggregation query: %v", err)
 	}
 	defer dbRows.Close()
 
-	type aggRow struct {
-		queryID      int64
-		replicaGroup sql.NullInt64
-		executions   int64
-		cpuTotalMs   float64
-		cpuAvgMs     float64
-	}
 	var got []aggRow
 	for dbRows.Next() {
 		var r aggRow
@@ -171,71 +334,52 @@ func runExactAggregationFixture(ctx context.Context, t *testing.T, lab *Lab, maj
 	if err := dbRows.Err(); err != nil {
 		t.Fatalf("reading aggregation rows: %v", err)
 	}
+	return got
+}
 
-	const tol = 1e-9
-	if major >= 16 {
-		// Group 1 (replica_group_id=1): plan 10's own two rows
-		// (executions=10, cpu_us=28000) plus plan 11 (executions=4,
-		// cpu_us=2000) = executions=14, cpu_total_ms=30. Group 2
-		// (replica_group_id=2): plan 10's other row alone,
-		// executions=2, cpu_total_ms=10. Ordered by cpu_total_ms DESC,
-		// group 1 (30ms) ranks before group 2 (10ms). These numbers are
-		// measured, not deduced from the formula in the abstract: see
-		// this function's own doc comment for why this exact fixture
-		// shape (plan 10 on two replica groups, plan 11 sharing plan
-		// 10's own group) is what actually separates a correct
-		// GROUP BY replica_group_id from an incorrect GROUP BY plan_id.
-		if len(got) != 2 {
-			t.Fatalf("2022: got %d rows, want 2 (one per replica group): %+v", len(got), got)
+// aggRow is one row of the substituted aggregation query's own nine
+// columns.
+type aggRow struct {
+	queryID      int64
+	replicaGroup sql.NullInt64
+	executions   int64
+	cpuTotalMs   float64
+	cpuAvgMs     float64
+}
+
+// findAggRow returns the one row of got matching queryID and
+// replicaGroup (0 means "no replica grouping, as on 2019 - NULL"),
+// failing the test if there is no such row.
+func findAggRow(t *testing.T, got []aggRow, queryID, replicaGroup int64) aggRow {
+	t.Helper()
+	for _, r := range got {
+		if r.queryID != queryID {
+			continue
 		}
-		first, second := got[0], got[1]
-		if first.executions != 14 {
-			t.Fatalf("row 0 executions: got %d, want 14", first.executions)
+		if replicaGroup == 0 {
+			if !r.replicaGroup.Valid {
+				return r
+			}
+			continue
 		}
-		if math.Abs(first.cpuTotalMs-30) > tol {
-			t.Fatalf("row 0 cpu_total_ms: got %v, want 30 (tolerance %v)", first.cpuTotalMs, tol)
-		}
-		wantAvg1 := 30000.0 / 14 / 1000.0
-		if math.Abs(first.cpuAvgMs-wantAvg1) > tol {
-			t.Fatalf("row 0 cpu_avg_ms: got %v, want %v (tolerance %v)", first.cpuAvgMs, wantAvg1, tol)
-		}
-		if !first.replicaGroup.Valid || first.replicaGroup.Int64 != 1 {
-			t.Fatalf("row 0 replica_group_id: got %+v, want 1", first.replicaGroup)
-		}
-		if !second.replicaGroup.Valid || second.replicaGroup.Int64 != 2 {
-			t.Fatalf("row 1 replica_group_id: got %+v, want 2 (kept distinct from row 0)", second.replicaGroup)
-		}
-		if second.executions != 2 {
-			t.Fatalf("row 1 executions: got %d, want 2", second.executions)
-		}
-		if math.Abs(second.cpuTotalMs-10) > tol {
-			t.Fatalf("row 1 cpu_total_ms: got %v, want 10 (tolerance %v)", second.cpuTotalMs, tol)
-		}
-	} else {
-		// 2019 has no replica_group_id column at all: every one of the
-		// three (plan 10/group 1's two rows, plan 11, and plan 10's
-		// second row under what would be group 2 on 2022) combines into
-		// ONE row for query 100: executions=10+4+2=16,
-		// cpu_total_ms=(28000+2000+10000)/1000=40.
-		if len(got) != 1 {
-			t.Fatalf("2019: got %d rows, want 1 (no replica grouping): %+v", len(got), got)
-		}
-		row := got[0]
-		if row.executions != 16 {
-			t.Fatalf("executions: got %d, want 16 (10 + 4 + 2, plans combined)", row.executions)
-		}
-		wantTotal := 40.0
-		wantAvg := 40000.0 / 16 / 1000.0
-		if math.Abs(row.cpuTotalMs-wantTotal) > tol {
-			t.Fatalf("cpu_total_ms: got %v, want %v (tolerance %v)", row.cpuTotalMs, wantTotal, tol)
-		}
-		if math.Abs(row.cpuAvgMs-wantAvg) > tol {
-			t.Fatalf("cpu_avg_ms: got %v, want %v (tolerance %v)", row.cpuAvgMs, wantAvg, tol)
-		}
-		if row.replicaGroup.Valid {
-			t.Fatalf("replica_group_id: got %+v, want a typed NULL", row.replicaGroup)
+		if r.replicaGroup.Valid && r.replicaGroup.Int64 == replicaGroup {
+			return r
 		}
 	}
+	t.Fatalf("no row for query_id=%d replica_group=%d in %+v", queryID, replicaGroup, got)
+	return aggRow{}
+}
+
+// findAggRowOrNil returns a pointer to the first row of got matching
+// queryID (any replica group), or nil if there is none - used where
+// absence itself is the thing under test.
+func findAggRowOrNil(got []aggRow, queryID int64) *aggRow {
+	for i := range got {
+		if got[i].queryID == queryID {
+			return &got[i]
+		}
+	}
+	return nil
 }
 
 // TestTop exercises diagnostics.Top against a real engine, in five
@@ -372,6 +516,103 @@ func TestTop(t *testing.T) {
 
 	t.Run("OFF with no history after QUERY_STORE CLEAR ALL fails at code 4", func(t *testing.T) {
 		runUnavailableFixture(ctx, t, lab)
+	})
+
+	// B9: the real, measured --object behavior. A reviewer found that
+	// adding "U" (table) and "V" (view) to topAllowedObjectTypes left
+	// the whole suite green - the correct type-rejection behavior was
+	// never actually exercised.
+	t.Run("--object filter: a table is rejected by type, an unknown name is code 8, a procedure is accepted", func(t *testing.T) {
+		if _, err := lab.Admin.ExecContext(ctx, "CREATE PROCEDURE dbo.AsqB9Proc AS SELECT 1"); err != nil {
+			t.Fatalf("creating throwaway procedure: %v", err)
+		}
+		t.Cleanup(func() {
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), podmanCmdTimeout)
+			defer cleanupCancel()
+			if _, err := lab.Admin.ExecContext(cleanupCtx, "DROP PROCEDURE dbo.AsqB9Proc"); err != nil {
+				t.Logf("cleanup: dropping dbo.AsqB9Proc: %v", err)
+			}
+		})
+
+		baseOpts := diagnostics.TopOptions{
+			Window:        diagnostics.Window{Since: time.Now().Add(-time.Hour), Until: time.Now().Add(time.Minute)},
+			By:            "cpu",
+			Aggregate:     "total",
+			Top:           10,
+			MinExecutions: 1,
+		}
+
+		tableOpts := baseOpts
+		tableOpts.Object = "dbo.Widgets"
+		err := diagnostics.Top(ctx, sess, tableOpts, &captureSink{})
+		var pub *model.PublicError
+		if !errors.As(err, &pub) {
+			t.Fatalf("--object dbo.Widgets (a table): expected a *model.PublicError, got %v", err)
+		}
+		if pub.Code != 2 {
+			t.Fatalf("--object dbo.Widgets: code = %d, want 2", pub.Code)
+		}
+		if !strings.Contains(pub.Message, `"U"`) {
+			t.Fatalf("--object dbo.Widgets: message does not name type U: %q", pub.Message)
+		}
+
+		missingOpts := baseOpts
+		missingOpts.Object = "dbo.AsqB9NoSuchThing"
+		err = diagnostics.Top(ctx, sess, missingOpts, &captureSink{})
+		if !errors.As(err, &pub) {
+			t.Fatalf("--object dbo.AsqB9NoSuchThing: expected a *model.PublicError, got %v", err)
+		}
+		if pub.Code != 8 {
+			t.Fatalf("--object dbo.AsqB9NoSuchThing: code = %d, want 8", pub.Code)
+		}
+
+		procOpts := baseOpts
+		procOpts.Object = "dbo.AsqB9Proc"
+		if err := diagnostics.Top(ctx, sess, procOpts, &captureSink{}); err != nil {
+			t.Fatalf("--object dbo.AsqB9Proc (a procedure): expected success, got %v", err)
+		}
+	})
+
+	// B10 (the A1 half): capture mode NONE, with real history already
+	// present, is reported by a "capture_mode" notice - the scenario
+	// A1 added, measured against a real engine rather than only the
+	// fake-driver form in internal/diagnostics/top_test.go.
+	t.Run("capture mode NONE is reported by a capture_mode notice", func(t *testing.T) {
+		dbName := createThrowawayDatabase(ctx, t, lab, "asq_top_capture_")
+		if _, err := lab.Admin.ExecContext(ctx, "ALTER DATABASE ["+dbName+"] SET QUERY_STORE = ON (OPERATION_MODE = READ_WRITE, INTERVAL_LENGTH_MINUTES = 1, QUERY_CAPTURE_MODE = ALL)"); err != nil {
+			t.Fatalf("enabling Query Store: %v", err)
+		}
+		generateLoadAndWaitForHistory(ctx, t, lab, dbName)
+		if _, err := lab.Admin.ExecContext(ctx, "ALTER DATABASE ["+dbName+"] SET QUERY_STORE (QUERY_CAPTURE_MODE = NONE)"); err != nil {
+			t.Fatalf("switching capture mode to NONE: %v", err)
+		}
+
+		profile := lab.Profile
+		profile.Database = dbName
+		modeSess, err := sqlserver.Open(ctx, profile)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		defer modeSess.Close()
+
+		sink := &captureSink{}
+		opts := diagnostics.TopOptions{
+			Window:        diagnostics.Window{Since: time.Now().Add(-time.Hour), Until: time.Now().Add(time.Minute)},
+			By:            "cpu",
+			Aggregate:     "total",
+			Top:           10,
+			MinExecutions: 1,
+		}
+		if err := diagnostics.Top(ctx, modeSess, opts, sink); err != nil {
+			t.Fatalf("Top with capture mode NONE (history already exists) should still succeed, got: %v", err)
+		}
+		notice := sink.noticeWithKind("capture_mode")
+		if notice == nil {
+			t.Fatalf("no capture_mode notice emitted: %+v", sink.notices)
+		}
+		if !strings.Contains(notice.Message, "NONE") {
+			t.Fatalf("capture_mode notice does not name NONE: %q", notice.Message)
+		}
 	})
 }
 

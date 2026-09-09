@@ -264,3 +264,79 @@ func TestParseMissingFlagValue(t *testing.T) {
 	_, _, err := Parse([]string{"--ctx", "client", "info", "--timeout"})
 	publicErrorCode(t, err, 2)
 }
+
+// TestParseRejectsExplicitEmptySinceUntil is fix-2's A2: an explicitly
+// given --since or --until with an empty value is a malformed
+// timestamp, never a silent "not given" that falls back to the
+// relative --hours window. Measured before this fix:
+// Parse([]string{"--ctx","client","qs","top","--since","","--until",""})
+// returned no error at all and a resolved 24-hour relative window - a
+// blank environment-variable expansion in an operations script would
+// otherwise rank a different window than the one requested, with no
+// error to notice.
+func TestParseRejectsExplicitEmptySinceUntil(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+	}{
+		{"both empty", []string{"--ctx", "client", "qs", "top", "--since", "", "--until", ""}},
+		{"since empty alone", []string{"--ctx", "client", "qs", "top", "--since", ""}},
+		{"until empty alone", []string{"--ctx", "client", "qs", "top", "--until", ""}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, _, err := Parse(c.args)
+			publicErrorCode(t, err, 2)
+		})
+	}
+}
+
+// TestParseAcceptsNeitherSinceNorUntil proves the fix above does not
+// break the legitimate case: neither flag given at all still resolves
+// the relative --hours window, exactly as before.
+func TestParseAcceptsNeitherSinceNorUntil(t *testing.T) {
+	req, _, err := Parse([]string{"--ctx", "client", "qs", "top"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if req.Window.Since.IsZero() || req.Window.Until.IsZero() {
+		t.Fatalf("Window not resolved: %+v", req.Window)
+	}
+}
+
+// TestParseValidatesObjectSyntaxBeforeConnection is A4: --object's
+// two-part syntax is checked in Parse, before any connection opens -
+// the same ordering already applied to --aggregate/--by and to the
+// window above. Measured before this fix: both invocations below only
+// ever reached sqlserver.Resolve's own check after a real connection
+// attempt (code 3 on an unreachable server), instead of code 2 here.
+func TestParseValidatesObjectSyntaxBeforeConnection(t *testing.T) {
+	cases := []string{"dbo", "[dbo.x"}
+	for _, object := range cases {
+		t.Run(object, func(t *testing.T) {
+			_, _, err := Parse([]string{"--ctx", "client", "qs", "top", "--object", object})
+			publicErrorCode(t, err, 2)
+		})
+	}
+}
+
+// TestParseRejectsExecutionsAvg is B8: grep -rn 'aggregate'
+// --include=*_test.go found nothing in this repository before this
+// test - the guard existed in parse.go but no test exercised it, so
+// removing its three lines left the entire suite green. Measured:
+// without it, the combination reaches the SQL as code 5 instead of
+// failing here at code 2.
+func TestParseRejectsExecutionsAvg(t *testing.T) {
+	_, _, err := Parse([]string{"--ctx", "client", "qs", "top", "--by", "executions", "--aggregate", "avg"})
+	publicErrorCode(t, err, 2)
+}
+
+// TestParseRejectsHoursWithValidSinceUntilPair is B11: a reviewer
+// bypassed registry.go's --hours/--since/--until ExclusiveWith
+// declarations and measured a real regression behind them - without
+// that guard, --hours is silently ignored whenever a complete, valid
+// --since/--until pair is also given, and no unit test protected it.
+func TestParseRejectsHoursWithValidSinceUntilPair(t *testing.T) {
+	_, _, err := Parse([]string{"--ctx", "client", "qs", "top", "--hours", "5", "--since", "2026-01-01T00:00:00Z", "--until", "2026-01-02T00:00:00Z"})
+	publicErrorCode(t, err, 2)
+}

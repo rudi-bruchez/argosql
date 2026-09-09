@@ -157,6 +157,7 @@ func TestHealthFromCellsAcceptsErrorState(t *testing.T) {
 	cells[colDesired] = "READ_WRITE"
 	cells[colActual] = "ERROR"
 	cells[colReadOnlyReason] = int64(0)
+	cells[colCaptureMode] = "ALL"
 	cells[colHasHistory] = false
 
 	h, err := healthFromCells(cells)

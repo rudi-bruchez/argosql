@@ -24,6 +24,14 @@ type Health struct {
 	Desired, Actual string
 	ReadOnlyReason  int64
 	HasHistory      bool
+	// CaptureMode is sys.database_query_store_options'
+	// query_capture_mode_desc (ALL, NONE, AUTO, or CUSTOM) - the second
+	// warning design spec line 81 names ("capture restrictions"),
+	// alongside non-READ_WRITE state and requested history outside
+	// coverage. health.sql already reads this column (Status displays
+	// it); Top's own code-4/notice logic needs it too, which is why it
+	// belongs on Health rather than staying Status-only.
+	CaptureMode string
 }
 
 // StatusTable and CoverageTable are the two tables "qs status" emits,
@@ -46,11 +54,20 @@ var StatusTable = model.TableSpec{
 	},
 }
 
+// CoverageTable's two timestamp columns are DATETIMEOFFSET, not
+// DATETIME2: coverage.sql's MIN(i.start_time)/MAX(i.end_time) read
+// sys.query_store_runtime_stats_interval.start_time/end_time with no
+// CAST at all, and Microsoft's own documentation of that view types
+// both columns datetimeoffset. This was mislabeled DATETIME2 since task
+// 9b; task 10 is this query's first consumer to actually parse the
+// rendered string back (see top.go's ranking table), which is what
+// surfaced the mislabel - ScanRow always rendered the one true shape
+// DatabaseTypeName actually reports, there was never a "sometimes".
 var CoverageTable = model.TableSpec{
 	Name: "coverage",
 	Columns: []model.Column{
-		{Name: "oldest_interval", SQLType: "DATETIME2"},
-		{Name: "newest_interval", SQLType: "DATETIME2"},
+		{Name: "oldest_interval", SQLType: "DATETIMEOFFSET"},
+		{Name: "newest_interval", SQLType: "DATETIMEOFFSET"},
 		{Name: "has_history", SQLType: "BIT"},
 	},
 }
@@ -79,10 +96,10 @@ func queryOptionsRow(ctx context.Context, s *sqlserver.Session) ([]model.Cell, e
 	return queryOneRow(ctx, s.Conn, healthQuery)
 }
 
-// healthFromCells narrows a queryOptionsRow result to the four fields
+// healthFromCells narrows a queryOptionsRow result to the five fields
 // Health carries. Every Query Store command needs only these to decide
-// whether it can proceed; the display-only fields (capture mode,
-// storage, retention, interval) are Status's alone to report.
+// whether it can proceed; the remaining display-only fields (storage,
+// retention, interval) are Status's alone to report.
 func healthFromCells(cells []model.Cell) (Health, error) {
 	desired, ok := cells[colDesired].(string)
 	if !ok {
@@ -96,11 +113,15 @@ func healthFromCells(cells []model.Cell) (Health, error) {
 	if !ok {
 		return Health{}, unexpectedCell("readonly_reason")
 	}
+	captureMode, ok := cells[colCaptureMode].(string)
+	if !ok {
+		return Health{}, unexpectedCell("capture_mode")
+	}
 	hasHistory, ok := cells[colHasHistory].(bool)
 	if !ok {
 		return Health{}, unexpectedCell("has_history")
 	}
-	return Health{Desired: desired, Actual: actual, ReadOnlyReason: reason, HasHistory: hasHistory}, nil
+	return Health{Desired: desired, Actual: actual, ReadOnlyReason: reason, HasHistory: hasHistory, CaptureMode: captureMode}, nil
 }
 
 // unexpectedCell builds the code-5 error healthFromCells returns when

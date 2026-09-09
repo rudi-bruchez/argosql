@@ -2,6 +2,7 @@ package diagnostics
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -42,6 +43,12 @@ func TestParseWindowRejectsMixedModeAndInvalidRanges(t *testing.T) {
 		{"zero hours with no since/until", 0, "", "", "positive"},
 		{"negative hours with no since/until", -1, "", "", "positive"},
 		{"hours overflowing a time.Duration", 1 << 61, "", "", "overflow"},
+		// A3: a since/until pair that parses fine as RFC3339, and orders
+		// fine, but converts to UTC outside SQL Server's representable
+		// datetimeoffset domain (years 1-9999) - measured: the offset
+		// alone pushes the UTC value across the boundary.
+		{"since converts to UTC year 0", 24, "0001-01-01T00:00:00+01:00", "2026-01-01T00:00:00Z", "range"},
+		{"until converts to UTC year 10000", 24, "9999-12-31T23:00:00Z", "9999-12-31T23:59:59-01:00", "range"},
 	}
 	for _, c := range cases {
 		_, err := ParseWindow(now, c.hours, c.since, c.until)
@@ -55,8 +62,14 @@ func TestParseWindowRejectsMixedModeAndInvalidRanges(t *testing.T) {
 		if pub.Code != 2 {
 			t.Fatalf("%s: got code %d, want 2", c.name, pub.Code)
 		}
-		if pub.Message == "" {
-			t.Fatalf("%s: empty message", c.name)
+		// B7: this substring check is the actual assertion - proving
+		// the right branch fired, not merely "some code-2 error fired
+		// somewhere". Measured by a second reviewer: without this
+		// check (the field existed but was never read), swapping the
+		// "--since"/"--until" labels between cases, or reducing every
+		// message to the literal "x", both left this test green.
+		if !strings.Contains(pub.Message, c.wantCode2Msg) {
+			t.Fatalf("%s: message %q does not mention %q", c.name, pub.Message, c.wantCode2Msg)
 		}
 	}
 }
