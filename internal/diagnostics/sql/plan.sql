@@ -1,0 +1,33 @@
+-- plan.sql resolves one Query Store plan's compiled XML by
+-- (query_id, plan_id) TOGETHER: the WHERE clause below is the one
+-- place that verifies plan_id genuinely belongs to query_id, never
+-- just that plan_id exists somewhere in the database (design spec:
+-- "Verify plan belongs to query"; "--plan-id does not belong to the
+-- given query_id" is its own documented code-8 case, design spec line
+-- 224, and this single predicate makes it indistinguishable here from
+-- a plainly missing id - exactly the way query.sql's own identity
+-- lookup cannot tell "does not exist" from "not visible" apart
+-- either; see diagnostics/plan.go's own planNotFound).
+--
+-- query_plan is xml, and it is nullable: Microsoft documents the
+-- closely related sys.dm_exec_query_plan.query_plan as returning NULL
+-- once a plan's XML has been evicted from cache or was never
+-- cacheable to begin with. A resolved (query_id, plan_id) pair whose
+-- query_plan is NULL is reported by Go as code 4, plan_unavailable,
+-- never a silent empty export (see diagnostics/plan.go's own
+-- planUnavailable).
+--
+-- Returns zero rows when the pair does not exist together in this
+-- database, or exists but is not visible to the current principal -
+-- Go reports that as code 8, not_found_or_not_visible, mirroring
+-- query.sql's own queryStoreNotFound path.
+--
+-- Unlike query.go's Query and top.go's Top, Plan never reads health
+-- first and never gates on runtime history: design spec line 83's own
+-- exception ("plan can export a retained plan even if no runtime
+-- history remains") means this plain catalog read is Plan's entire
+-- SQL surface - sys.query_store_plan outlives
+-- sys.query_store_runtime_stats' own retention window.
+SELECT query_plan
+FROM sys.query_store_plan
+WHERE query_id = @query_id AND plan_id = @plan_id;

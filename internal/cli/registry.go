@@ -13,6 +13,7 @@ import (
 
 	"github.com/rudi-bruchez/argosql/internal/diagnostics"
 	"github.com/rudi-bruchez/argosql/internal/model"
+	"github.com/rudi-bruchez/argosql/internal/plan"
 	"github.com/rudi-bruchez/argosql/internal/sqlserver"
 )
 
@@ -197,18 +198,19 @@ func globalFlags() []Flag {
 }
 
 // NewRegistry builds the registry this build of asq serves: help, info,
-// qs status, qs top and qs query. help's Execute closes over the
+// qs status, qs top, qs query and plan. help's Execute closes over the
 // finished registry through reg, a pointer to the slice NewRegistry is
 // about to return: by the time help actually runs, reg has been fully
 // populated by the composite literal below, even though help's own
 // entry is built first.
 func NewRegistry() Registry {
-	reg := make(Registry, 5)
+	reg := make(Registry, 6)
 	reg[0] = helpCommand(&reg)
 	reg[1] = infoCommand()
 	reg[2] = qsStatusCommand()
 	reg[3] = qsTopCommand()
 	reg[4] = qsQueryCommand()
+	reg[5] = planCommand()
 	return reg
 }
 
@@ -498,6 +500,60 @@ func qsQueryCommand() Command {
 		Execute: func(ctx context.Context, s *sqlserver.Session, req Request, dst model.Sink) error {
 			opts := diagnostics.QueryOptions{ID: req.QueryID, Window: req.Window}
 			return diagnostics.Query(ctx, s, opts, dst)
+		},
+	}
+}
+
+// planCommand registers "plan <query_id> --plan-id <id> [--summary]":
+// verifies the plan belongs to the query, exports its complete XML to
+// a ".sqlplan" artifact, and, only when --summary is given, a bounded
+// statement/operators/references/warnings summary of optimizer
+// estimates (design spec: "Verify plan belongs to query; export
+// complete XML to .sqlplan; optional bounded summary"). Tables is
+// plan.StatementTable/plan.OperatorsTable/plan.ReferencesTable/
+// plan.WarningsTable themselves, for the same reason infoCommand above
+// uses diagnostics.InfoTable - these four are always listed here as
+// the command's declared schema even though a run without --summary
+// writes none of them; Command.Tables is registry/help metadata, not a
+// promise that every run populates every table (help already renders
+// "qs status"'s flags the same way regardless of what a given
+// invocation actually needs).
+//
+// query_id is Positional, exactly like "qs query"'s own query_id (see
+// Command.Positional's own doc comment); --plan-id has no analogous
+// mechanism to lean on - Flag carries no "required" field, since every
+// other flag in this registry is genuinely optional - so its
+// requiredness is checked directly in Parse, the same way --ctx's is
+// (see Parse's own check for cmd.Name == "plan").
+func planCommand() Command {
+	return Command{
+		Name:       "plan",
+		Positional: "query_id",
+		Summary:    "Export one Query Store plan's complete XML to a .sqlplan artifact; --plan-id is required. --summary adds a bounded statement/operators/references/warnings summary of optimizer estimates.",
+		Examples: []string{
+			"asq --ctx client --db AppDB plan 4821 --plan-id 9033",
+			"asq --ctx client --db AppDB plan 4821 --plan-id 9033 --summary",
+		},
+		Units: []string{
+			"statement.estimated_cost, operators.estimated_subtree_cost: optimizer cost units (unitless, relative)",
+		},
+		// sys.query_store_plan is read the same way sys.query_store_query
+		// and sys.query_store_runtime_stats are elsewhere in this
+		// project - same measured implication as qs top's own
+		// Permissions field: VIEW DATABASE STATE alone suffices on both
+		// versions.
+		Permissions: []string{
+			"VIEW DATABASE STATE (2019)",
+			"VIEW DATABASE PERFORMANCE STATE (2022+; implied by VIEW DATABASE STATE)",
+		},
+		Versions: []string{"2019", "2022"},
+		Tables:   []model.TableSpec{plan.StatementTable, plan.OperatorsTable, plan.ReferencesTable, plan.WarningsTable},
+		Flags: []Flag{
+			{Name: "plan-id", Kind: FlagInt64, Min: 1, Max: math.MaxInt64},
+			{Name: "summary", Kind: FlagBool, Default: false},
+		},
+		Execute: func(ctx context.Context, s *sqlserver.Session, req Request, dst model.Sink) error {
+			return diagnostics.Plan(ctx, s, req.QueryID, req.PlanID, req.Summary, dst)
 		},
 	}
 }

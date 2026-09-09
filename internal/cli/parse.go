@@ -205,6 +205,19 @@ func Parse(args []string) (Request, *Command, error) {
 		return req, nil, &model.PublicError{Code: 2, Kind: "flag", Message: "--aggregate avg is not valid with --by executions"}
 	}
 
+	// "plan <query_id> --plan-id <id> [--summary]" (design spec): --plan-id
+	// is the one non-positional argument this command cannot do without,
+	// and Flag itself has no "required" concept (see Command.Positional's
+	// own doc comment on why --ctx's own requiredness, the only other
+	// case like this, is checked directly here rather than through a new
+	// Flag field for a single use). Checked before any connection opens,
+	// the same "syntactic check before connection" ordering already
+	// applied above and below to every other pre-connection rejection in
+	// this function.
+	if cmd.Name == "plan" && !explicit["plan-id"] {
+		return req, nil, &model.PublicError{Code: 2, Kind: "flag", Message: "--plan-id is required"}
+	}
+
 	// An explicitly given --since or --until with an EMPTY value is a
 	// malformed timestamp, never "not given": ParseWindow only ever
 	// sees the two strings, not whether they were typed at all, so
@@ -322,6 +335,10 @@ func assignRequestField(req *Request, name string, v any) error {
 		req.Top = int(v.(int64))
 	case "include-internal":
 		req.IncludeInternal = v.(bool)
+	case "plan-id":
+		req.PlanID = v.(int64)
+	case "summary":
+		req.Summary = v.(bool)
 	case "json":
 		// handled by Parse directly after this loop.
 	default:
