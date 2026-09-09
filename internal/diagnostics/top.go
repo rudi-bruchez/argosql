@@ -6,6 +6,7 @@ import (
 	_ "embed"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/rudi-bruchez/argosql/internal/model"
 	"github.com/rudi-bruchez/argosql/internal/output"
@@ -51,6 +52,122 @@ var TopQueriesTable = model.TableSpec{
 		{Name: "reads_total", SQLType: "FLOAT"},
 		{Name: "reads_avg", SQLType: "FLOAT"},
 	},
+}
+
+// TopRankingTable is "qs top"'s header table, emitted before
+// TopQueriesTable (design spec line 103's declared table order predates
+// this table; it still must precede the rows it describes). It exists
+// because the design spec requires two facts the ranking rows
+// themselves never carry: the requested window and the database's
+// actual stored interval coverage (design spec line 73: "Disclose the
+// requested window and actual interval coverage"), and the filter this
+// particular ranking was run under (design spec line 63: "The ranking
+// header records its filter") - two unrelated omissions the project
+// fixes as one table, not three scattered additions, matching the
+// existing idiom ("help" renders commands+flags, "qs status" renders
+// status+coverage).
+//
+// coverage_oldest/coverage_newest are nullable: a database with no
+// stored interval at all reports both NULL, never an invented window.
+// parent_module is nullable too: NULL when --object was not given, the
+// resolved schema.name (never the raw --object argument) when it was.
+var TopRankingTable = model.TableSpec{
+	Name: "ranking",
+	Columns: []model.Column{
+		{Name: "requested_since", SQLType: "DATETIMEOFFSET"},
+		{Name: "requested_until", SQLType: "DATETIMEOFFSET"},
+		{Name: "coverage_oldest", SQLType: "DATETIMEOFFSET"},
+		{Name: "coverage_newest", SQLType: "DATETIMEOFFSET"},
+		{Name: "by", SQLType: "NVARCHAR"},
+		{Name: "aggregate", SQLType: "NVARCHAR"},
+		{Name: "top", SQLType: "INT"},
+		{Name: "min_executions", SQLType: "BIGINT"},
+		{Name: "include_internal", SQLType: "BIT"},
+		{Name: "parent_module", SQLType: "NVARCHAR"},
+	},
+}
+
+// datetimeOffsetFormat and datetime2Format mirror
+// internal/output/cell.go's own DATETIMEOFFSET/DATETIME2 rendering
+// exactly, so ranking's hand-built cells look like any other
+// project-rendered timestamp. coverage.sql's oldest/newest columns can
+// come back through queryOneRow/ScanRow in either shape - see
+// reformatCoverageCell's own doc comment for the measured reason.
+// Query Store's interval timestamps carry no zone of their own, so
+// reformatCoverageCell below treats them as UTC to match
+// requested_since/requested_until's own UTC-rendered form.
+const (
+	datetimeOffsetFormat = "2006-01-02T15:04:05.9999999Z07:00"
+	datetime2Format      = "2006-01-02T15:04:05.9999999"
+)
+
+// formatDateTimeOffset renders t (already UTC; Window's own contract)
+// the same way internal/output.ScanRow would render a real
+// DATETIMEOFFSET column.
+func formatDateTimeOffset(t time.Time) string {
+	return t.UTC().Format(datetimeOffsetFormat)
+}
+
+// reformatCoverageCell turns one of coverage.sql's own Cell values (a
+// string, per cell.go's convention, or nil for "no interval at all")
+// into ranking's DATETIMEOFFSET-shaped form.
+//
+// It tries datetimeOffsetFormat before datetime2Format, not the
+// reverse. Measured against a real SQL Server 2022 container running
+// this exact fix's own "qs top" integration test: MIN(i.start_time)/
+// MAX(i.end_time) over sys.query_store_runtime_stats_interval -
+// declared DATETIME2 in CoverageTable, and that is still the correct
+// label for coverage.sql's own "qs status" use - came back through
+// ScanRow as "2026-09-09T08:57:00Z", the DATETIMEOFFSET-shaped form
+// cell.go's own "Z07:00" directive produces at exactly a zero offset,
+// not the plain, offset-less form datetime2Format alone would parse.
+// The *name* of a column's declared SQL type is not proof of the Go
+// string shape ScanRow actually rendered for it on this query; trying
+// the offset-aware form first, and falling back to the plain form,
+// parses either shape coverage.sql could hand back rather than
+// betting on one.
+//
+// A non-nil, non-string cell is this package's own defect:
+// coverage.sql CASTs explicitly, so ScanRow can only ever hand back a
+// string or nil for these two columns.
+func reformatCoverageCell(c model.Cell) (model.Cell, *time.Time, error) {
+	if c == nil {
+		return nil, nil, nil
+	}
+	s, ok := c.(string)
+	if !ok {
+		return nil, nil, &model.PublicError{Code: 5, Kind: "execution", Message: fmt.Sprintf("coverage timestamp: unexpected value %#v", c)}
+	}
+	t, err := time.Parse(datetimeOffsetFormat, s)
+	if err != nil {
+		t, err = time.Parse(datetime2Format, s)
+	}
+	if err != nil {
+		return nil, nil, &model.PublicError{Code: 5, Kind: "execution", Message: fmt.Sprintf("parsing coverage timestamp %q: %s", s, err.Error())}
+	}
+	return formatDateTimeOffset(t), &t, nil
+}
+
+// readCoverage runs the package's own coverage.sql - already embedded
+// for "qs status" (see health.go/embed.go's coverageQuery) - and
+// returns the oldest/newest stored interval bounds both as ranking's
+// DATETIMEOFFSET-shaped Cells and as parsed time.Time (nil/nil when
+// Query Store holds no interval at all), reused rather than duplicated
+// per this fix's own instruction.
+func readCoverage(ctx context.Context, s *sqlserver.Session) (oldestCell, newestCell model.Cell, oldest, newest *time.Time, err error) {
+	cells, err := queryOneRow(ctx, s.Conn, coverageQuery)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	oldestCell, oldest, err = reformatCoverageCell(cells[0])
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	newestCell, newest, err = reformatCoverageCell(cells[1])
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	return oldestCell, newestCell, oldest, newest, nil
 }
 
 // TopOptions is one resolved "qs top" request: the already-parsed
@@ -143,6 +260,7 @@ func Top(ctx context.Context, s *sqlserver.Session, opts TopOptions, dst model.S
 	}
 
 	var objectID sql.NullInt64
+	var parentModule model.Cell // NULL unless --object resolved; never the raw --object argument.
 	if opts.Object != "" {
 		obj, err := sqlserver.Resolve(ctx, s.Conn, opts.Object)
 		if err != nil {
@@ -156,6 +274,12 @@ func Top(ctx context.Context, s *sqlserver.Session, opts TopOptions, dst model.S
 			}
 		}
 		objectID = sql.NullInt64{Int64: obj.ID, Valid: true}
+		parentModule = obj.Schema + "." + obj.Name
+	}
+
+	oldestCell, newestCell, oldest, newest, err := readCoverage(ctx, s)
+	if err != nil {
+		return err
 	}
 
 	// ReplaceAll, not Replace(...,1): both embedded files also mention
@@ -177,12 +301,16 @@ func Top(ctx context.Context, s *sqlserver.Session, opts TopOptions, dst model.S
 		return err
 	}
 
-	// Two independent facts, never claiming exhaustiveness beyond what
-	// each actually says: "capture" is about the engine's own collecting
-	// state (this ranking may not reflect every execution while Query
-	// Store is not READ_WRITE), "coverage" is about this database
-	// having no runtime history at all yet. Both can be true together;
-	// neither implies the other.
+	// Three independent facts, never claiming exhaustiveness beyond what
+	// each actually says, and never replacing one another: "capture" is
+	// about the engine's own collecting state (this ranking may not
+	// reflect every execution while Query Store is not READ_WRITE);
+	// "coverage" is about this database having no runtime history at
+	// all, ever; "coverage_window" is about a database that DOES have
+	// history, but not covering the requested window - the empty (or
+	// partial) ranking a --since far in the past produces otherwise
+	// carries no explanation at all (design spec line 81: "requested
+	// history outside available coverage").
 	if nonCollectingStates[health.Actual] {
 		dst.Notice(model.Notice{
 			Kind:    "capture",
@@ -196,6 +324,39 @@ func Top(ctx context.Context, s *sqlserver.Session, opts TopOptions, dst model.S
 			Message: "this database has no Query Store runtime history yet",
 			Table:   TopQueriesTable.Name,
 		})
+	}
+	if oldest != nil && newest != nil && (opts.Window.Since.Before(*oldest) || opts.Window.Until.After(*newest)) {
+		dst.Notice(model.Notice{
+			Kind: "coverage_window",
+			Message: fmt.Sprintf(
+				"requested window [%s, %s) extends outside available coverage [%s, %s]",
+				formatDateTimeOffset(opts.Window.Since), formatDateTimeOffset(opts.Window.Until),
+				formatDateTimeOffset(*oldest), formatDateTimeOffset(*newest),
+			),
+			Table: TopQueriesTable.Name,
+		})
+	}
+
+	if err := dst.Begin(TopRankingTable); err != nil {
+		return err
+	}
+	rankingRow := []model.Cell{
+		formatDateTimeOffset(opts.Window.Since),
+		formatDateTimeOffset(opts.Window.Until),
+		oldestCell,
+		newestCell,
+		opts.By,
+		opts.Aggregate,
+		int64(opts.Top),
+		opts.MinExecutions,
+		opts.IncludeInternal,
+		parentModule,
+	}
+	if err := dst.Row(rankingRow); err != nil {
+		return err
+	}
+	if err := dst.End(true, true); err != nil {
+		return err
 	}
 
 	if err := dst.Begin(TopQueriesTable); err != nil {

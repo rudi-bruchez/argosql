@@ -5,7 +5,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
+	"github.com/rudi-bruchez/argosql/internal/diagnostics"
 	"github.com/rudi-bruchez/argosql/internal/model"
 )
 
@@ -146,6 +148,27 @@ func Parse(args []string) (Request, *Command, error) {
 	// each flag is validated independently of the other's value.
 	if cmd.Name == "qs top" && req.By == "executions" && req.Aggregate == "avg" {
 		return req, nil, &model.PublicError{Code: 2, Kind: "flag", Message: "--aggregate avg is not valid with --by executions"}
+	}
+
+	// ParseWindow resolves --hours/--since/--until into req.Window here,
+	// before any connection opens, so every one of the design spec's
+	// code-2 window rejections (mixed half-given since/until, since >=
+	// until, malformed RFC3339, an --hours overflow) reports "bad
+	// argument" rather than a connection failure a user or an agent
+	// would go debug a healthy network for. Guarded by the command
+	// actually declaring "hours": calling this unconditionally would
+	// resolve (and potentially reject) a window for "info" or "qs
+	// status", which declare no such flags at all and carry zero
+	// meaning for one. time.Now() is read exactly once here, matching
+	// the design spec's "resolve relative time once in UTC for the
+	// entire command" - never read again later, closer to the
+	// connection, which would let the two diverge.
+	if _, ok := allowed["hours"]; ok {
+		win, err := diagnostics.ParseWindow(time.Now(), req.Hours, req.Since, req.Until)
+		if err != nil {
+			return req, nil, err
+		}
+		req.Window = win
 	}
 
 	if !cmd.Offline && req.ContextName == "" {

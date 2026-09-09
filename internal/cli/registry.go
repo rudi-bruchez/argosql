@@ -10,7 +10,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/rudi-bruchez/argosql/internal/diagnostics"
 	"github.com/rudi-bruchez/argosql/internal/model"
@@ -122,6 +121,14 @@ type Request struct {
 	TimeoutSeconds, PreviewRows, TruncateRunes, Hours, Top     int
 	NoTruncate, IncludeInternal, Summary                       bool
 	Explicit                                                   map[string]bool
+	// Window is ParseWindow's resolved [Since, Until) for any command
+	// that declares the --hours/--since/--until flags (today, "qs top"
+	// alone) - resolved once in Parse, before any connection opens (see
+	// Parse's own doc comment on why), so Execute consumes it rather
+	// than calling ParseWindow a second time against a later, drifted
+	// time.Now(). Zero value for every command that does not declare
+	// those flags.
+	Window diagnostics.Window
 }
 
 // Command is one registered command: its table contracts, the flags it
@@ -372,8 +379,14 @@ func qsStatusCommand() Command {
 // value once Min is set would reject every value including the default.
 func qsTopCommand() Command {
 	return Command{
-		Name:    "qs top",
-		Summary: "Rank Query Store queries by total or average CPU, duration, logical reads, or executions over a requested window.",
+		Name: "qs top",
+		// Names --object and parent_module here, in Summary, rather than
+		// as a new descriptive field on Flag: Flag.Description would
+		// reopen helpFlagsTableSpec's one-row-per-flag shape that task
+		// 9a built specifically so help stops truncating itself, and one
+		// design-spec clause (line 61: "Help and output label it
+		// parent_module") does not justify reopening that contract.
+		Summary: "Rank Query Store queries by total or average CPU, duration, logical reads, or executions over a requested window; --object filters by parent_module.",
 		Examples: []string{
 			"asq --ctx client --db AppDB qs top --by cpu --hours 24 --top 10",
 			"asq --ctx client --db AppDB qs top --by reads --aggregate avg --since 2026-09-01T00:00:00Z --until 2026-09-02T00:00:00Z",
@@ -394,7 +407,11 @@ func qsTopCommand() Command {
 			"VIEW DATABASE PERFORMANCE STATE (2022+; implied by VIEW DATABASE STATE)",
 		},
 		Versions: []string{"2019", "2022"},
-		Tables:   []model.TableSpec{diagnostics.TopQueriesTable},
+		// ranking first, queries second: the design spec's declared
+		// table order (design spec line 103 lists "qs top: queries"
+		// alone, predating this fix's own "ranking" header table, which
+		// must still precede the rows it describes).
+		Tables: []model.TableSpec{diagnostics.TopRankingTable, diagnostics.TopQueriesTable},
 		Flags: []Flag{
 			{Name: "object", Kind: FlagString},
 			{Name: "min-executions", Kind: FlagInt64, Default: int64(1), Min: 1, Max: math.MaxInt64},
@@ -407,12 +424,8 @@ func qsTopCommand() Command {
 			{Name: "include-internal", Kind: FlagBool, Default: false},
 		},
 		Execute: func(ctx context.Context, s *sqlserver.Session, req Request, dst model.Sink) error {
-			win, err := diagnostics.ParseWindow(time.Now(), req.Hours, req.Since, req.Until)
-			if err != nil {
-				return err
-			}
 			opts := diagnostics.TopOptions{
-				Window:          win,
+				Window:          req.Window,
 				By:              req.By,
 				Aggregate:       req.Aggregate,
 				Object:          req.Object,

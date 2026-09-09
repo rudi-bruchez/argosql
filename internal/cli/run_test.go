@@ -207,6 +207,21 @@ func TestHelpOfflineRendersDeclaredMetadata(t *testing.T) {
 	if !strings.Contains(status.permissions, "VIEW DATABASE STATE") {
 		t.Fatalf("qs status's permissions do not mention VIEW DATABASE STATE: %q", status.permissions)
 	}
+	// design spec line 61: "Help and output label it parent_module,
+	// never 'queries touching this table'" - named in "qs top"'s Summary
+	// rather than as a new Flag.Description field (see qsTopCommand's own
+	// comment on why), so this is the one place that label can be
+	// checked at all.
+	top, ok := rows["qs top"]
+	if !ok {
+		t.Fatal("help output is missing command \"qs top\"")
+	}
+	if !strings.Contains(top.summary, "parent_module") {
+		t.Fatalf("qs top's summary does not name parent_module: %q", top.summary)
+	}
+	if !strings.Contains(top.summary, "--object") {
+		t.Fatalf("qs top's summary does not name --object: %q", top.summary)
+	}
 }
 
 // TestHelpOfflineRendersFlagDefaultsBoundsAndEnum proves help's flags

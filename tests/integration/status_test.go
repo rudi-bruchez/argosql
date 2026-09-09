@@ -21,9 +21,18 @@ import (
 // memory, nothing ever touches a file. It lets this file's tests
 // assert directly on what diagnostics.Info/diagnostics.Status produced,
 // without going through internal/artifacts or internal/cli.
+//
+// Notice used to be discarded outright (func (s *captureSink)
+// Notice(model.Notice) {}), which meant no integration test in this
+// repository could ever assert that a notice was emitted at all - the
+// exact same defect End's own two completeness flags carried before
+// task 9b fixed it two commits ago. notices records every one it
+// receives, in arrival order, so a test can assert on them the same
+// way it already asserts on collectionComplete/propertiesComplete.
 type captureSink struct {
-	tables []capturedTable
-	cur    *capturedTable
+	tables  []capturedTable
+	cur     *capturedTable
+	notices []model.Notice
 }
 
 type capturedTable struct {
@@ -66,12 +75,23 @@ func (s *captureSink) File(kind, suffix string, src io.Reader) (model.Artifact, 
 	return model.Artifact{}, fmt.Errorf("captureSink: File not supported")
 }
 
-func (s *captureSink) Notice(model.Notice) {}
+func (s *captureSink) Notice(n model.Notice) { s.notices = append(s.notices, n) }
 
 func (s *captureSink) table(name string) *capturedTable {
 	for i := range s.tables {
 		if s.tables[i].spec.Name == name {
 			return &s.tables[i]
+		}
+	}
+	return nil
+}
+
+// noticeWithKind returns the first recorded notice of the given Kind, or
+// nil if none was emitted.
+func (s *captureSink) noticeWithKind(kind string) *model.Notice {
+	for i := range s.notices {
+		if s.notices[i].Kind == kind {
+			return &s.notices[i]
 		}
 	}
 	return nil

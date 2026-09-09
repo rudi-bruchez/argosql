@@ -119,12 +119,33 @@ func (r *fakeHealthRows) Next(dest []driver.Value) error {
 	return nil
 }
 
+// fakeCoverageRows is a driver.Rows over coverage.sql's own two
+// columns (oldest_interval, newest_interval), reporting no stored
+// interval at all (both NULL) - the simplest fixture that still lets
+// Top's "ranking" row carry a typed NULL for coverage_oldest/newest,
+// and deliberately avoids triggering the "coverage_window" notice
+// (proven against a real engine instead, by tests/integration).
+type fakeCoverageRows struct{ done bool }
+
+func (r *fakeCoverageRows) Columns() []string                     { return []string{"oldest_interval", "newest_interval"} }
+func (r *fakeCoverageRows) Close() error                          { return nil }
+func (r *fakeCoverageRows) ColumnTypeDatabaseTypeName(int) string { return "DATETIME2" }
+func (r *fakeCoverageRows) Next(dest []driver.Value) error {
+	if r.done {
+		return io.EOF
+	}
+	dest[0] = nil
+	dest[1] = nil
+	r.done = true
+	return nil
+}
+
 // fakeTopConn is a minimal database/sql/driver.Conn answering exactly
-// the two queries Top ever issues: the shared health.sql read (matched
-// by its distinctive table reference) and Top's own ranking query
-// (everything else) - and recording the named parameters the ranking
-// query was bound with, so TestTopAggregation can assert on both
-// without a real server, the same technique
+// the three queries Top ever issues: the shared health.sql read, the
+// shared coverage.sql read (both matched by a distinctive substring),
+// and Top's own ranking query (everything else) - recording the named
+// parameters the ranking query was bound with, so TestTopAggregation
+// can assert on both without a real server, the same technique
 // internal/sqlserver/testdriver_test.go already established for that
 // package's own unit tests.
 type fakeTopConn struct {
@@ -142,6 +163,9 @@ func (c *fakeTopConn) Begin() (driver.Tx, error) {
 func (c *fakeTopConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
 	if strings.Contains(query, "database_query_store_options") {
 		return &fakeHealthRows{}, nil
+	}
+	if strings.Contains(query, "oldest_interval") {
+		return &fakeCoverageRows{}, nil
 	}
 	c.args = args
 	return &fakeTopRows{data: c.data}, nil
@@ -168,21 +192,51 @@ func namedArg(args []driver.NamedValue, name string) (driver.Value, bool) {
 	return nil, false
 }
 
-// captureSink is a minimal model.Sink keeping every row in memory -
-// enough for this test to inspect what Top wrote without going through
-// internal/artifacts or internal/cli.
+// captureSink is a minimal model.Sink keeping every table's rows (and
+// every notice) in memory - enough for this test to inspect what Top
+// wrote without going through internal/artifacts or internal/cli. Top
+// now writes two tables ("ranking" then "queries"): a single-table sink
+// that only ever remembered the most recent Begin would silently
+// concatenate both tables' rows together under "queries"'s name, so
+// this mirrors tests/integration/status_test.go's own multi-table
+// captureSink shape.
 type captureSink struct {
+	tables  []capturedTable
+	cur     *capturedTable
+	notices []model.Notice
+}
+
+type capturedTable struct {
 	spec model.TableSpec
 	rows [][]model.Cell
 }
 
-func (s *captureSink) Begin(spec model.TableSpec) error { s.spec = spec; return nil }
-func (s *captureSink) Row(row []model.Cell) error       { s.rows = append(s.rows, row); return nil }
-func (s *captureSink) End(bool, bool) error             { return nil }
+func (s *captureSink) Begin(spec model.TableSpec) error {
+	s.cur = &capturedTable{spec: spec}
+	return nil
+}
+func (s *captureSink) Row(row []model.Cell) error {
+	s.cur.rows = append(s.cur.rows, row)
+	return nil
+}
+func (s *captureSink) End(bool, bool) error {
+	s.tables = append(s.tables, *s.cur)
+	s.cur = nil
+	return nil
+}
 func (s *captureSink) File(kind, suffix string, src io.Reader) (model.Artifact, error) {
 	return model.Artifact{}, fmt.Errorf("captureSink: File not supported")
 }
-func (s *captureSink) Notice(model.Notice) {}
+func (s *captureSink) Notice(n model.Notice) { s.notices = append(s.notices, n) }
+
+func (s *captureSink) table(name string) *capturedTable {
+	for i := range s.tables {
+		if s.tables[i].spec.Name == name {
+			return &s.tables[i]
+		}
+	}
+	return nil
+}
 
 // TestTopAggregation is the task 10 brief's other red-phase test. It
 // cannot execute the real embedded SQL - this package's own unit tests
@@ -260,11 +314,15 @@ func TestTopAggregation(t *testing.T) {
 		t.Fatalf("Top: %v", err)
 	}
 
-	if len(sink.rows) != 2 {
-		t.Fatalf("got %d rows, want 2: %+v", len(sink.rows), sink.rows)
+	queries := sink.table(TopQueriesTable.Name)
+	if queries == nil {
+		t.Fatalf("no %q table in Top's output: %+v", TopQueriesTable.Name, sink.tables)
+	}
+	if len(queries.rows) != 2 {
+		t.Fatalf("got %d rows, want 2: %+v", len(queries.rows), queries.rows)
 	}
 
-	row := sink.rows[0]
+	row := queries.rows[0]
 	if got, ok := row[0].(int64); !ok || got != 100 {
 		t.Fatalf("row 0 query_id: got %#v, want int64(100)", row[0])
 	}
@@ -283,7 +341,7 @@ func TestTopAggregation(t *testing.T) {
 		t.Fatalf("row 0 cpu_avg_ms: got %#v, want 2.8 (tolerance 1e-9)", row[4])
 	}
 
-	row1 := sink.rows[1]
+	row1 := queries.rows[1]
 	if got, ok := row1[1].(int64); !ok || got != 2 {
 		t.Fatalf("row 1 replica_group_id: got %#v, want int64(2) (distinct from row 0's replica group)", row1[1])
 	}
