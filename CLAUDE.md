@@ -159,6 +159,21 @@ malformée. Sa forme instance est obligatoirement
 Un `GRANT SELECT` limité à une colonne sonde à 0 au niveau OBJECT : seule la
 forme COLUMN à cinq arguments rend 1.
 
+**Refuser n'est pas ne pas autoriser**, et la distinction décide du code de sortie.
+`DENY VIEW DEFINITION` sur un objet retire la visibilité de ses métadonnées : l'objet
+disparaît de `sys.objects` pour ce principal, donc la commande rend 8 et jamais un état
+de définition. `GRANT EXECUTE` SEUL, sans aucun `DENY`, laisse au contraire l'objet
+visible dans `sys.objects`, rend `sys.sql_modules.definition` NULL, et la sonde sur
+`VIEW DEFINITION` répond refusé. C'est ce second montage, et lui seul, qui construit
+l'état `permission_denied` de la spec : un module visible dont la définition est
+illisible. Mesuré après s'être trompé une fois dans l'autre sens.
+
+`OBJECTPROPERTYEX(..., 'IsEncrypted')` rend **NULL sur un objet qui n'est pas un
+module**, une table par exemple. Ce NULL n'est donc pas une absence de réponse mais une
+erreur de catégorie, et elle se rapporte comme telle : `definition_unavailable` au code
+4, avec un message qui nomme le type réel. Avant correction, ce cas rendait un code 5,
+c'est-à-dire une erreur d'exécution du moteur pour ce qui est une faute d'argument.
+
 `sys.query_store_runtime_stats.execution_type` ne prend que **trois** valeurs,
 0 régulier, 3 abandon client, 4 abandon par exception. Filtrer sur `= 0` et
 exclure 3 et 4 sont donc équivalents.
