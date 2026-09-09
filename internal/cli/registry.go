@@ -156,18 +156,29 @@ type Command struct {
 	Versions    []string
 	Offline     bool
 
-	// Positional names one required positional integer argument the
-	// command takes beyond its own words - empty for every command
-	// except "qs query", whose query_id is never a flag (the design
-	// spec's own example invocation, "qs query 4821 --hours 24", and
-	// every test in this codebase write it bare, immediately after the
-	// command's two words). Parse validates and parses it into
-	// req.QueryID before any connection opens, the same "syntactic
+	// Positional names one required positional argument the command
+	// takes beyond its own words - empty for every command that takes
+	// none. What Parse validates that token AS depends on
+	// PositionalIsObject, right below: a plain integer (query_id,
+	// plan_id's own command) by default, or a two-part schema.object
+	// name when PositionalIsObject is true. Either way Parse validates
+	// and parses it before any connection opens, the same "syntactic
 	// check before connection" ordering already applied to --object and
 	// the window flags. Empty means matchCommand's ordinary contract
 	// still applies: any bare token left over after the command's own
 	// words is an error.
 	Positional string
+
+	// PositionalIsObject changes what Positional's one extra bare token
+	// means: instead of a positive int64 parsed into req.QueryID, it is
+	// a two-part schema.object name, validated exactly like --object
+	// already is (sqlserver.ValidateQualifiedName) and parsed into
+	// req.Object - "obj table", "obj code", "idx list" and "size
+	// table"'s own <schema.name> argument. req.Object is the same field
+	// "qs top"'s --object flag fills; the two never collide, because no
+	// command in this registry declares both a PositionalIsObject
+	// positional and an --object flag.
+	PositionalIsObject bool
 }
 
 // Registry is the ordered list of every command this build of asq
@@ -198,19 +209,23 @@ func globalFlags() []Flag {
 }
 
 // NewRegistry builds the registry this build of asq serves: help, info,
-// qs status, qs top, qs query and plan. help's Execute closes over the
-// finished registry through reg, a pointer to the slice NewRegistry is
-// about to return: by the time help actually runs, reg has been fully
-// populated by the composite literal below, even though help's own
-// entry is built first.
+// qs status, qs top, qs query, plan, obj table, obj code, idx list and
+// size table. help's Execute closes over the finished registry through
+// reg, a pointer to the slice NewRegistry is about to return: by the
+// time help actually runs, reg has been fully populated by the
+// composite literal below, even though help's own entry is built first.
 func NewRegistry() Registry {
-	reg := make(Registry, 6)
+	reg := make(Registry, 10)
 	reg[0] = helpCommand(&reg)
 	reg[1] = infoCommand()
 	reg[2] = qsStatusCommand()
 	reg[3] = qsTopCommand()
 	reg[4] = qsQueryCommand()
 	reg[5] = planCommand()
+	reg[6] = objTableCommand()
+	reg[7] = objCodeCommand()
+	reg[8] = idxListCommand()
+	reg[9] = sizeTableCommand()
 	return reg
 }
 
@@ -554,6 +569,125 @@ func planCommand() Command {
 		},
 		Execute: func(ctx context.Context, s *sqlserver.Session, req Request, dst model.Sink) error {
 			return diagnostics.Plan(ctx, s, req.QueryID, req.PlanID, req.Summary, dst)
+		},
+	}
+}
+
+// objTableCommand registers "obj table <schema.name>": obj's ordered
+// columns and index structure, plus its approximate row count when
+// size permissions allow it (design spec: "obj table"). Tables is
+// diagnostics.TableTable/ColumnsTable/IndexesTable themselves, for the
+// same reason infoCommand above uses diagnostics.InfoTable - in the
+// design spec's own declared order (line 103: "obj table: table,
+// columns, indexes").
+//
+// schema.name is Positional with PositionalIsObject, exactly like
+// "obj code"/"idx list"/"size table" below - see Command.Positional's
+// own doc comment.
+func objTableCommand() Command {
+	return Command{
+		Name:               "obj table",
+		Positional:         "schema.name",
+		PositionalIsObject: true,
+		Summary:            "Ordered columns (types, length, precision, scale, nullability, identity/computed/default metadata) and index structure for a table; approximate row count when size permissions allow it.",
+		Examples:           []string{"asq --ctx client --db AppDB obj table dbo.Orders"},
+		Units: []string{
+			"max_length: bytes, as sys.columns itself stores it; for nchar/nvarchar this is twice the character count; -1 means MAX",
+		},
+		// Resolving and reading columns/indexes needs only VIEW
+		// DEFINITION and (for a table) SELECT - the "I" bundle's own
+		// baseline, without its two 2022-only size-specific grants: this
+		// command degrades to an unavailable row count rather than
+		// requiring them (design spec line 172).
+		Permissions: []string{"VIEW DEFINITION", "SELECT (object-level, for a table)"},
+		Versions:    []string{"2019", "2022"},
+		Tables:      []model.TableSpec{diagnostics.TableTable, diagnostics.ColumnsTable, diagnostics.IndexesTable},
+		Execute: func(ctx context.Context, s *sqlserver.Session, req Request, dst model.Sink) error {
+			return diagnostics.Table(ctx, s, req.Object, dst)
+		},
+	}
+}
+
+// objCodeCommand registers "obj code <schema.name>": exports a visible
+// module's definition to a .sql artifact, or reports one of the design
+// spec's three failure states (encrypted, permission_denied,
+// definition_unavailable) purely as the returned error's Kind, never
+// as a table row - see diagnostics.Code's own doc comment and
+// diagnostics.ModuleTable's, on why no row exists for those three
+// cases. Tables still names diagnostics.ModuleTable, for help's
+// benefit: a run that succeeds does write exactly this table.
+func objCodeCommand() Command {
+	return Command{
+		Name:               "obj code",
+		Positional:         "schema.name",
+		PositionalIsObject: true,
+		Summary:            "Export a visible module's definition to a .sql artifact, with identity and line count. encrypted/permission_denied/definition_unavailable are reported as an error kind, never a table row.",
+		Examples:           []string{"asq --ctx client --db AppDB obj code dbo.EncryptedProc"},
+		Permissions:        []string{"VIEW DEFINITION"},
+		Versions:           []string{"2019", "2022"},
+		Tables:             []model.TableSpec{diagnostics.ModuleTable},
+		Execute: func(ctx context.Context, s *sqlserver.Session, req Request, dst model.Sink) error {
+			return diagnostics.Code(ctx, s, req.Object, dst)
+		},
+	}
+}
+
+// idxListCommand registers "idx list <schema.name>": every index of an
+// object, its ordered keys with direction, included columns, filter,
+// uniqueness and disabled state (design spec: "idx list"). Tables is
+// diagnostics.IndexesTable itself - the exact same value "obj table"
+// declares for its own third table, since Table (table.go) and Indexes
+// (indexes.go) share readIndexes, the private reader neither one
+// invokes the other's command to reach (design spec: "shares
+// implementation with table inspection").
+func idxListCommand() Command {
+	return Command{
+		Name:               "idx list",
+		Positional:         "schema.name",
+		PositionalIsObject: true,
+		Summary:            "Every index of an object: name/type, ordered keys with direction, included columns, filter, uniqueness and disabled state.",
+		Examples:           []string{"asq --ctx client --db AppDB idx list dbo.Orders"},
+		Permissions:        []string{"VIEW DEFINITION"},
+		Versions:           []string{"2019", "2022"},
+		Tables:             []model.TableSpec{diagnostics.IndexesTable},
+		Execute: func(ctx context.Context, s *sqlserver.Session, req Request, dst model.Sink) error {
+			return diagnostics.Indexes(ctx, s, req.Object, dst)
+		},
+	}
+}
+
+// sizeTableCommand registers "size table <schema.name>": approximate
+// row count and allocated/used/reserved space, broken down by index
+// and allocation type (design spec: "size table"). Tables is
+// diagnostics.TableTable and diagnostics.AllocationsTable themselves,
+// in the design spec's own declared order (line 103: "size table:
+// table, allocations") - the same TableTable value "obj table" opens
+// too, so help's advertised schema for that shared header row can
+// never drift between the two commands.
+//
+// Unlike "obj table", this command REQUIRES the size-specific
+// permissions (design spec line 172's second half): a row count it
+// cannot read fails the whole command at code 4, rather than
+// degrading - see diagnostics.Size's own doc comment.
+func sizeTableCommand() Command {
+	return Command{
+		Name:               "size table",
+		Positional:         "schema.name",
+		PositionalIsObject: true,
+		Summary:            "Approximate row count and allocated/used/reserved space for a table, broken down by index_id, partition_number and allocation_type.",
+		Examples:           []string{"asq --ctx client --db AppDB size table dbo.Orders"},
+		Units: []string{
+			"used_pages, reserved_pages: 8-KB pages",
+			"used_bytes, reserved_bytes: bytes (pages * 8192); MiB = bytes / 1048576",
+		},
+		Permissions: []string{
+			"VIEW DEFINITION, SELECT (2019)",
+			"VIEW DATABASE PERFORMANCE STATE, VIEW SECURITY DEFINITION (2022+, in addition to the above)",
+		},
+		Versions: []string{"2019", "2022"},
+		Tables:   []model.TableSpec{diagnostics.TableTable, diagnostics.AllocationsTable},
+		Execute: func(ctx context.Context, s *sqlserver.Session, req Request, dst model.Sink) error {
+			return diagnostics.Size(ctx, s, req.Object, dst)
 		},
 	}
 }

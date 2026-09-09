@@ -138,15 +138,27 @@ func Parse(args []string) (Request, *Command, error) {
 				Message: fmt.Sprintf("%s requires exactly one %s argument", cmd.Name, cmd.Positional),
 			}
 		}
-		id, perr := strconv.ParseInt(extra[0], 10, 64)
-		if perr != nil || id <= 0 {
-			return req, nil, &model.PublicError{
-				Code:    2,
-				Kind:    "invalid_argument",
-				Message: fmt.Sprintf("%s: %q is not a valid positive %s", cmd.Name, extra[0], cmd.Positional),
+		// PositionalIsObject: "obj table"/"obj code"/"idx list"/"size
+		// table"'s own <schema.name> argument - validated exactly like
+		// --object already is below (the same syntactic, pre-connection
+		// check sqlserver.Resolve itself performs first), never parsed
+		// as an integer.
+		if cmd.PositionalIsObject {
+			if err := sqlserver.ValidateQualifiedName(extra[0]); err != nil {
+				return req, nil, err
 			}
+			req.Object = extra[0]
+		} else {
+			id, perr := strconv.ParseInt(extra[0], 10, 64)
+			if perr != nil || id <= 0 {
+				return req, nil, &model.PublicError{
+					Code:    2,
+					Kind:    "invalid_argument",
+					Message: fmt.Sprintf("%s: %q is not a valid positive %s", cmd.Name, extra[0], cmd.Positional),
+				}
+			}
+			req.QueryID = id
 		}
-		req.QueryID = id
 	}
 
 	allowed := map[string]Flag{}

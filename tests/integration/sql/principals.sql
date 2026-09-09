@@ -97,3 +97,17 @@ GO
 -- package's Probe must not invent one either.
 DENY SELECT ON SCHEMA::Restricted TO asq_test_i, asq_test_s;
 GO
+
+-- dbo.DeniedDefinitionProc (task 13, objects.sql): GRANT EXECUTE keeps
+-- the object visible to sys.objects for I and S (VIEW DEFINITION is
+-- about to be denied specifically, and metadata visibility only needs
+-- SOME permission on the object, not that one); DENY VIEW DEFINITION
+-- then wins over the schema-wide GRANT VIEW DEFINITION above - SQL
+-- Server's own DENY-always-wins precedence, regardless of scope
+-- specificity - so sys.sql_modules.definition comes back NULL for
+-- this one object while the object itself stays resolvable. This is
+-- "obj code"'s own confirmed permission_denied fixture (design spec
+-- line 204).
+GRANT EXECUTE ON dbo.DeniedDefinitionProc TO asq_test_i, asq_test_s;
+DENY VIEW DEFINITION ON dbo.DeniedDefinitionProc TO asq_test_i, asq_test_s;
+GO
