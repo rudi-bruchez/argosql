@@ -327,7 +327,7 @@ Après une charge, l'admin exécute `EXEC sys.sp_query_store_flush_db` dans AppD
 func ScanRow(rows *sql.Rows, types []*sql.ColumnType) ([]model.Cell, error)
 ```
 
-Mesuré avec `go-mssqldb` v1.11.0 : `decimal`, `money`, `varbinary` et `uniqueidentifier` arrivent tous en `[]uint8`, et `datetime2`/`datetimeoffset` en `time.Time`. Aucun de ces types n'est admis par `Cell.Value`, dont le domaine est nil, string, bool, int64, float64. Seul `ColumnType.DatabaseTypeName()` sépare un décimal exact d'un binaire : la conversion se décide sur ce nom, jamais sur le type Go seul, sinon un `varbinary` devient un nombre en texte. Règles : decimal et money en string exacte, varbinary en hexadécimal préfixé, uniqueidentifier en forme canonique, date et heure en texte ISO 8601, bigint en int64 puis chaîne JSON. Un type SQL non couvert est une erreur explicite, jamais un `fmt.Sprintf` de secours. Tester chacun de ces types contre un serveur réel et non seulement contre des valeurs fabriquées.
+Mesuré avec `go-mssqldb` v1.11.0 : `decimal`, `money`, `varbinary` et `uniqueidentifier` arrivent tous en `[]uint8`, et `datetime2`/`datetimeoffset` en `time.Time`. Aucun de ces types n'est admis par `model.Cell`, type nu dont le domaine est nil, string, bool, int64, float64. Seul `ColumnType.DatabaseTypeName()` sépare un décimal exact d'un binaire : la conversion se décide sur ce nom, jamais sur le type Go seul, sinon un `varbinary` devient un nombre en texte. Règles : decimal et money en string exacte, varbinary en hexadécimal préfixé, uniqueidentifier en forme canonique, date et heure en texte ISO 8601, bigint en int64 puis chaîne JSON. Un type SQL non couvert est une erreur explicite, jamais un `fmt.Sprintf` de secours. Tester chacun de ces types contre un serveur réel et non seulement contre des valeurs fabriquées.
 
 Encodeur incrémental aligné sur le modèle push du collecteur :
 
@@ -382,8 +382,8 @@ func (c *Collector) Finish(info model.ContextInfo, runErr error) (model.Result,e
 func TestRowLimit(t *testing.T) {
     c, err:=New(t.TempDir(),"json",Limits{Rows:2,Bytes:1048576}); if err!=nil { t.Fatal(err) }
     if err=c.Begin(model.TableSpec{Name:"x",Columns:[]model.Column{{Name:"n",SQLType:"int"}}}); err!=nil {t.Fatal(err)}
-    for i:=0;i<2;i++ { if err=c.Row([]model.Cell{{Value:int64(i)}}); err!=nil {t.Fatal(err)} }
-    err=c.Row([]model.Cell{{Value:int64(2)}})
+    for i:=0;i<2;i++ { if err=c.Row([]model.Cell{int64(i)}); err!=nil {t.Fatal(err)} }
+    err=c.Row([]model.Cell{int64(2)})
     if model.ExitCode(err)!=7 {t.Fatalf("limit error: %v",err)}
 }
 ```
@@ -417,7 +417,7 @@ Réserve mémoire de la seconde lecture : au plus ByteLimit octets sérialisable
 func TestOversizedCellIsNotEmpty(t *testing.T) {
     r:=model.Result{SchemaVersion:1,OK:true,Tables:[]model.TableResult{{
         Spec:model.TableSpec{Name:"x",Columns:[]model.Column{{Name:"text",SQLType:"nvarchar(max)"}}},
-        Rows:[][]model.Cell{{{Value:strings.Repeat("x",40000)}}},
+        Rows:[][]model.Cell{{strings.Repeat("x",40000)}},
         State:model.Completeness{RowsCollected:1,CollectionComplete:true,PropertiesComplete:true},
     }}}
     b,err:=Render(r,PreviewOptions{Rows:10,NoTruncate:true,ByteLimit:32768},"json")
