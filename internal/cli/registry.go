@@ -186,20 +186,48 @@ func NewRegistry() Registry {
 	return reg
 }
 
-// helpTableSpec is the one table help's own Execute fills: one row per
-// registered command, every list-valued field (flags, examples, units,
-// permissions, versions) flattened to a single "; "-joined string,
-// because model.Cell carries scalars only.
-var helpTableSpec = model.TableSpec{
+// helpCommandsTableSpec holds one row per registered command: its
+// identity and the help-only fields that do not vary in number
+// (summary, examples, units, permissions, versions, each flattened to
+// a single "; "-joined string, because model.Cell carries scalars
+// only). Flags live in helpFlagsTableSpec instead, one row per flag:
+// see its own doc comment for why a command's flags cannot join this
+// table as just another flattened string column.
+var helpCommandsTableSpec = model.TableSpec{
 	Name: "commands",
 	Columns: []model.Column{
 		{Name: "name", SQLType: "NVARCHAR"},
 		{Name: "summary", SQLType: "NVARCHAR"},
-		{Name: "flags", SQLType: "NVARCHAR"},
 		{Name: "examples", SQLType: "NVARCHAR"},
 		{Name: "units", SQLType: "NVARCHAR"},
 		{Name: "permissions", SQLType: "NVARCHAR"},
 		{Name: "versions", SQLType: "NVARCHAR"},
+	},
+}
+
+// helpFlagsTableSpec holds one row per flag accepted by any registered
+// command (global flags repeated for every connecting command, plus
+// each command's own). A flag's name, kind, default, bounds and enum
+// each land in their own column, rather than one "; "-joined cell per
+// command the way helpCommandsTableSpec's other list fields do: a
+// command that accepts nine global flags plus several of its own -
+// "qs top" will, once task 10 adds it - pushes a single flattened cell
+// well past the project's 200-code-point preview cell limit, which
+// truncates help's own inventory by default; the design spec (line 45)
+// requires that inventory to carry "parameters, defaults, and
+// examples" in full, so it cannot be the one output this project lets
+// its own truncation guarantee quietly break. See
+// TestHelpOfflineNoCellTruncated.
+var helpFlagsTableSpec = model.TableSpec{
+	Name: "flags",
+	Columns: []model.Column{
+		{Name: "command", SQLType: "NVARCHAR"},
+		{Name: "flag", SQLType: "NVARCHAR"},
+		{Name: "kind", SQLType: "NVARCHAR"},
+		{Name: "default", SQLType: "NVARCHAR"},
+		{Name: "min", SQLType: "INT"},
+		{Name: "max", SQLType: "INT"},
+		{Name: "enum", SQLType: "NVARCHAR"},
 	},
 }
 
@@ -211,10 +239,10 @@ func helpCommand(reg *Registry) Command {
 	return Command{
 		Name:     "help",
 		Offline:  true,
-		Summary:  "List every registered command with its flags, examples, units, permissions and supported versions. Works with no configuration file and no connection.",
+		Summary:  "List every registered command and every flag it accepts. Works with no configuration file and no connection.",
 		Examples: []string{"asq help", "asq help --json"},
 		Versions: []string{"2019", "2022"},
-		Tables:   []model.TableSpec{helpTableSpec},
+		Tables:   []model.TableSpec{helpCommandsTableSpec, helpFlagsTableSpec},
 		Flags:    []Flag{{Name: "json", Kind: FlagBool, Default: false}},
 		Execute: func(_ context.Context, _ *sqlserver.Session, _ Request, dst model.Sink) error {
 			return runHelp(*reg, dst)
@@ -222,18 +250,18 @@ func helpCommand(reg *Registry) Command {
 	}
 }
 
-// runHelp fills dst with one row per command in reg. It never touches a
-// file or a connection: everything it reads comes from the registry
-// already held in memory.
+// runHelp fills dst with one row per command (the commands table) and
+// one row per flag any command accepts (the flags table). It never
+// touches a file or a connection: everything it reads comes from the
+// registry already held in memory.
 func runHelp(reg Registry, dst model.Sink) error {
-	if err := dst.Begin(helpTableSpec); err != nil {
+	if err := dst.Begin(helpCommandsTableSpec); err != nil {
 		return err
 	}
 	for _, c := range reg {
 		row := []model.Cell{
 			c.Name,
 			c.Summary,
-			describeFlags(c),
 			strings.Join(c.Examples, "; "),
 			strings.Join(c.Units, "; "),
 			strings.Join(c.Permissions, "; "),
@@ -243,46 +271,44 @@ func runHelp(reg Registry, dst model.Sink) error {
 			return err
 		}
 	}
+	if err := dst.End(true, true); err != nil {
+		return err
+	}
+
+	if err := dst.Begin(helpFlagsTableSpec); err != nil {
+		return err
+	}
+	for _, c := range reg {
+		for _, f := range flagsFor(c) {
+			var min, max model.Cell
+			if f.Min != 0 || f.Max != 0 {
+				min, max = f.Min, f.Max
+			}
+			row := []model.Cell{
+				c.Name,
+				f.Name,
+				f.Kind,
+				f.Default,
+				min,
+				max,
+				strings.Join(f.Enum, "|"),
+			}
+			if err := dst.Row(row); err != nil {
+				return err
+			}
+		}
+	}
 	return dst.End(true, true)
 }
 
-// describeFlags renders c's accepted flags as "name:kind" pairs,
-// global flags first (unless c is offline, which accepts none of
-// them) and c's own flags after.
-// describe renders one flag as "name:kind", appending "=default" when a
-// default is declared, " range=min..max" when a bound is declared, and
-// " enum=a|b|c" when an enum is declared - design spec line 45: help's
-// inventory must carry "parameters, defaults, and examples", and an
-// agent reading it has to be able to tell which values are valid
-// without trying one.
-func (f Flag) describe() string {
-	var b strings.Builder
-	b.WriteString(f.Name)
-	b.WriteByte(':')
-	b.WriteString(f.Kind)
-	if f.Default != nil {
-		fmt.Fprintf(&b, "=%v", f.Default)
-	}
-	if f.Min != 0 || f.Max != 0 {
-		fmt.Fprintf(&b, " range=%d..%d", f.Min, f.Max)
-	}
-	if len(f.Enum) > 0 {
-		fmt.Fprintf(&b, " enum=%s", strings.Join(f.Enum, "|"))
-	}
-	return b.String()
-}
-
-func describeFlags(c Command) string {
-	var names []string
+// flagsFor lists every flag c accepts: global flags first (unless c is
+// offline, which accepts none of them), then c's own.
+func flagsFor(c Command) []Flag {
+	var flags []Flag
 	if !c.Offline {
-		for _, f := range globalFlags() {
-			names = append(names, f.describe())
-		}
+		flags = append(flags, globalFlags()...)
 	}
-	for _, f := range c.Flags {
-		names = append(names, f.describe())
-	}
-	return strings.Join(names, "; ")
+	return append(flags, c.Flags...)
 }
 
 // notImplemented is the placeholder Execute for every command task 9b

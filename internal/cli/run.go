@@ -28,6 +28,13 @@ const (
 	collectionByteLimit = 104857600
 )
 
+// offlineDefaultPreviewRows is runOffline's row cap when the caller did
+// not pass an explicit --preview: generous enough that help's own
+// registry metadata (a handful of commands, each with a handful of
+// flags) is never cut by it, while the project-wide stdout byte cap
+// still applies underneath it as the real safety net.
+const offlineDefaultPreviewRows = 1000
+
 // configLoader and sessionOpener are config.Load's and sqlserver.Open's
 // own signatures, named so run (below) can take a fake of either
 // without a real config file or a real network connection: that is how
@@ -158,7 +165,21 @@ func runOffline(cmd Command, req Request, stdout, stderr io.Writer) int {
 	result.OK = execErr == nil
 	result.Error = publicErrorOf(execErr)
 
-	out, renderErr := output.Render(result, previewOptionsFrom(req), req.Format)
+	options := previewOptionsFrom(req)
+	if !req.Explicit["preview"] {
+		// An offline command's whole result is its registry metadata,
+		// already in memory and small by construction: the general
+		// --preview default of 10 rows exists to bound a SQL result set
+		// a caller has not asked to see in full, not to cap help's own
+		// inventory. Measured: with the 9 global flags alone, help's
+		// "flags" table already holds 19 rows across 3 commands, and
+		// the default --preview would have silently dropped "qs
+		// status"'s flags from help's own output, omitted_reasons
+		// row_limit, with no cell ever near its byte cap. An explicit
+		// --preview is still honored: only the silent default changes.
+		options.Rows = offlineDefaultPreviewRows
+	}
+	out, renderErr := output.Render(result, options, req.Format)
 	if renderErr != nil {
 		fmt.Fprintln(stderr, renderErr.Error())
 		return model.ExitCode(renderErr)

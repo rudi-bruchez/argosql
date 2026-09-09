@@ -58,18 +58,17 @@ func TestHelpOfflineDefaultIsTSV(t *testing.T) {
 	}
 }
 
-// helpRow is one row of help --json's "commands" table, by column
-// position: name, summary, flags, examples, units, permissions,
-// versions (see helpTableSpec in registry.go).
-type helpRow struct {
-	name, summary, flags, examples, units, permissions, versions string
+// helpTable is one decoded table from help --json's response, by name.
+type helpTable struct {
+	name string
+	rows [][]any
 }
 
-// helpRows runs "help --json" and decodes its one table into helpRow
-// values, keyed by command name, failing the test on any shape problem
-// along the way rather than letting a caller misread a missing field as
-// an empty one.
-func helpRows(t *testing.T) map[string]helpRow {
+// helpTables runs "help --json" and decodes its tables, keyed by
+// table name, failing the test on any shape problem along the way
+// rather than letting a caller misread a missing table as an empty
+// one.
+func helpTables(t *testing.T) map[string]helpTable {
 	t.Helper()
 	var out, errout bytes.Buffer
 	code := Run(context.Background(), []string{"help", "--json"}, &out, &errout)
@@ -78,28 +77,86 @@ func helpRows(t *testing.T) map[string]helpRow {
 	}
 	var env struct {
 		Tables []struct {
+			Spec struct {
+				Name string `json:"name"`
+			} `json:"spec"`
 			Rows [][]any `json:"rows"`
 		} `json:"tables"`
 	}
 	if err := json.Unmarshal(out.Bytes(), &env); err != nil {
 		t.Fatalf("invalid JSON: %v (%s)", err, out.String())
 	}
-	if len(env.Tables) != 1 {
-		t.Fatalf("got %d tables, want exactly 1 (%s)", len(env.Tables), out.String())
+	tables := map[string]helpTable{}
+	for _, tbl := range env.Tables {
+		tables[tbl.Spec.Name] = helpTable{name: tbl.Spec.Name, rows: tbl.Rows}
 	}
-	rows := map[string]helpRow{}
-	for _, r := range env.Tables[0].Rows {
-		if len(r) != 7 {
-			t.Fatalf("help row has %d columns, want 7: %v", len(r), r)
+	return tables
+}
+
+// helpCommandRow is one row of help --json's "commands" table, by
+// column position: name, summary, examples, units, permissions,
+// versions (see helpCommandsTableSpec in registry.go).
+type helpCommandRow struct {
+	name, summary, examples, units, permissions, versions string
+}
+
+func helpCommandRows(t *testing.T) map[string]helpCommandRow {
+	t.Helper()
+	tbl, ok := helpTables(t)["commands"]
+	if !ok {
+		t.Fatal("help output is missing the \"commands\" table")
+	}
+	rows := map[string]helpCommandRow{}
+	for _, r := range tbl.rows {
+		if len(r) != 6 {
+			t.Fatalf("commands row has %d columns, want 6: %v", len(r), r)
 		}
 		field := func(i int) string {
 			s, _ := r[i].(string)
 			return s
 		}
 		name := field(0)
-		rows[name] = helpRow{
-			name: name, summary: field(1), flags: field(2), examples: field(3),
-			units: field(4), permissions: field(5), versions: field(6),
+		rows[name] = helpCommandRow{
+			name: name, summary: field(1), examples: field(2),
+			units: field(3), permissions: field(4), versions: field(5),
+		}
+	}
+	return rows
+}
+
+// helpFlagRow is one row of help --json's "flags" table, by column
+// position: command, flag, kind, default, min, max, enum (see
+// helpFlagsTableSpec in registry.go). min/max decode through
+// encoding/json into float64 when present, or remain nil when the flag
+// declares no bound.
+type helpFlagRow struct {
+	command, flag, kind string
+	def                 any
+	min, max            any
+	enum                string
+}
+
+// helpFlagRows returns help --json's "flags" table rows, keyed by
+// "command/flag".
+func helpFlagRows(t *testing.T) map[string]helpFlagRow {
+	t.Helper()
+	tbl, ok := helpTables(t)["flags"]
+	if !ok {
+		t.Fatal("help output is missing the \"flags\" table")
+	}
+	rows := map[string]helpFlagRow{}
+	for _, r := range tbl.rows {
+		if len(r) != 7 {
+			t.Fatalf("flags row has %d columns, want 7: %v", len(r), r)
+		}
+		str := func(i int) string {
+			s, _ := r[i].(string)
+			return s
+		}
+		command, flag := str(0), str(1)
+		rows[command+"/"+flag] = helpFlagRow{
+			command: command, flag: flag, kind: str(2),
+			def: r[3], min: r[4], max: r[5], enum: str(6),
 		}
 	}
 	return rows
@@ -112,7 +169,7 @@ func helpRows(t *testing.T) map[string]helpRow {
 // it). This test fails the moment any of the three registered commands
 // is missing from the rendered inventory, by name.
 func TestHelpOfflineListsAllCommands(t *testing.T) {
-	rows := helpRows(t)
+	rows := helpCommandRows(t)
 	want := []string{"help", "info", "qs status"}
 	for _, name := range want {
 		if _, ok := rows[name]; !ok {
@@ -129,7 +186,7 @@ func TestHelpOfflineListsAllCommands(t *testing.T) {
 // output, not just exist on the struct: dropping any one of them from
 // runHelp's row would leave every other cli test green.
 func TestHelpOfflineRendersDeclaredMetadata(t *testing.T) {
-	rows := helpRows(t)
+	rows := helpCommandRows(t)
 	info, ok := rows["info"]
 	if !ok {
 		t.Fatal("help output is missing command \"info\"")
@@ -152,27 +209,162 @@ func TestHelpOfflineRendersDeclaredMetadata(t *testing.T) {
 	}
 }
 
-// TestHelpOfflineRendersFlagDefaultsBoundsAndEnum proves help's
-// inventory carries a flag's default, bound and enum - design spec
-// line 45 ("parameters, defaults, and examples"): an agent reading help
-// must be able to tell which values are valid without trying one.
-// Flag.Validate already enforces these; this test is about whether
-// describeFlags actually renders them.
+// TestHelpOfflineRendersFlagDefaultsBoundsAndEnum proves help's flags
+// table carries each flag's default, bound and enum in its own column
+// - design spec line 45 ("parameters, defaults, and examples"): an
+// agent reading help must be able to tell which values are valid
+// without trying one. Flag.Validate already enforces these; this test
+// is about whether runHelp actually renders them.
 func TestHelpOfflineRendersFlagDefaultsBoundsAndEnum(t *testing.T) {
-	rows := helpRows(t)
-	info, ok := rows["info"]
+	rows := helpFlagRows(t)
+
+	timeout, ok := rows["info/timeout"]
 	if !ok {
-		t.Fatal("help output is missing command \"info\"")
+		t.Fatal("flags table is missing info/timeout")
 	}
-	for _, want := range []string{
-		"timeout:int64=30 range=1..300",
-		"preview:int64=10 range=0..10000",
-		"truncate:int64=200 range=1..10000",
-		"format:string=tsv enum=tsv|json",
-		"no-truncate:bool=false",
-	} {
-		if !strings.Contains(info.flags, want) {
-			t.Fatalf("info's flags do not contain %q: %q", want, info.flags)
+	if timeout.kind != "int64" || timeout.def != float64(30) || timeout.min != float64(1) || timeout.max != float64(300) {
+		t.Fatalf("info/timeout = %+v, want kind=int64 default=30 min=1 max=300", timeout)
+	}
+
+	format, ok := rows["info/format"]
+	if !ok {
+		t.Fatal("flags table is missing info/format")
+	}
+	if format.def != "tsv" || format.enum != "tsv|json" {
+		t.Fatalf("info/format = %+v, want default=tsv enum=tsv|json", format)
+	}
+
+	noTruncate, ok := rows["info/no-truncate"]
+	if !ok {
+		t.Fatal("flags table is missing info/no-truncate")
+	}
+	if noTruncate.def != false {
+		t.Fatalf("info/no-truncate = %+v, want default=false", noTruncate)
+	}
+
+	ctx, ok := rows["info/ctx"]
+	if !ok {
+		t.Fatal("flags table is missing info/ctx")
+	}
+	if ctx.def != nil || ctx.min != nil || ctx.max != nil {
+		t.Fatalf("info/ctx = %+v, want default/min/max all nil (no bound declared)", ctx)
+	}
+}
+
+// TestHelpOfflineNoCellTruncated is the test the coordinator asked for
+// after measuring the single-cell form's actual output: with help's
+// flags flattened into one "; "-joined cell per command, info's and
+// "qs status"'s flags cell both measured 205 Unicode code points,
+// already past the project's 200-code-point default preview cell
+// limit, and came back truncated with a "…[+8]" marker under the
+// default options help --json normally runs with. A help that
+// truncates its own inventory by default defeats the one thing it
+// exists for: an agent reading it to learn which values are valid
+// without trying one. This test reads help --json under its default
+// options - no --no-truncate - and fails if any cell, in any table,
+// carries output's truncation marker. It is written to fail again the
+// day a future command (qs top, at task 10, alone adds six more flags
+// on top of the nine global ones) pushes some cell back over the
+// limit, whatever shape future help rendering takes.
+func TestHelpOfflineNoCellTruncated(t *testing.T) {
+	var out, errout bytes.Buffer
+	code := Run(context.Background(), []string{"help", "--json"}, &out, &errout)
+	if code != 0 {
+		t.Fatalf("code=%d stderr=%s", code, errout.String())
+	}
+	var env struct {
+		Tables []struct {
+			Spec struct {
+				Name string `json:"name"`
+			} `json:"spec"`
+			Rows [][]any `json:"rows"`
+		} `json:"tables"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &env); err != nil {
+		t.Fatalf("invalid JSON: %v (%s)", err, out.String())
+	}
+	for _, tbl := range env.Tables {
+		for _, row := range tbl.Rows {
+			for i, cell := range row {
+				s, ok := cell.(string)
+				if !ok {
+					continue
+				}
+				if strings.Contains(s, "…[+") {
+					t.Fatalf("table %q row %v column %d is truncated: %q", tbl.Spec.Name, row, i, s)
+				}
+			}
+		}
+	}
+}
+
+// TestHelpOfflineNoRowOmitted is TestHelpOfflineNoCellTruncated's
+// counterpart for rows instead of cells: fixing the cell-truncation
+// defect by splitting help's flags into their own table, one row per
+// flag, created a second way for the same underlying cause (help's
+// inventory growing past a default bound) to cut it again - this time
+// the general --preview default of 10 rows, which silently dropped "qs
+// status"'s flags from the "flags" table (19 rows collected, only 10
+// shown, omitted_reasons row_limit) before runOffline was taught that
+// an offline command's own registry metadata is not the kind of result
+// --preview exists to cap. This test fails if any table in help's
+// default output shows fewer rows than it collected.
+func TestHelpOfflineNoRowOmitted(t *testing.T) {
+	var out, errout bytes.Buffer
+	code := Run(context.Background(), []string{"help", "--json"}, &out, &errout)
+	if code != 0 {
+		t.Fatalf("code=%d stderr=%s", code, errout.String())
+	}
+	var env struct {
+		Tables []struct {
+			Spec struct {
+				Name string `json:"name"`
+			} `json:"spec"`
+			State struct {
+				RowsCollected int64 `json:"rows_collected"`
+			} `json:"state"`
+			Preview struct {
+				RowsShown      int64    `json:"rows_shown"`
+				OmittedReasons []string `json:"omitted_reasons"`
+			} `json:"preview"`
+		} `json:"tables"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &env); err != nil {
+		t.Fatalf("invalid JSON: %v (%s)", err, out.String())
+	}
+	if len(env.Tables) == 0 {
+		t.Fatal("help output has no tables")
+	}
+	for _, tbl := range env.Tables {
+		if tbl.Preview.RowsShown != tbl.State.RowsCollected {
+			t.Fatalf("table %q shows %d of %d collected rows, omitted_reasons=%v",
+				tbl.Spec.Name, tbl.Preview.RowsShown, tbl.State.RowsCollected, tbl.Preview.OmittedReasons)
+		}
+	}
+}
+
+// TestHelpOfflineExplicitPreviewStillApplies proves the fix above does
+// not make --preview inert for help: an explicit --preview still caps
+// rows shown, only the silent default changes.
+func TestHelpOfflineExplicitPreviewStillApplies(t *testing.T) {
+	var out, errout bytes.Buffer
+	code := Run(context.Background(), []string{"help", "--json", "--preview", "2"}, &out, &errout)
+	if code != 0 {
+		t.Fatalf("code=%d stderr=%s", code, errout.String())
+	}
+	var env struct {
+		Tables []struct {
+			Preview struct {
+				RowsShown int64 `json:"rows_shown"`
+			} `json:"preview"`
+		} `json:"tables"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &env); err != nil {
+		t.Fatalf("invalid JSON: %v (%s)", err, out.String())
+	}
+	for _, tbl := range env.Tables {
+		if tbl.Preview.RowsShown > 2 {
+			t.Fatalf("table shows %d rows, want at most 2 with --preview 2", tbl.Preview.RowsShown)
 		}
 	}
 }
