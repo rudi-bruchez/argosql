@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strconv"
+	"unicode/utf8"
 
 	"github.com/rudi-bruchez/argosql/internal/model"
 )
@@ -21,6 +22,14 @@ type jsonEncoder struct {
 	w        *bufio.Writer
 	columns  []model.Column
 	wroteAny bool
+
+	// encodingNormalized is set once a string Cell this encoder has
+	// written was not valid UTF-8 - a VARCHAR/CHAR column under a
+	// non-UTF-8 collation can carry exactly this, and encoding/json's
+	// Marshal silently substitutes the invalid bytes with U+FFFD to keep
+	// its output valid JSON (see encodeJSONCell). This package only
+	// detects and exposes that substitution; see EncodingNormalized.
+	encodingNormalized bool
 }
 
 func newJSONEncoder(w io.Writer, spec model.TableSpec) (*jsonEncoder, error) {
@@ -60,9 +69,12 @@ func (e *jsonEncoder) WriteRow(row []model.Cell) error {
 				return err
 			}
 		}
-		enc, err := encodeJSONCell(c, e.columns[i].SQLType)
+		enc, normalized, err := encodeJSONCell(c, e.columns[i].SQLType)
 		if err != nil {
 			return err
+		}
+		if normalized {
+			e.encodingNormalized = true
 		}
 		if _, err := e.w.Write(enc); err != nil {
 			return err
@@ -78,7 +90,18 @@ func (e *jsonEncoder) Close() error {
 	return e.w.Flush()
 }
 
-// encodeJSONCell renders one Cell as JSON. Every Cell type outside nil
+// EncodingNormalized reports whether any string Cell written so far was
+// not valid UTF-8. This encoder only detects and exposes that fact; it
+// never refuses to write the value and never decides what to do about
+// it - deciding belongs to whichever later stage holds a model.Sink (and
+// can therefore emit a model.Notice carrying model.ReasonEncodingNormalized),
+// not to this encoder. See jsonEncoder.encodingNormalized's doc comment.
+func (e *jsonEncoder) EncodingNormalized() bool {
+	return e.encodingNormalized
+}
+
+// encodeJSONCell renders one Cell as JSON, and reports whether doing so
+// silently substituted invalid UTF-8 bytes. Every Cell type outside nil
 // marshals as the JSON kind it naturally is (string, bool, number) with
 // one exception: an int64 Cell for a "bigint" column is written as a
 // quoted JSON string instead of a bare number, because a JSON number that
@@ -86,23 +109,37 @@ func (e *jsonEncoder) Close() error {
 // in particular, limited to 2^53). A decimal/money Cell needs no such
 // exception: it already arrived here as a Cell string (see cell.go), so
 // it is already quoted by virtue of being a string.
-func encodeJSONCell(c model.Cell, sqlType string) ([]byte, error) {
+//
+// A string Cell is checked against utf8.ValidString before marshaling:
+// encoding/json's own Marshal silently replaces any invalid byte with the
+// Unicode replacement rune (U+FFFD) to guarantee its output is valid
+// JSON, with no signal that it did so. That silent substitution is
+// exactly what this check surfaces.
+func encodeJSONCell(c model.Cell, sqlType string) (encoded []byte, normalized bool, err error) {
 	if c == nil {
-		return []byte("null"), nil
+		return []byte("null"), false, nil
 	}
 	switch v := c.(type) {
 	case string:
-		return json.Marshal(v)
+		enc, err := json.Marshal(v)
+		if err != nil {
+			return nil, false, err
+		}
+		return enc, !utf8.ValidString(v), nil
 	case bool:
-		return json.Marshal(v)
+		enc, err := json.Marshal(v)
+		return enc, false, err
 	case float64:
-		return json.Marshal(v)
+		enc, err := json.Marshal(v)
+		return enc, false, err
 	case int64:
 		if baseSQLType(sqlType) == "BIGINT" {
-			return json.Marshal(strconv.FormatInt(v, 10))
+			enc, err := json.Marshal(strconv.FormatInt(v, 10))
+			return enc, false, err
 		}
-		return json.Marshal(v)
+		enc, err := json.Marshal(v)
+		return enc, false, err
 	default:
-		return nil, fmt.Errorf("output: Cell holds unsupported type %T for JSON encoding", c)
+		return nil, false, fmt.Errorf("output: Cell holds unsupported type %T for JSON encoding", c)
 	}
 }

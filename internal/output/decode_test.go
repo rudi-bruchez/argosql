@@ -211,6 +211,146 @@ func TestTSVTruncatedArtifactRejected(t *testing.T) {
 	}
 }
 
+// TestJSONTruncatedRightAfterRowsArrayRejected proves that an artifact
+// cut exactly after the rows array's closing "]" - what a full disk or a
+// cut connection produces, since every byte up to that point is valid -
+// is rejected rather than returned as a clean io.EOF indistinguishable
+// from a complete read. Built from a real encoder's own output with the
+// trailing "}" chopped off, not a hand-typed artifact.
+func TestJSONTruncatedRightAfterRowsArrayRejected(t *testing.T) {
+	spec := model.TableSpec{Columns: []model.Column{{Name: "a", SQLType: "INT"}}}
+	var buf strings.Builder
+	enc, err := NewTableEncoder(&buf, FormatJSON, spec)
+	if err != nil {
+		t.Fatalf("NewTableEncoder: %v", err)
+	}
+	if err := enc.WriteRow([]model.Cell{int64(1)}); err != nil {
+		t.Fatalf("WriteRow: %v", err)
+	}
+	if err := enc.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	full := buf.String()
+	if !strings.HasSuffix(full, "]}") {
+		t.Fatalf("expected the artifact to end in \"]}\", got: %q", full)
+	}
+	truncated := strings.TrimSuffix(full, "}") // cut exactly after the rows "]"
+
+	dec, err := NewTableDecoder(strings.NewReader(truncated), FormatJSON, spec)
+	if err != nil {
+		t.Fatalf("NewTableDecoder: %v", err)
+	}
+	row, err := dec.Next()
+	if err != nil {
+		t.Fatalf("Next() (the one real row): %v", err)
+	}
+	if row[0] != int64(1) {
+		t.Fatalf("unexpected row: %#v", row)
+	}
+	// io.EOF is itself a non-nil error value and is exactly what the
+	// defect under test returns: "err == nil" alone would pass whether
+	// or not the truncation is actually caught, since the buggy
+	// behavior this test exists to catch IS a non-nil err (io.EOF).
+	// The assertion that means anything is that err is an explicit
+	// rejection, distinct from io.EOF.
+	if _, err := dec.Next(); err == nil || err == io.EOF {
+		t.Fatalf("expected an explicit malformed-artifact error for an artifact truncated right after the rows array, got %v", err)
+	}
+}
+
+// TestJSONTruncatedMidRowRejected proves that an artifact cut in the
+// middle of a row's data - not on any delimiter boundary - is rejected,
+// the other truncation point a full disk or a cut connection can land on.
+func TestJSONTruncatedMidRowRejected(t *testing.T) {
+	spec := model.TableSpec{Columns: []model.Column{{Name: "a", SQLType: "NVARCHAR(10)"}}}
+	full := `{"columns":[{"name":"a","sql_type":"NVARCHAR(10)"}],"rows":[["hello"]]}`
+	cut := strings.Index(full, `"hello`)
+	if cut < 0 {
+		t.Fatalf("test artifact does not contain the expected marker: %q", full)
+	}
+	truncated := full[:cut+4] // stops mid-string, inside the JSON string token
+
+	dec, err := NewTableDecoder(strings.NewReader(truncated), FormatJSON, spec)
+	if err != nil {
+		t.Fatalf("NewTableDecoder: %v", err)
+	}
+	if _, err := dec.Next(); err == nil {
+		t.Fatal("expected an error for an artifact truncated mid-row, got nil")
+	}
+}
+
+// TestTSVDuplicateColumnNamesRoundTrip proves duplicate column names
+// survive a full encode -> decode round trip distinctly and positionally
+// - the brief's "duplicate headers preserved" requirement - rather than
+// being collapsed or mismatched by a name-keyed lookup. Both columns are
+// named "dup" but carry different values; decoding must keep them apart
+// by position, not merge or swap them by name.
+func TestTSVDuplicateColumnNamesRoundTrip(t *testing.T) {
+	spec := model.TableSpec{
+		Columns: []model.Column{
+			{Name: "dup", SQLType: "NVARCHAR(10)"},
+			{Name: "dup", SQLType: "NVARCHAR(10)"},
+		},
+	}
+	var buf strings.Builder
+	enc, err := NewTableEncoder(&buf, FormatTSV, spec)
+	if err != nil {
+		t.Fatalf("NewTableEncoder: %v", err)
+	}
+	if err := enc.WriteRow([]model.Cell{"first", "second"}); err != nil {
+		t.Fatalf("WriteRow: %v", err)
+	}
+	if err := enc.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	dec, err := NewTableDecoder(strings.NewReader(buf.String()), FormatTSV, spec)
+	if err != nil {
+		t.Fatalf("NewTableDecoder with duplicate column names: %v", err)
+	}
+	row, err := dec.Next()
+	if err != nil {
+		t.Fatalf("Next(): %v", err)
+	}
+	if row[0] != "first" || row[1] != "second" {
+		t.Fatalf("duplicate-named columns were not kept distinct by position: %#v", row)
+	}
+}
+
+// TestJSONDuplicateColumnNamesRoundTrip is the JSON counterpart of
+// TestTSVDuplicateColumnNamesRoundTrip.
+func TestJSONDuplicateColumnNamesRoundTrip(t *testing.T) {
+	spec := model.TableSpec{
+		Columns: []model.Column{
+			{Name: "dup", SQLType: "NVARCHAR(10)"},
+			{Name: "dup", SQLType: "NVARCHAR(10)"},
+		},
+	}
+	var buf strings.Builder
+	enc, err := NewTableEncoder(&buf, FormatJSON, spec)
+	if err != nil {
+		t.Fatalf("NewTableEncoder: %v", err)
+	}
+	if err := enc.WriteRow([]model.Cell{"first", "second"}); err != nil {
+		t.Fatalf("WriteRow: %v", err)
+	}
+	if err := enc.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	dec, err := NewTableDecoder(strings.NewReader(buf.String()), FormatJSON, spec)
+	if err != nil {
+		t.Fatalf("NewTableDecoder with duplicate column names: %v", err)
+	}
+	row, err := dec.Next()
+	if err != nil {
+		t.Fatalf("Next(): %v", err)
+	}
+	if row[0] != "first" || row[1] != "second" {
+		t.Fatalf("duplicate-named columns were not kept distinct by position: %#v", row)
+	}
+}
+
 func TestUnsupportedFormatRejected(t *testing.T) {
 	spec := model.TableSpec{Columns: []model.Column{{Name: "a", SQLType: "INT"}}}
 	if _, err := NewTableEncoder(&strings.Builder{}, "csv", spec); err == nil {

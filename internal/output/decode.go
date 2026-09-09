@@ -42,7 +42,6 @@ func newTSVDecoder(r io.Reader, spec model.TableSpec) (*tsvDecoder, error) {
 	if len(fields) != len(spec.Columns) {
 		return nil, fmt.Errorf("output: malformed tsv artifact: header has %d columns, spec has %d", len(fields), len(spec.Columns))
 	}
-
 	types := make([]string, len(spec.Columns))
 	for i, c := range spec.Columns {
 		types[i] = baseSQLType(c.SQLType)
@@ -219,7 +218,6 @@ func newJSONDecoder(r io.Reader, spec model.TableSpec) (*jsonDecoder, error) {
 	if len(columns) != len(spec.Columns) {
 		return nil, fmt.Errorf("output: malformed json artifact: %d columns, spec has %d", len(columns), len(spec.Columns))
 	}
-
 	if err := expectJSONKey(dec, "rows"); err != nil {
 		return nil, err
 	}
@@ -243,6 +241,19 @@ func (d *jsonDecoder) Next() ([]model.Cell, error) {
 		return nil, fmt.Errorf("output: malformed json artifact: %w", err)
 	}
 	if delim, ok := tok.(json.Delim); ok && delim == ']' {
+		// The rows array is closed, but io.EOF must mean "the whole
+		// artifact was read", not merely "the rows array looked
+		// closed". A disk-full write or a cut connection truncates a
+		// file exactly at a byte boundary like this one; without this
+		// check, a decoder reading that truncated file sees the same
+		// "]" a complete file would have had at this position, and
+		// returns a clean io.EOF indistinguishable from having read
+		// every row. Requiring and consuming the artifact's closing
+		// "}" is what turns that silent partial read into an explicit
+		// error instead.
+		if err := expectJSONDelim(d.dec, '}'); err != nil {
+			return nil, fmt.Errorf("output: malformed json artifact: truncated after the rows array (missing closing brace): %w", err)
+		}
 		d.done = true
 		return nil, io.EOF
 	}

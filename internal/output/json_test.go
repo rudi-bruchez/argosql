@@ -192,6 +192,70 @@ func TestJSONFailingWriterPropagated(t *testing.T) {
 	}
 }
 
+// TestJSONEncodingNormalizedDetection proves the encoder detects, and
+// Encoder.EncodingNormalized exposes, the one silent substitution this
+// package does not otherwise surface: encoding/json.Marshal replacing an
+// invalid UTF-8 byte sequence (something a VARCHAR/CHAR column under a
+// non-UTF-8 collation can legitimately carry) with U+FFFD.
+func TestJSONEncodingNormalizedDetection(t *testing.T) {
+	spec := model.TableSpec{Columns: []model.Column{{Name: "s", SQLType: "VARCHAR(10)"}}}
+
+	t.Run("valid UTF-8 never flags normalization", func(t *testing.T) {
+		var buf bytes.Buffer
+		enc, err := NewTableEncoder(&buf, FormatJSON, spec)
+		if err != nil {
+			t.Fatalf("NewTableEncoder: %v", err)
+		}
+		if err := enc.WriteRow([]model.Cell{"héllo"}); err != nil {
+			t.Fatalf("WriteRow: %v", err)
+		}
+		if enc.EncodingNormalized() {
+			t.Fatal("valid UTF-8 text must not be reported as normalized")
+		}
+	})
+
+	t.Run("invalid UTF-8 is detected and the artifact substitutes U+FFFD", func(t *testing.T) {
+		invalid := string([]byte{0x68, 0x69, 0xff, 0xfe}) // "hi" + two bytes that are not valid UTF-8
+		var buf bytes.Buffer
+		enc, err := NewTableEncoder(&buf, FormatJSON, spec)
+		if err != nil {
+			t.Fatalf("NewTableEncoder: %v", err)
+		}
+		if err := enc.WriteRow([]model.Cell{invalid}); err != nil {
+			t.Fatalf("WriteRow: %v", err)
+		}
+		if !enc.EncodingNormalized() {
+			t.Fatal("invalid UTF-8 text must be reported as normalized")
+		}
+		if err := enc.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		if !strings.Contains(buf.String(), "�") {
+			t.Fatalf("expected the artifact to contain the U+FFFD replacement character encoding/json itself substitutes, got: %s", buf.String())
+		}
+	})
+}
+
+// TestTSVNeverReportsEncodingNormalized proves EncodingNormalized's
+// fallback: tsvEncoder writes a Cell's bytes unmodified (no JSON-style
+// substitution is possible), so Encoder.EncodingNormalized must stay
+// false for it even when a cell carries invalid UTF-8.
+func TestTSVNeverReportsEncodingNormalized(t *testing.T) {
+	spec := model.TableSpec{Columns: []model.Column{{Name: "s", SQLType: "VARCHAR(10)"}}}
+	invalid := string([]byte{0x68, 0x69, 0xff, 0xfe})
+	var buf strings.Builder
+	enc, err := NewTableEncoder(&buf, FormatTSV, spec)
+	if err != nil {
+		t.Fatalf("NewTableEncoder: %v", err)
+	}
+	if err := enc.WriteRow([]model.Cell{invalid}); err != nil {
+		t.Fatalf("WriteRow: %v", err)
+	}
+	if enc.EncodingNormalized() {
+		t.Fatal("tsvEncoder never substitutes bytes; EncodingNormalized must stay false")
+	}
+}
+
 // failingWriter succeeds failAfter writes, then fails every write after
 // that, to exercise error propagation out of Encoder without needing a
 // real broken pipe.

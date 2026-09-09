@@ -55,8 +55,13 @@ func TestConvertCellTypes(t *testing.T) {
 		{"ntext", "NTEXT", "long ntext", "long ntext"},
 		{"xml", "XML", "<a/>", "<a/>"},
 		{"decimal exact", "DECIMAL", []byte("1234567890123456789012345678901234.5678"), "1234567890123456789012345678901234.5678"},
-		{"money", "MONEY", []byte("1.2345"), "1.2345"},
-		{"money negative", "MONEY", []byte("-1.2345"), "-1.2345"},
+		// Large enough that a float64 intermediate loses a digit: measured
+		// directly, strconv.ParseFloat("922337203685477.5807", 64) then
+		// FormatFloat back yields "922337203685477.6", not the original -
+		// a regression 1.2345 is far too small to detect, since small
+		// values like that round-trip through float64 exactly.
+		{"money", "MONEY", []byte("922337203685477.5807"), "922337203685477.5807"},
+		{"money negative", "MONEY", []byte("-922337203685477.5807"), "-922337203685477.5807"},
 		{"smallmoney", "SMALLMONEY", []byte("99.9900"), "99.9900"},
 		{"varbinary", "VARBINARY", []byte{0x12, 0x34}, "0x1234"},
 		{"binary", "BINARY", []byte{0xAB, 0xCD, 0xEF}, "0xabcdef"},

@@ -24,7 +24,15 @@ const (
 	ReasonEncodingNormalized = "encoding_normalized" // invalid sequence replaced
 )
 
-// Column describes one collected column.
+// Column describes one collected column. SQLType must be the exact
+// string (*sql.ColumnType).DatabaseTypeName() returns for the column -
+// "BIGINT", "DECIMAL(38,4)", "UNIQUEIDENTIFIER" - not a hand-written SQL
+// type name: internal/output's JSON and TSV encoders and decoders key
+// off SQLType, case-insensitively and up to its first "(", to decide
+// whether a cell is a bigint (quoted in JSON, parsed back to int64 on
+// read) or one of the int/bit/float families reconstructed from artifact
+// text; any other spelling of the same type is read back as an opaque
+// string, not as the narrower Go type a diagnostic would expect.
 type Column struct {
 	Name    string `json:"name"`
 	SQLType string `json:"sql_type"`

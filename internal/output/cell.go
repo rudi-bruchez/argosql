@@ -248,6 +248,30 @@ func (e *Encoder) WriteRow(row []model.Cell) error { return e.inner.WriteRow(row
 // brackets) and flushes any buffered output. It does not close w.
 func (e *Encoder) Close() error { return e.inner.Close() }
 
+// encodingNormalizer is implemented by a rowWriter that can silently
+// substitute invalid bytes while encoding a string Cell - today, only
+// jsonEncoder (encoding/json.Marshal replaces invalid UTF-8 with U+FFFD
+// to keep its output valid JSON). tsvEncoder writes a Cell's bytes
+// unmodified and has no such case, so it does not implement this
+// interface, and EncodingNormalized below falls back to false for it.
+type encodingNormalizer interface {
+	EncodingNormalized() bool
+}
+
+// EncodingNormalized reports whether this Encoder has, at any point,
+// silently substituted invalid bytes while writing a string Cell. It
+// only detects and exposes that fact - it never decides what to do about
+// it, and it never refuses to write the value: a legitimate database
+// under an old, non-UTF-8 collation must stay usable through this
+// package. Deciding belongs to whichever later stage holds a model.Sink
+// and can emit a model.Notice carrying model.ReasonEncodingNormalized.
+func (e *Encoder) EncodingNormalized() bool {
+	if r, ok := e.inner.(encodingNormalizer); ok {
+		return r.EncodingNormalized()
+	}
+	return false
+}
+
 // Decoder reads one table back from an artifact Encoder wrote, one row at
 // a time. It is the explicit reverse of Encoder: decode.go's machinery,
 // not json.Unmarshal or a single bulk read, since an artifact can be
