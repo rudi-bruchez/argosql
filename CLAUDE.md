@@ -58,6 +58,14 @@ Un test qui lance le binaire pour un principal donné n'injecte que le secret de
 `login.sql`, à la racine, contient un mot de passe de remplacement à éditer sur
 place. **Ne jamais le commiter après y avoir tapé un vrai mot de passe.**
 
+Et la règle qui vaut pour les tests autant que pour le code : **un message d'échec ne
+déverse pas un environnement ni une entrée `CLÉ=VALEUR`.** Mesuré ici sur le test qui
+garantit justement l'isolation des secrets : son message imprimait l'environnement complet
+reçu par le processus enfant, avec un vrai jeton de session de la machine dedans. Un échec
+de test est exactement le texte qu'on colle dans un journal de CI ou un rapport de bug.
+Nommer la variable suffit à localiser la fuite ; `envKey` et `envKeys`, dans
+`tests/integration/fixture_test.go`, sont là pour ça.
+
 ## Fichiers qui ne nous appartiennent pas
 
 Une copie de travail peut contenir des documents personnels du propriétaire du
@@ -175,6 +183,30 @@ réussite qui n'a pas eu lieu.
 
 Dans un script sqlcmd, un `:setvar` **prime** sur le `-v` de la ligne de
 commande.
+
+Query Store **OFF laisse toutes les vues de catalogue lisibles**. L'état OFF est donc un
+cas réel à tester, pas une hypothèse : la commande doit réussir avec un avertissement
+quand l'historique reste lisible, et ne tomber au code 4 que si l'historique est
+inaccessible lui aussi.
+
+`ALTER DATABASE ... SET QUERY_STORE CLEAR ALL` puis
+`SET QUERY_STORE = ON (OPERATION_MODE = READ_ONLY)` construit l'état **READ_ONLY sans
+historique**, celui que la spec distingue de READ_ONLY avec historique.
+
+`DATA_FLUSH_INTERVAL_SECONDS = 5` est **refusé** par le moteur, message 153. C'est la
+première chose qu'on essaie pour accélérer une fixture, et elle ne marche pas.
+
+Ajouter un **index couvrant après un basculement d'intervalle** donne de façon fiable deux
+plans d'un même `query_id` dans deux intervalles distincts. C'est le cas non dégénéré dont
+dépend toute preuve de jointure vers les plans.
+
+Rien ne garantit que `sp_query_store_flush_db` rende une requête **visible par les vues de
+catalogue de façon synchrone**. Toute attente de ce genre est un sondage, jamais un
+`sleep` fixe, et sa borne doit être plus longue que tout ce que le moteur a jamais pris :
+trente secondes ont échoué trois fois sous charge processeur, deux minutes tiennent. Et le
+délai de sondage doit rester **strictement inférieur au budget de contexte** de la requête
+qui sonde, sans quoi c'est la requête qui meurt d'abord et l'échec arrive sous forme
+d'erreur de pilote opaque au lieu du message qui nomme ce qu'on attendait.
 
 ## Méthode : la cassure
 
