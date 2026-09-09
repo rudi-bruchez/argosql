@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/rudi-bruchez/argosql/internal/model"
@@ -315,6 +316,30 @@ func TestParseValidatesObjectSyntaxBeforeConnection(t *testing.T) {
 	for _, object := range cases {
 		t.Run(object, func(t *testing.T) {
 			_, _, err := Parse([]string{"--ctx", "client", "qs", "top", "--object", object})
+			publicErrorCode(t, err, 2)
+		})
+	}
+}
+
+// TestParseValidatesPositionalObjectSyntaxBeforeConnection is task 13
+// fix-2's own A1 target: a reviewer removed the
+// sqlserver.ValidateQualifiedName call in Parse's PositionalIsObject
+// branch and the entire suite, unitary and integration, stayed green -
+// no test in this package ever exercised "obj table", "obj code", "idx
+// list" or "size table" other than by name, in
+// TestHelpOfflineListsAllCommands's own list. Unlike
+// TestParseValidatesObjectSyntaxBeforeConnection above, which only
+// exercises "qs top"'s --object FLAG, this covers the POSITIONAL form
+// the four object-taking commands actually use.
+func TestParseValidatesPositionalObjectSyntaxBeforeConnection(t *testing.T) {
+	for _, args := range [][]string{
+		{"--ctx", "client", "obj", "table", "Orders"},
+		{"--ctx", "client", "obj", "code", "Orders"},
+		{"--ctx", "client", "idx", "list", "Orders"},
+		{"--ctx", "client", "size", "table", "Orders"},
+	} {
+		t.Run(strings.Join(args[2:], " "), func(t *testing.T) {
+			_, _, err := Parse(args)
 			publicErrorCode(t, err, 2)
 		})
 	}

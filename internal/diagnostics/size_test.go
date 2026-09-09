@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/rudi-bruchez/argosql/internal/model"
+	"github.com/rudi-bruchez/argosql/internal/sqlserver"
 
 	mssql "github.com/microsoft/go-mssqldb"
 )
@@ -101,6 +102,82 @@ func TestSizeMemoryOptimizedReturnsFour(t *testing.T) {
 	}
 	if pub.Code != 4 || pub.Kind != "memory_optimized_unavailable" {
 		t.Fatalf("Size on a memory-optimized table: want code 4/memory_optimized_unavailable, got code %d/%s", pub.Code, pub.Kind)
+	}
+}
+
+// TestSizeNotApplicableReturnsFour is fix-2/A7's own target: the third
+// of rowCountUnavailableReason's four values, rowCountReasonNotApplicable
+// (an object with no sys.dm_db_partition_stats row at all, neither
+// memory-optimized nor permission-denied), had no test at all before
+// this - a reviewer measured that renaming its Kind, or defaulting to
+// it from a genuine permission denial, passed silently. Its own Kind
+// ("size_unavailable") must be distinct from the other two
+// (memory_optimized_unavailable, permission) - design spec: "without
+// inventing its cause", the same discipline obj code's definitionState
+// vocabulary already gets.
+func TestSizeNotApplicableReturnsFour(t *testing.T) {
+	conn := &fakeObjConn{responses: []objQueryResponse{
+		resolveFoundResponse(906, "dbo", "Orders", "U"),
+		tableRowResponse(nil, nil, nil, false),
+	}}
+	sess := newFakeObjSession(t, conn)
+	sink := &objCaptureSink{}
+
+	err := Size(context.Background(), sess, "dbo.Orders", sink)
+	var pub *model.PublicError
+	if !errors.As(err, &pub) {
+		t.Fatalf("Size: want *model.PublicError, got %#v", err)
+	}
+	if pub.Code != 4 || pub.Kind != "size_unavailable" {
+		t.Fatalf("Size with no partition-stats row: want code 4/size_unavailable, got code %d/%s", pub.Code, pub.Kind)
+	}
+	if pub.Kind == "memory_optimized_unavailable" || pub.Kind == "permission" {
+		t.Fatalf("size_unavailable must not collapse into either sibling Kind, got %q", pub.Kind)
+	}
+}
+
+// TestRowCountUnavailableMessageDistinctPerReason is fix-2/A7's other
+// half: a reviewer measured that freezing rowCountUnavailableMessage's
+// switch to one constant string passed every existing test, because
+// nothing compared the three reasons' messages against EACH OTHER,
+// only against a fixed expectation each in isolation (which a shared
+// constant would also satisfy if all three tests happened to want the
+// same literal - they don't here, but the isolation itself was the
+// gap). The three messages must be pairwise distinct.
+func TestRowCountUnavailableMessageDistinctPerReason(t *testing.T) {
+	obj := sqlserver.Object{Schema: "dbo", Name: "Orders"}
+	permission := rowCountUnavailableMessage(obj, rowCountReasonPermission)
+	memOpt := rowCountUnavailableMessage(obj, rowCountReasonMemoryOptimized)
+	notApplicable := rowCountUnavailableMessage(obj, rowCountReasonNotApplicable)
+
+	if permission == memOpt || permission == notApplicable || memOpt == notApplicable {
+		t.Fatalf("rowCountUnavailableMessage must render three distinct texts, got %q / %q / %q", permission, memOpt, notApplicable)
+	}
+}
+
+// TestTableHeaderRowCountReachesNotApplicable is fix-2/A7's proof that
+// rowCountReasonNotApplicable is reachable at all, even though task
+// 13 fix-1's own type gate (tableAllowedTypes) means no real 'U' table
+// can hit it through Table/Size any more in practice (every disk-based
+// table always has at least one sys.dm_db_partition_stats row).
+// "Inatteignable par l'interface" is not accepted on this project as a
+// reason to leave a vocabulary branch untested - this calls
+// tableHeaderRowCount directly, bypassing Table/Size, with a fake row
+// that has no row_count and is not memory-optimized: the one shape
+// that still reaches this branch.
+func TestTableHeaderRowCountReachesNotApplicable(t *testing.T) {
+	conn := &fakeObjConn{responses: []objQueryResponse{
+		tableRowResponse(nil, nil, nil, false),
+	}}
+	sess := newFakeObjSession(t, conn)
+	obj := sqlserver.Object{ID: 1, Schema: "dbo", Name: "Orders", Type: "U"}
+
+	_, reason, err := tableHeaderRowCount(context.Background(), sess, obj)
+	if err != nil {
+		t.Fatalf("tableHeaderRowCount: %v", err)
+	}
+	if reason != rowCountReasonNotApplicable {
+		t.Fatalf("reason: got %q, want %q", reason, rowCountReasonNotApplicable)
 	}
 }
 

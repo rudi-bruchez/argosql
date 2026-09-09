@@ -15,10 +15,22 @@ import (
 	"github.com/rudi-bruchez/argosql/internal/output"
 	"github.com/rudi-bruchez/argosql/internal/sqlserver"
 
-	// Used only to recognize a permission-denied SQL error number
-	// (229, 300) the same way internal/sqlserver's own private
-	// classifier does - that classifier is not exported, and this
-	// package never reaches back into sqlserver's pool to borrow it.
+	// Used only to recognize this package's own permission-denied SQL
+	// error numbers (permissionSQLErrors, below) - that classifier is
+	// not exported, and this package never reaches back into
+	// sqlserver's pool to borrow it.
+	//
+	// Task 13 fix-2 (A10): this package's own set, {229, 230, 297, 300},
+	// deliberately diverges from internal/sqlserver's own private
+	// sqlErrorPermission, {229, 300} - the two are no longer "the same
+	// way" and are not meant to be merged. sqlserver's classifier only
+	// ever sees errors from SET LOCK_TIMEOUT, SELECT @@LOCK_TIMEOUT and
+	// SERVERPROPERTY (session setup and version detection), none of
+	// which require any permission at all, so they can never raise 230
+	// (column-level denial) or 297 (catalog/DMV metadata-visibility
+	// denial, design spec line 172's own obj table/size table case) -
+	// only this package's queries, against sys.dm_db_partition_stats
+	// and the catalog views, can.
 	mssql "github.com/microsoft/go-mssqldb"
 )
 

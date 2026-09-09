@@ -6,10 +6,12 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/rudi-bruchez/argosql/internal/cli"
 	"github.com/rudi-bruchez/argosql/internal/diagnostics"
 	"github.com/rudi-bruchez/argosql/internal/model"
 	"github.com/rudi-bruchez/argosql/internal/sqlserver"
@@ -550,8 +552,16 @@ func TestSize(t *testing.T) {
 		if got := sumUsedPages(alloc.rows); got != wantUsed {
 			t.Fatalf("sum(used_pages): got %d, want %d", got, wantUsed)
 		}
-		if seen := allocationTypesSeen(alloc.rows); !seen["IN_ROW_DATA"] {
-			t.Fatalf("a heap with no LOB/overflow column must report IN_ROW_DATA, got %v", seen)
+		// fix-2/A4: presence alone ("IN_ROW_DATA is there") does not
+		// catch the zero-page categories the three filters in size.sql
+		// exist to suppress - a reviewer removed all three and every
+		// partition started reporting LOB_DATA/ROW_OVERFLOW_DATA rows
+		// at zero pages, which this table's own comment declares must
+		// never happen, and this assertion (checked only for presence)
+		// stayed green. Named exhaustively: a heap with no LOB/overflow
+		// column must report IN_ROW_DATA and NOTHING else.
+		if seen := allocationTypesSeen(alloc.rows); len(seen) != 1 || !seen["IN_ROW_DATA"] {
+			t.Fatalf("a heap with no LOB/overflow column must report exactly {IN_ROW_DATA}, got %v", seen)
 		}
 	})
 
@@ -672,6 +682,218 @@ func TestSize(t *testing.T) {
 	})
 }
 
+// independentAllocationOrder reads sys.dm_db_partition_stats' raw
+// pages directly and unpivots them in Go - never reusing size.sql's
+// own UNION ALL - into the (index_id, partition_number,
+// allocation_type) triplets that actually carry pages, sorted by
+// those three keys with Go's own sort.Slice. This is the "seconde
+// lecture indépendante" the brief names as the one assertion form
+// that survived every cassure a reviewer tried against TestSize.
+func independentAllocationOrder(t *testing.T, ctx context.Context, lab *Lab, qualifiedName string) []string {
+	t.Helper()
+	var objectID int64
+	if err := lab.Admin.QueryRowContext(ctx, "SELECT OBJECT_ID(@p1)", qualifiedName).Scan(&objectID); err != nil {
+		t.Fatalf("resolving object_id for %s: %v", qualifiedName, err)
+	}
+	rows, err := lab.Admin.QueryContext(ctx,
+		"SELECT index_id, partition_number, in_row_used_page_count, in_row_reserved_page_count, "+
+			"lob_used_page_count, lob_reserved_page_count, row_overflow_used_page_count, row_overflow_reserved_page_count "+
+			"FROM sys.dm_db_partition_stats WHERE object_id = @p1", objectID)
+	if err != nil {
+		t.Fatalf("independent partition-stats read for %s: %v", qualifiedName, err)
+	}
+	defer rows.Close()
+
+	type triplet struct {
+		indexID, partitionNumber int64
+		allocationType           string
+	}
+	var triplets []triplet
+	for rows.Next() {
+		var indexID, partitionNumber, inRowUsed, inRowReserved, lobUsed, lobReserved, rowOverflowUsed, rowOverflowReserved int64
+		if err := rows.Scan(&indexID, &partitionNumber, &inRowUsed, &inRowReserved, &lobUsed, &lobReserved, &rowOverflowUsed, &rowOverflowReserved); err != nil {
+			t.Fatalf("scanning independent partition-stats row: %v", err)
+		}
+		if inRowUsed > 0 || inRowReserved > 0 {
+			triplets = append(triplets, triplet{indexID, partitionNumber, "IN_ROW_DATA"})
+		}
+		if lobUsed > 0 || lobReserved > 0 {
+			triplets = append(triplets, triplet{indexID, partitionNumber, "LOB_DATA"})
+		}
+		if rowOverflowUsed > 0 || rowOverflowReserved > 0 {
+			triplets = append(triplets, triplet{indexID, partitionNumber, "ROW_OVERFLOW_DATA"})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("reading independent partition-stats rows: %v", err)
+	}
+
+	sort.Slice(triplets, func(i, j int) bool {
+		a, b := triplets[i], triplets[j]
+		if a.indexID != b.indexID {
+			return a.indexID < b.indexID
+		}
+		if a.partitionNumber != b.partitionNumber {
+			return a.partitionNumber < b.partitionNumber
+		}
+		return a.allocationType < b.allocationType
+	})
+
+	out := make([]string, len(triplets))
+	for i, tr := range triplets {
+		out[i] = fmt.Sprintf("%d/%d/%s", tr.indexID, tr.partitionNumber, tr.allocationType)
+	}
+	return out
+}
+
+// productionAllocationOrder reads back the (index_id, partition_number,
+// allocation_type) triplets diagnostics.Size actually wrote, in the
+// order it wrote them - no sorting here, this is what production says.
+func productionAllocationOrder(sink *captureSink) []string {
+	tbl := sink.table("allocations")
+	if tbl == nil {
+		return nil
+	}
+	out := make([]string, len(tbl.rows))
+	for i, row := range tbl.rows {
+		indexID, _ := row[0].(int64)
+		partitionNumber, _ := row[1].(int64)
+		allocationType, _ := row[2].(string)
+		out[i] = fmt.Sprintf("%d/%d/%s", indexID, partitionNumber, allocationType)
+	}
+	return out
+}
+
+// TestSizeAllocationsOrderMatchesIndependentUnpivot is task 13 fix-2's
+// own A0 target: fix-1 moved allocations.sql's row order entirely into
+// sql/size.sql's own ORDER BY (index_id, partition_number,
+// allocation_type - design spec line 103's own declared key), and its
+// own replacement test, TestSizeAllocationsPreservesDriverOrder, can
+// only prove "the code does not reorder the driver's rows" - a fake
+// driver always hands back whatever order the test wrote, so no unit
+// test can ever exercise the real ORDER BY clause. This does, on two
+// fixtures that each vary a different subset of the three keys:
+// dbo.SizeFixture (multiple index_id, and multiple allocation_type on
+// the same index/partition) and dbo.SizePartitioned (multiple
+// partition_number on its one index) - between the two, all three
+// keys are exercised by a fixture that actually varies them, unlike
+// the reviewer's own measurement of the OLD Go-level test, whose three
+// input rows all shared index_id=1 and could never have caught a lost
+// index_id comparison.
+func TestSizeAllocationsOrderMatchesIndependentUnpivot(t *testing.T) {
+	lab := NewLab(t, os.Getenv("ASQ_TEST_IMAGE"))
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	if err := applyObjects(ctx, lab.Admin); err != nil {
+		t.Fatalf("applying objects.sql: %v", err)
+	}
+
+	sess, err := sqlserver.Open(ctx, lab.Profile)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer sess.Close()
+
+	for _, name := range []string{"dbo.SizeFixture", "dbo.SizePartitioned"} {
+		t.Run(name, func(t *testing.T) {
+			want := independentAllocationOrder(t, ctx, lab, "AppDB."+name)
+			sink := &captureSink{}
+			if err := diagnostics.Size(ctx, sess, name, sink); err != nil {
+				t.Fatalf("Size: %v", err)
+			}
+			got := productionAllocationOrder(sink)
+			if len(got) != len(want) {
+				t.Fatalf("%s: allocation row count: got %d, want %d (independent unpivot): got=%v want=%v", name, len(got), len(want), got, want)
+			}
+			for i := range want {
+				if got[i] != want[i] {
+					t.Fatalf("%s: allocations[%d]: got %q, want %q (independent unpivot, full sequence got=%v want=%v)", name, i, got[i], want[i], got, want)
+				}
+			}
+		})
+	}
+}
+
+// TestRegisteredTableOrderMatchesExecution is task 13 fix-2's own A8
+// target: a reviewer inverted "obj table"'s registered Tables list and
+// removed AllocationsTable from "size table"'s, and
+// TestHelpOfflineListsAllCommands (the only test that ever reads the
+// registry's Tables field) checks nothing but command NAMES - it
+// never even looks at Tables. The comment on TableTable/ColumnsTable/
+// IndexesTable/AllocationsTable itself makes the promise this closes:
+// "help's advertised schema and what Table/Size actually write can
+// never drift" - a promise kept only by the diagnostics functions
+// happening to agree with the registry, never verified. This compares
+// cli.NewRegistry()'s own declared order, by name, against the
+// sequence of tables diagnostics.Table/Size actually open (captureSink's
+// own tables field, appended in Begin/End order - real execution, not
+// a second literal). Limited to these two commands, the ones this
+// task's own reviewer found live cassures on: a fully generic version
+// across all ten commands would need a fixture and a fake session per
+// command (several needing real Query Store history), which this task
+// does not build.
+func TestRegisteredTableOrderMatchesExecution(t *testing.T) {
+	lab := NewLab(t, os.Getenv("ASQ_TEST_IMAGE"))
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	if err := applyObjects(ctx, lab.Admin); err != nil {
+		t.Fatalf("applying objects.sql: %v", err)
+	}
+	sess, err := sqlserver.Open(ctx, lab.Profile)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer sess.Close()
+
+	reg := cli.NewRegistry()
+	findCommand := func(name string) cli.Command {
+		for _, c := range reg {
+			if c.Name == name {
+				return c
+			}
+		}
+		t.Fatalf("registry has no command named %q", name)
+		return cli.Command{}
+	}
+
+	cases := []struct {
+		command string
+		run     func(sink *captureSink) error
+	}{
+		{"obj table", func(sink *captureSink) error { return diagnostics.Table(ctx, sess, "dbo.Orders", sink) }},
+		{"size table", func(sink *captureSink) error { return diagnostics.Size(ctx, sess, "dbo.Orders", sink) }},
+	}
+	for _, c := range cases {
+		t.Run(c.command, func(t *testing.T) {
+			cmd := findCommand(c.command)
+			var wantNames []string
+			for _, spec := range cmd.Tables {
+				wantNames = append(wantNames, spec.Name)
+			}
+
+			sink := &captureSink{}
+			if err := c.run(sink); err != nil {
+				t.Fatalf("%s: %v", c.command, err)
+			}
+			var gotNames []string
+			for _, tbl := range sink.tables {
+				gotNames = append(gotNames, tbl.spec.Name)
+			}
+
+			if len(gotNames) != len(wantNames) {
+				t.Fatalf("%s: table count: got %v, want %v (registry's own declared Tables)", c.command, gotNames, wantNames)
+			}
+			for i := range wantNames {
+				if gotNames[i] != wantNames[i] {
+					t.Fatalf("%s: table order: got %v, want %v (registry's own declared Tables)", c.command, gotNames, wantNames)
+				}
+			}
+		})
+	}
+}
+
 // TestObjTableColumnsAndIndexes proves obj table's columns/indexes
 // content against a real engine on dbo.ColumnsFixture: a DECIMAL
 // column, a persisted computed column, a column default, an ordered
@@ -694,15 +916,120 @@ func TestObjTableColumnsAndIndexes(t *testing.T) {
 	}
 	defer sess.Close()
 
+	// fix-2/A2: an independent read of sys.objects/sys.schemas, never a
+	// literal copied from the fixture - the "table" row's own identity
+	// had no assertion at all before this (a reviewer froze
+	// object_id/schema/name to -1/"zzzBREAK18"/"zzzBREAK18" and the
+	// suite stayed green).
+	var wantObjectID int64
+	var wantSchema, wantName string
+	if err := lab.Admin.QueryRowContext(ctx,
+		"SELECT o.object_id, s.name, o.name FROM sys.objects o JOIN sys.schemas s ON s.schema_id=o.schema_id WHERE o.object_id=OBJECT_ID(N'AppDB.dbo.ColumnsFixture')",
+	).Scan(&wantObjectID, &wantSchema, &wantName); err != nil {
+		t.Fatalf("independent identity read: %v", err)
+	}
+
+	// fix-2/A5: an independent read of sys.columns, ordered by
+	// column_id - the sequence AND the values a reviewer measured were
+	// unguarded (max_length frozen to 0, precision/scale swapped,
+	// is_identity frozen to 0, ORDER BY replaced by name DESC, all
+	// green).
+	type wantColumn struct {
+		name                        string
+		maxLength, precision, scale int64
+		isIdentity                  bool
+	}
+	var wantColumns []wantColumn
+	colRows, err := lab.Admin.QueryContext(ctx,
+		"SELECT c.name, c.max_length, c.precision, c.scale, c.is_identity FROM sys.columns c WHERE c.object_id=OBJECT_ID(N'AppDB.dbo.ColumnsFixture') ORDER BY c.column_id")
+	if err != nil {
+		t.Fatalf("independent columns read: %v", err)
+	}
+	for colRows.Next() {
+		var wc wantColumn
+		if err := colRows.Scan(&wc.name, &wc.maxLength, &wc.precision, &wc.scale, &wc.isIdentity); err != nil {
+			t.Fatalf("scanning independent column row: %v", err)
+		}
+		wantColumns = append(wantColumns, wc)
+	}
+	colRows.Close()
+
+	// fix-2/A6: an independent read of sys.indexes, ordered by
+	// index_id - a reviewer replaced i.type_desc with the literal
+	// N'MYSTERY' and reversed ORDER BY i.index_id, both green, because
+	// no assertion anywhere read the type cell or compared order.
+	type wantIndex struct {
+		indexID  int64
+		name     string
+		typeDesc string
+	}
+	var wantIndexes []wantIndex
+	idxRows, err := lab.Admin.QueryContext(ctx,
+		"SELECT i.index_id, i.name, i.type_desc FROM sys.indexes i WHERE i.object_id=OBJECT_ID(N'AppDB.dbo.ColumnsFixture') AND i.index_id > 0 ORDER BY i.index_id")
+	if err != nil {
+		t.Fatalf("independent indexes read: %v", err)
+	}
+	for idxRows.Next() {
+		var wi wantIndex
+		if err := idxRows.Scan(&wi.indexID, &wi.name, &wi.typeDesc); err != nil {
+			t.Fatalf("scanning independent index row: %v", err)
+		}
+		wantIndexes = append(wantIndexes, wi)
+	}
+	idxRows.Close()
+
 	sink := &captureSink{}
 	if err := diagnostics.Table(ctx, sess, "dbo.ColumnsFixture", sink); err != nil {
 		t.Fatalf("Table: %v", err)
+	}
+
+	tableRow := sink.table("table")
+	if tableRow == nil || len(tableRow.rows) != 1 {
+		t.Fatalf("table row missing: %#v", tableRow)
+	}
+	if got := tableRow.rows[0][0]; got != wantObjectID {
+		t.Fatalf("table object_id cell: got %#v, want %d (independent sys.objects read)", got, wantObjectID)
+	}
+	if got := tableRow.rows[0][1]; got != wantSchema {
+		t.Fatalf("table schema cell: got %#v, want %q (independent sys.schemas read)", got, wantSchema)
+	}
+	if got := tableRow.rows[0][2]; got != wantName {
+		t.Fatalf("table name cell: got %#v, want %q (independent sys.objects read)", got, wantName)
 	}
 
 	columns := sink.table("columns")
 	if columns == nil {
 		t.Fatal("columns table missing")
 	}
+	if len(columns.rows) != len(wantColumns) {
+		t.Fatalf("columns row count: got %d, want %d (independent sys.columns read)", len(columns.rows), len(wantColumns))
+	}
+	// Sequence checked BEFORE any map is built: the spec says "Ordered
+	// columns", and a map thrown together first (as this test used to
+	// do) discards that order before anything can look at it.
+	for i, wc := range wantColumns {
+		row := columns.rows[i]
+		gotName, _ := row[1].(string)
+		if gotName != wc.name {
+			t.Fatalf("columns[%d].name: got %q, want %q (independent column_id order)", i, gotName, wc.name)
+		}
+		if row[3] != wc.maxLength {
+			t.Fatalf("columns[%d] (%s).max_length: got %#v, want %d", i, wc.name, row[3], wc.maxLength)
+		}
+		if row[4] != wc.precision {
+			t.Fatalf("columns[%d] (%s).precision: got %#v, want %d", i, wc.name, row[4], wc.precision)
+		}
+		if row[5] != wc.scale {
+			t.Fatalf("columns[%d] (%s).scale: got %#v, want %d", i, wc.name, row[5], wc.scale)
+		}
+		if row[7] != wc.isIdentity {
+			t.Fatalf("columns[%d] (%s).identity: got %#v, want %v", i, wc.name, row[7], wc.isIdentity)
+		}
+	}
+
+	// The map now serves what it's actually for: looking up one named
+	// column for the assertions the sequence check above does not
+	// make (type name, default/computed definitions, nullability).
 	byName := map[string][]model.Cell{}
 	for _, row := range columns.rows {
 		name, _ := row[1].(string)
@@ -740,6 +1067,25 @@ func TestObjTableColumnsAndIndexes(t *testing.T) {
 	if indexes == nil {
 		t.Fatal("indexes table missing")
 	}
+	if len(indexes.rows) != len(wantIndexes) {
+		t.Fatalf("indexes row count: got %d, want %d (independent sys.indexes read)", len(indexes.rows), len(wantIndexes))
+	}
+	// Sequence and type_desc checked BEFORE any map is built - same
+	// reasoning as columns above, and this is index_id's own order,
+	// the second half of A6.
+	for i, wi := range wantIndexes {
+		row := indexes.rows[i]
+		gotID, _ := row[0].(int64)
+		gotName, _ := row[1].(string)
+		gotType, _ := row[2].(string)
+		if gotID != wi.indexID || gotName != wi.name {
+			t.Fatalf("indexes[%d]: got (index_id=%v, name=%q), want (index_id=%d, name=%q) (independent index_id order)", i, gotID, gotName, wi.indexID, wi.name)
+		}
+		if gotType != wi.typeDesc {
+			t.Fatalf("indexes[%d] (%s).type: got %q, want %q", i, wi.name, gotType, wi.typeDesc)
+		}
+	}
+
 	byIndexName := map[string][]model.Cell{}
 	for _, row := range indexes.rows {
 		name, _ := row[1].(string)
@@ -771,5 +1117,55 @@ func TestObjTableColumnsAndIndexes(t *testing.T) {
 	}
 	if disabled[7] != true {
 		t.Fatalf("disabled index disabled cell: got %#v, want true", disabled[7])
+	}
+}
+
+// TestIdxListOnHeapExcludesIndexZero is task 13 fix-2's own A3 target:
+// sql/indexes.sql's "AND i.index_id > 0" clause is what IndexesTable's
+// own doc comment relies on to claim "every row this table ever
+// carries names a real index" - a claim no fixture before this test
+// ever exercised, since dbo.SizeHeap (the only heap this project's
+// fixtures define) was read only by TestSize, which never opens the
+// "indexes" table at all, and every other fixture (Orders,
+// ColumnsFixture) has a clustered primary key. Measured by a reviewer
+// with the clause removed: idx list on a heap then returns TWO rows,
+// the first being the heap's own index_id=0 pseudo-row with a NULL
+// name - exactly what this test asserts never happens.
+func TestIdxListOnHeapExcludesIndexZero(t *testing.T) {
+	lab := NewLab(t, os.Getenv("ASQ_TEST_IMAGE"))
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	if err := applyObjects(ctx, lab.Admin); err != nil {
+		t.Fatalf("applying objects.sql: %v", err)
+	}
+
+	sess, err := sqlserver.Open(ctx, lab.Profile)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer sess.Close()
+
+	sink := &captureSink{}
+	if err := diagnostics.Indexes(ctx, sess, "dbo.SizeHeap", sink); err != nil {
+		t.Fatalf("Indexes: %v", err)
+	}
+	tbl := sink.table("indexes")
+	if tbl == nil {
+		t.Fatal("indexes table missing")
+	}
+	if len(tbl.rows) != 1 {
+		t.Fatalf("dbo.SizeHeap (one real nonclustered index, plus its own heap pseudo-row): want exactly one row, got %d: %#v", len(tbl.rows), tbl.rows)
+	}
+	row := tbl.rows[0]
+	indexID, _ := row[0].(int64)
+	if indexID == 0 {
+		t.Fatal("indexes[0].index_id: got 0 (the heap's own pseudo-row), want a real index")
+	}
+	if row[1] == nil {
+		t.Fatal("indexes[0].name: want a non-null real index name, not the heap's own NULL")
+	}
+	if row[2] != "NONCLUSTERED" {
+		t.Fatalf("indexes[0].type: got %#v, want %q (IX_SizeHeap_Value)", row[2], "NONCLUSTERED")
 	}
 }

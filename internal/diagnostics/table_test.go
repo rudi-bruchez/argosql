@@ -104,6 +104,13 @@ func TestTableWritesTableColumnsIndexesInOrderWithCellValues(t *testing.T) {
 	if got := columnsTbl.rows[1][9]; got != "((0))" {
 		t.Fatalf("columns[1].default_definition cell: got %#v, want %q", got, "((0))")
 	}
+	// fix-2/A9: the POSITIVE completeness case was never asserted - only
+	// TestTableColumnsPropertiesIncompleteWhenDefinitionDenied checked
+	// false. A cassure fixing dst.End(true, false) here would have
+	// passed silently without this.
+	if !columnsTbl.propertiesComplete {
+		t.Fatal("columns.propertiesComplete: want true when VIEW DEFINITION is allowed")
+	}
 
 	indexesTbl := sink.table("indexes")
 	if indexesTbl == nil || len(indexesTbl.rows) != 1 {
@@ -111,6 +118,9 @@ func TestTableWritesTableColumnsIndexesInOrderWithCellValues(t *testing.T) {
 	}
 	if got := indexesTbl.rows[0][3]; got != "[OrderId] ASC" {
 		t.Fatalf("indexes[0].keys cell: got %#v, want %q", got, "[OrderId] ASC")
+	}
+	if !indexesTbl.propertiesComplete {
+		t.Fatal("indexes.propertiesComplete: want true when VIEW DEFINITION is allowed")
 	}
 }
 
@@ -147,8 +157,15 @@ func TestTableDegradesWhenSizePermissionAbsent(t *testing.T) {
 	if tableTbl.propertiesComplete {
 		t.Fatal("table.propertiesComplete: want false when row count is unavailable")
 	}
-	if sink.noticeWithKind("row_count_unavailable") == nil {
+	notice := sink.noticeWithKind("row_count_unavailable")
+	if notice == nil {
 		t.Fatal("want a row_count_unavailable notice when size permissions are absent")
+	}
+	// fix-2/A9: the notice's own Table field, which names what it's
+	// about, had no assertion - a cassure setting it to an arbitrary
+	// string passed silently.
+	if notice.Table != TableTable.Name {
+		t.Fatalf("row_count_unavailable notice.Table: got %q, want %q", notice.Table, TableTable.Name)
 	}
 }
 

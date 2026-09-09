@@ -58,6 +58,15 @@ func TestCodeAvailable(t *testing.T) {
 		t.Fatalf("module: want exactly one row, got %#v", tbl)
 	}
 	row := tbl.rows[0]
+	// fix-2/A9: object_id and type had no assertion at all - a
+	// reviewer measured that zeroing object_id, or emptying type,
+	// passed silently.
+	if row[0] != int64(601) {
+		t.Fatalf("object_id cell: got %#v, want int64(601)", row[0])
+	}
+	if row[2] != "P" {
+		t.Fatalf("type cell: got %#v, want %q", row[2], "P")
+	}
 	if row[3] != definitionStateAvailable {
 		t.Fatalf("definition_state cell: got %#v, want %q", row[3], definitionStateAvailable)
 	}
@@ -72,6 +81,12 @@ func TestCodeAvailable(t *testing.T) {
 	}
 	if sink.files[0].suffix != ".sql" {
 		t.Fatalf("exported artifact suffix: got %q, want %q", sink.files[0].suffix, ".sql")
+	}
+	// fix-2/A9: the artifact's own kind was never checked - a reviewer
+	// measured that renaming "module_definition" passed silently,
+	// because the test only read suffix and content.
+	if sink.files[0].kind != "module_definition" {
+		t.Fatalf("exported artifact kind: got %q, want %q", sink.files[0].kind, "module_definition")
 	}
 }
 

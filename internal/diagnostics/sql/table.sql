@@ -32,10 +32,17 @@
 -- from "the query itself failed" by whether this query returns a row
 -- or an error, never by inspecting the NULLs themselves.
 --
--- LEFT JOIN sys.tables: only object type 'U' ever has a matching row
--- there, so is_memory_optimized comes back NULL - never an error - for
--- a view or a module, the other object types "obj table"/"size table"
--- might still be asked to read metadata for.
+-- JOIN sys.tables, not LEFT JOIN (task 13 fix-2, A10): this used to be
+-- a LEFT JOIN on the stated grounds that "a view or a module, the
+-- other object types obj table/size table might still be asked to
+-- read metadata for" would have no matching sys.tables row. That
+-- justification stopped being true the moment fix-1 added
+-- tableAllowedTypes in table.go: Table and Size both reject any
+-- object whose type is not 'U', in Go, before this query ever runs -
+-- so by the time @id reaches here, it is always a 'U' object, and
+-- every 'U' object has exactly one sys.tables row. A plain JOIN says
+-- that guarantee in the query itself, rather than leaving a LEFT JOIN
+-- whose own NULL-handling reason no longer applies.
 SELECT
     (SELECT SUM(CASE WHEN ps.index_id IN (0, 1) THEN ps.row_count ELSE 0 END)
      FROM sys.dm_db_partition_stats AS ps
@@ -48,5 +55,5 @@ SELECT
      WHERE ps.object_id = @id) AS total_reserved_pages,
     t.is_memory_optimized
 FROM sys.objects AS o
-LEFT JOIN sys.tables AS t ON t.object_id = o.object_id
+JOIN sys.tables AS t ON t.object_id = o.object_id
 WHERE o.object_id = @id;

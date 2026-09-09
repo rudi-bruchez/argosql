@@ -23,6 +23,40 @@ func TestHelpOffline(t *testing.T) {
 	}
 }
 
+// TestRunRejectsMalformedPositionalObjectBeforeConnecting is task 13
+// fix-2's own A1 target, the propagation half:
+// TestParseValidatesPositionalObjectSyntaxBeforeConnection (parse_test.go)
+// proves Parse itself rejects a malformed "obj table"/"obj code"/"idx
+// list"/"size table" name; this proves that rejection actually reaches
+// Run's own exit code and never lets openSession get called at all. A
+// reviewer measured the real binary against an unreachable host: with
+// the validation in place, the malformed name returns code 2 before
+// any socket opens; with it removed, the identical invocation returns
+// code 3 (connection) - the exact corollary CLAUDE.md already records
+// as paid for once. openSession here returns an error if it is ever
+// invoked, so this test would fail on ITS OWN if the propagation broke
+// even without checking the exit code, not only via the code-2
+// assertion.
+func TestRunRejectsMalformedPositionalObjectBeforeConnecting(t *testing.T) {
+	profile := config.Profile{Host: "fake", Database: "db", Username: "user", Password: "secret", Port: 1433, TrustServerCertificate: true}
+	openCalled := false
+	openSession := func(ctx context.Context, p config.Profile) (*sqlserver.Session, error) {
+		openCalled = true
+		return nil, fmt.Errorf("openSession must never be called: Parse should have rejected this name first")
+	}
+
+	var out, errout bytes.Buffer
+	args := []string{"--ctx", "x", "--format", "json", "--out-dir", t.TempDir(), "obj", "table", "Orders"} // "Orders": one part, no schema
+	code := run(context.Background(), args, &out, &errout, fakeLoadConfig(profile), openSession)
+
+	if openCalled {
+		t.Fatal("openSession was called: the malformed positional object name reached a connection attempt instead of being rejected by Parse")
+	}
+	if code != 2 {
+		t.Fatalf("exit code: got %d, want 2 (invalid_argument, before any connection) - stderr: %s", code, errout.String())
+	}
+}
+
 // TestHelpOfflineWithoutConfigDir proves help keeps working on an
 // environment that has neither a configuration directory nor a cache
 // directory - exactly the case os.UserConfigDir/os.UserCacheDir fail on,
