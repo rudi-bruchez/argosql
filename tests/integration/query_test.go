@@ -476,31 +476,7 @@ func queryIDForLiteralText(t *testing.T, lab *Lab, marker, text string) int64 {
 	defer cancel()
 
 	batch := fmt.Sprintf("SELECT N'%s' AS Marker, COUNT(*) AS Cnt FROM dbo.Widgets WHERE Quantity >= 0;", text)
-	if _, err := lab.Admin.ExecContext(ctx, batch); err != nil {
-		t.Fatalf("running literal-text workload for marker %q: %v", marker, err)
-	}
-	if _, err := lab.Admin.ExecContext(ctx, "EXEC sys.sp_query_store_flush_db"); err != nil {
-		t.Fatalf("sp_query_store_flush_db: %v", err)
-	}
-
-	findID := "SELECT q.query_id FROM sys.query_store_query_text AS qt " +
-		"JOIN sys.query_store_query AS q ON q.query_text_id = qt.query_text_id " +
-		"WHERE qt.query_sql_text LIKE '%' + @p1 + '%'"
-	deadline := time.Now().Add(flushPollDeadline)
-	for {
-		var id int64
-		err := lab.Admin.QueryRowContext(ctx, findID, marker).Scan(&id)
-		if err == nil {
-			return id
-		}
-		if !errors.Is(err, sql.ErrNoRows) {
-			t.Fatalf("polling for query_id of marker %q: %v", marker, err)
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("query store marker %q did not appear within %s of flush", marker, flushPollDeadline)
-		}
-		time.Sleep(flushPollDelay)
-	}
+	return queryIDForMarkerBatch(ctx, t, lab, marker, batch)
 }
 
 // TestQueryExportLongUnicodeTextByteIdentity is the brief's "long texte

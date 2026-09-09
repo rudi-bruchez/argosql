@@ -30,34 +30,7 @@ func TestPlanSummaryWarningAttributeForm(t *testing.T) {
 
 	const marker = "AsqFix1A1Crossjoin"
 	batch := "SELECT SUM(a.Quantity+b.Quantity) AS " + marker + " FROM dbo.Widgets a CROSS JOIN dbo.Widgets b OPTION(MAXDOP 1)"
-	// Five executions before the flush, matching Lab.QueryID's own
-	// resilience pattern (fixture_test.go): measured on 2019, a single
-	// execution of this batch was not reliably visible to
-	// sp_query_store_flush_db within the poll budget, unlike 2022.
-	for i := 0; i < 5; i++ {
-		if _, err := lab.Admin.ExecContext(ctx, batch); err != nil {
-			t.Fatalf("running the cross join workload: %v", err)
-		}
-	}
-	if _, err := lab.Admin.ExecContext(ctx, "EXEC sys.sp_query_store_flush_db"); err != nil {
-		t.Fatalf("sp_query_store_flush_db: %v", err)
-	}
-
-	findID := "SELECT q.query_id FROM sys.query_store_query_text AS qt " +
-		"JOIN sys.query_store_query AS q ON q.query_text_id = qt.query_text_id " +
-		"WHERE qt.query_sql_text LIKE '%' + @p1 + '%'"
-	deadline := time.Now().Add(flushPollDeadline)
-	var queryID int64
-	for {
-		err := lab.Admin.QueryRowContext(ctx, findID, marker).Scan(&queryID)
-		if err == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("marker %q did not appear within %s of flush: %v", marker, flushPollDeadline, err)
-		}
-		time.Sleep(flushPollDelay)
-	}
+	queryID := queryIDForMarkerBatch(ctx, t, lab, marker, batch)
 	planID := planIDFor(ctx, t, lab, queryID)
 
 	r, code := lab.Run(t, "Q", []string{"plan", strconv.FormatInt(queryID, 10), "--plan-id", strconv.FormatInt(planID, 10), "--summary"})

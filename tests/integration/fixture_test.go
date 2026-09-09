@@ -91,6 +91,80 @@ func applyBootstrap(ctx context.Context, db *sql.DB) error {
 // a comment does not.
 const queryStoreMarker = "AsqFixtureQueryStoreMarker"
 
+// reissueWorkload re-runs a fixture's own workload and forces another
+// Query Store flush, and the poll loops below call it every
+// flushReissueEvery attempts rather than only sleeping.
+//
+// Why re-running beats waiting longer, measured on this project: the
+// three tests that failed a full 2022 suite (two runs out of three, a
+// different test each time, every one of them green in isolation) all
+// failed the same way, a marker never appearing within the poll bound.
+// Raising that bound from 30 to 120 seconds reduced the frequency and
+// did not remove it, which is the signature of something that is not
+// merely slow. The corroborating measurement is in this file's own
+// history: a SINGLE execution of a batch was not reliably visible to
+// sp_query_store_flush_db, and five executions of the same batch were.
+// So the failure is a capture that did not happen, not a write that had
+// not landed yet, and no amount of additional waiting produces a row
+// the engine never captured. Re-issuing the work does.
+// queryIDForMarkerBatch is the ONE poll every fixture in this package
+// uses to turn a marked batch into its Query Store query_id. Three
+// copies of this loop existed before, and the copy a first version of
+// this fix did not touch is the one that failed the very run meant to
+// prove the fix: patching call sites instead of the shared path proved
+// nothing and cost a full suite run.
+//
+// It runs batch five times, not once, then flushes, then polls -
+// re-issuing the whole thing every flushReissueEvery attempts. The five
+// is not superstition: a single execution of a batch was measured not
+// reliably visible to sp_query_store_flush_db on 2019, and five
+// executions of the same batch were.
+func queryIDForMarkerBatch(ctx context.Context, t *testing.T, lab *Lab, marker, batch string) int64 {
+	t.Helper()
+
+	for i := 0; i < 5; i++ {
+		if _, err := lab.Admin.ExecContext(ctx, batch); err != nil {
+			t.Fatalf("running the workload for marker %q: %v", marker, err)
+		}
+	}
+	if _, err := lab.Admin.ExecContext(ctx, "EXEC sys.sp_query_store_flush_db"); err != nil {
+		t.Fatalf("sp_query_store_flush_db: %v", err)
+	}
+
+	const findID = "SELECT q.query_id FROM sys.query_store_query_text AS qt " +
+		"JOIN sys.query_store_query AS q ON q.query_text_id = qt.query_text_id " +
+		"WHERE qt.query_sql_text LIKE '%' + @p1 + '%'"
+
+	deadline := time.Now().Add(flushPollDeadline)
+	for attempt := 0; ; attempt++ {
+		var id int64
+		err := lab.Admin.QueryRowContext(ctx, findID, marker).Scan(&id)
+		if err == nil {
+			return id
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("polling for query_id of marker %q: %v", marker, err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("query store marker %q did not appear within %s, across %d polls and %d workload re-issues",
+				marker, flushPollDeadline, attempt, attempt/flushReissueEvery)
+		}
+		if attempt > 0 && attempt%flushReissueEvery == 0 {
+			reissueWorkload(ctx, lab.Admin, batch)
+		}
+		time.Sleep(flushPollDelay)
+	}
+}
+
+func reissueWorkload(ctx context.Context, db *sql.DB, batch string) {
+	for i := 0; i < 5; i++ {
+		row := db.QueryRowContext(ctx, batch)
+		var discard any
+		_ = row.Scan(&discard)
+	}
+	_, _ = db.ExecContext(ctx, "EXEC sys.sp_query_store_flush_db")
+}
+
 // flushPollDeadline bounds the wait for the flushed marker to become
 // visible in Query Store; flushPollDelay is the short interval between
 // polls, never one fixed sleep for the whole wait. flushPollBudget is
@@ -115,6 +189,11 @@ const (
 	flushPollBudget   = 150 * time.Second
 	flushPollDeadline = 120 * time.Second
 	flushPollDelay    = 300 * time.Millisecond
+
+	// Every this many polls (about ten seconds at flushPollDelay), the
+	// loop re-issues its workload instead of only sleeping. See
+	// reissueWorkload for the measurement that made this necessary.
+	flushReissueEvery = 33
 )
 
 // TestFixtureQueryStoreFlush proves the fixture capability every later
@@ -149,7 +228,7 @@ func TestFixtureQueryStoreFlush(t *testing.T) {
 
 	findMarker := "SELECT COUNT(*) FROM sys.query_store_query_text WHERE query_sql_text LIKE '%' + @p1 + '%'"
 	deadline := time.Now().Add(flushPollDeadline)
-	for {
+	for attempt := 0; ; attempt++ {
 		var n int
 		if err := lab.Admin.QueryRowContext(ctx, findMarker, queryStoreMarker).Scan(&n); err != nil {
 			t.Fatalf("polling sys.query_store_query_text: %v", err)
@@ -158,7 +237,11 @@ func TestFixtureQueryStoreFlush(t *testing.T) {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("query store marker did not appear within %s of flush", flushPollDeadline)
+			t.Fatalf("query store marker did not appear within %s, across %d polls and %d workload re-issues",
+				flushPollDeadline, attempt, attempt/flushReissueEvery)
+		}
+		if attempt > 0 && attempt%flushReissueEvery == 0 {
+			reissueWorkload(ctx, lab.Admin, loadQuery)
 		}
 		time.Sleep(flushPollDelay)
 	}
@@ -182,35 +265,7 @@ func (lab *Lab) QueryID(t *testing.T, marker string) int64 {
 	defer cancel()
 
 	load := strings.ReplaceAll(workloadScript, "{{MARKER}}", marker)
-	for i := 0; i < 5; i++ {
-		var count int
-		if err := lab.Admin.QueryRowContext(ctx, load).Scan(&count); err != nil {
-			t.Fatalf("running marked workload %q: %v", marker, err)
-		}
-	}
-
-	if _, err := lab.Admin.ExecContext(ctx, "EXEC sys.sp_query_store_flush_db"); err != nil {
-		t.Fatalf("sp_query_store_flush_db: %v", err)
-	}
-
-	findID := "SELECT q.query_id FROM sys.query_store_query_text AS qt " +
-		"JOIN sys.query_store_query AS q ON q.query_text_id = qt.query_text_id " +
-		"WHERE qt.query_sql_text LIKE '%' + @p1 + '%'"
-	deadline := time.Now().Add(flushPollDeadline)
-	for {
-		var id int64
-		err := lab.Admin.QueryRowContext(ctx, findID, marker).Scan(&id)
-		if err == nil {
-			return id
-		}
-		if !errors.Is(err, sql.ErrNoRows) {
-			t.Fatalf("polling for query_id of marker %q: %v", marker, err)
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("query store marker %q did not appear within %s of flush", marker, flushPollDeadline)
-		}
-		time.Sleep(flushPollDelay)
-	}
+	return queryIDForMarkerBatch(ctx, t, lab, marker, load)
 }
 
 // testBinaryOnce/testBinaryPath/testBinaryErr build this module's asq
