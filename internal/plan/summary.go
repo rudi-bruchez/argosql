@@ -302,9 +302,12 @@ func malformedXMLError(err error) error {
 // summaryTruncatedError builds the code-7 error Summarize returns when
 // the references or the warnings list was capped (fix 1's A3): the
 // design spec, line 101, states "incomplete collection yields code 7"
-// without a carve-out for plan --summary, and this project's own
-// twelve other End(false, ...) callers all reach a collection-limit
-// error the same way (internal/artifacts.Collector's own Row/breach).
+// without a carve-out for plan --summary. There is no other End(false,
+// ...) caller in this project to follow: the twelve others all pass
+// true, and the only other code-7 path is the Collector's own row and
+// byte breach, which raises the error itself rather than through a
+// completeness flag. This caller is the first, so the spec is the whole
+// argument and no in-repo precedent supports it.
 // The raw plan_xml artifact and every table's own rows/notices are
 // already written and recorded by the time this returns - a later
 // error never erases what a Sink already accepted (see
