@@ -55,14 +55,37 @@ func Parse(args []string) (Request, *Command, error) {
 			req.Explicit = explicit
 			return req, nil, &model.PublicError{Code: 2, Kind: "flag", Message: "empty flag name"}
 		}
+
+		// Fix 1's A7 (pending-fixes.md P1): "--flag=value" is cut on the
+		// FIRST "=" - not the last, so a value that itself contains "="
+		// (e.g. --object dbo.a=b, which arrives as its own separate
+		// token anyway, or a hypothetical --flag=a=b) keeps everything
+		// after that first sign - before name is ever looked up in the
+		// registry. The previous form looked up "top=5" itself and
+		// reported "unknown flag", which is false: --top exists, only
+		// the message was wrong, and an agent reading it would have
+		// dropped the flag instead of fixing its syntax.
+		var val string
+		hasInlineValue := false
+		if eq := strings.IndexByte(name, '='); eq >= 0 {
+			val = name[eq+1:]
+			name = name[:eq]
+			hasInlineValue = true
+		}
+
 		spec, ok := superset[name]
 		if !ok {
 			req.Explicit = explicit
 			return req, nil, flagError(name, "unknown flag")
 		}
 
-		var val string
-		if spec.Kind == FlagBool {
+		if hasInlineValue {
+			// "--no-truncate=false" must value false, not the
+			// FlagBool branch's usual forced "true": Validate still
+			// parses val as a bool below, so "--x=notabool" is still
+			// rejected the same way a separated "--x notabool" is.
+			i++
+		} else if spec.Kind == FlagBool {
 			val = "true"
 			i++
 		} else {

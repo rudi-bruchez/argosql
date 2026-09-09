@@ -27,17 +27,61 @@ var (
 	queryPlans2022 string
 )
 
-// QueryTable is "qs query"'s first table: one query's identity (design
+// QueryWindowTable is "qs query"'s header table, emitted before
+// QueryTable - fix 1's A1, mirroring top.go's own TopRankingTable
+// (see its doc comment for the same reasoning applied here): the
+// design spec's declared table order for "qs query" (line 103) names
+// only "query, plans", written before TopRankingTable existed either.
+// Placed first, not appended last or folded into QueryTable's own
+// seven columns, for the same header-before-data idiom Top already
+// established in this package: a reader who has already learned that
+// "qs top" discloses its window before its ranking rows should not
+// have to learn a second convention for "qs query".
+//
+// This exists because query.go used to read coverage.sql's two cells
+// and then discard them outright (`_ = oldestCell; _ = newestCell`) -
+// design spec line 73's disclosure requirement ("Disclose the
+// requested window and actual interval coverage") was read, computed,
+// and then thrown away rather than genuinely unimplemented. Measured
+// by two independent reviewers, on both engines, with a window
+// strictly inside coverage: no date ever reached the Sink.
+//
+// coverage_oldest/coverage_newest are nullable exactly like
+// TopRankingTable's own columns: a database with no stored interval at
+// all reports both NULL, never an invented window. Design spec line
+// 73's second half ("boundary intervals are not prorated or claimed to
+// be exact per-execution filtering") is not something this table's
+// shape can express - it is a fact about the SQL underneath, stated
+// here in prose because that is where the spec itself puts it: the
+// half-open window [requested_since, requested_until) selects whole
+// runtime-stats intervals whose own bounds straddle the requested
+// edges, never a per-execution timestamp, so a plan's reported
+// totals/averages can include (or exclude) executions that happened
+// on the far side of requested_since/requested_until, within the same
+// interval.
+var QueryWindowTable = model.TableSpec{
+	Name: "window",
+	Columns: []model.Column{
+		{Name: "requested_since", SQLType: "DATETIMEOFFSET"},
+		{Name: "requested_until", SQLType: "DATETIMEOFFSET"},
+		{Name: "coverage_oldest", SQLType: "DATETIMEOFFSET"},
+		{Name: "coverage_newest", SQLType: "DATETIMEOFFSET"},
+	},
+}
+
+// QueryTable is "qs query"'s second table: one query's identity (design
 // spec: "qs query <query_id>": "Identity, parent object when visible,
 // SQL preview and full-text artifact..."). internal/cli's registry
 // uses this exact TableSpec as "qs query"'s declared Command.Tables,
 // so help's advertised schema and what Query actually writes can never
 // drift apart.
 //
-// parent_module is nullable: NULL for an ad-hoc query (object_id = 0)
-// and also NULL for a query compiled inside a module the current
-// principal cannot see in the catalog right now (a warning notice
-// covers that second case - see Query's own doc comment). query_hash
+// parent_module is nullable: NULL for an ad-hoc query (object_id = 0) -
+// legitimately absent, properties_complete stays true - and also NULL
+// for a query compiled inside a module the current principal cannot
+// see in the catalog right now, or that no longer exists (a warning
+// notice covers that second case, and properties_complete goes false
+// with it - see Query's own doc comment and fix 1's A2). query_hash
 // is query.sql's own binary(8) column, rendered by
 // internal/output.ScanRow as a "0x"-prefixed hex string, like every
 // other VARBINARY/BINARY cell in this project. text_preview carries
@@ -183,40 +227,65 @@ func Query(ctx context.Context, s *sqlserver.Session, opts QueryOptions, dst mod
 	}
 
 	// parent_module: NULL for an ad-hoc query (object_id = 0, design
-	// spec's own stated default - never attempted to resolve). For a
+	// spec's own stated default - never attempted to resolve, and a
+	// legitimate absence: propertiesComplete stays true below). For a
 	// query that does belong to a module, the LEFT JOIN in query.sql
 	// may still have found nothing - the module is no longer visible to
-	// the current principal, or was dropped - in which case Go reports
-	// parent_module = NULL plus a warning notice rather than failing
-	// the whole command (design spec: "qs query | 0; parent name may be
-	// unavailable").
+	// the current principal, or was dropped, and query.sql's catalog
+	// read cannot tell the two apart any more than sqlserver.Resolve
+	// can (fix 1's A4: the notice below says so, rather than asserting
+	// the narrower "not visible") - in which case Go reports
+	// parent_module = NULL, propertiesComplete = false (fix 1's A2, so
+	// Render's own model.ReasonPropertyUnavailable reaches
+	// omitted_reasons instead of a silent properties_complete=true
+	// lie), and a warning notice, rather than failing the whole command
+	// (design spec: "qs query | 0; parent name may be unavailable").
 	var parentModule model.Cell
+	propertiesComplete := true
 	if objectID != 0 {
 		schema, schemaOK := cells[colQParentSchema].(string)
 		name, nameOK := cells[colQParentName].(string)
 		if schemaOK && nameOK {
 			parentModule = schema + "." + name
 		} else {
+			propertiesComplete = false
 			dst.Notice(model.Notice{
 				Kind:    "parent_module_unavailable",
-				Message: fmt.Sprintf("query %d: parent module (object_id %d) is not visible to the current principal", queryID, objectID),
+				Message: fmt.Sprintf("query %d: parent module (object_id %d) not found or not visible to the current principal", queryID, objectID),
 				Table:   QueryTable.Name,
 			})
 		}
-	}
-
-	textArtifact, err := dst.File("query_sql_text", ".sql", strings.NewReader(querySQLText))
-	if err != nil {
-		return err
 	}
 
 	oldestCell, newestCell, oldest, newest, err := readCoverage(ctx, s)
 	if err != nil {
 		return err
 	}
-	_ = oldestCell
-	_ = newestCell
 	emitQueryStoreNotices(dst, QueryTable.Name, health, opts.Window, oldest, newest)
+
+	// Fix 1's A1: QueryWindowTable discloses the requested window and
+	// actual interval coverage - design spec line 73 - before QueryTable,
+	// the same header-before-data order Top uses for TopRankingTable.
+	if err := dst.Begin(QueryWindowTable); err != nil {
+		return err
+	}
+	windowRow := []model.Cell{
+		formatDateTimeOffset(opts.Window.Since),
+		formatDateTimeOffset(opts.Window.Until),
+		oldestCell,
+		newestCell,
+	}
+	if err := dst.Row(windowRow); err != nil {
+		return err
+	}
+	if err := dst.End(true, true); err != nil {
+		return err
+	}
+
+	textArtifact, err := dst.File("query_sql_text", ".sql", strings.NewReader(querySQLText))
+	if err != nil {
+		return err
+	}
 
 	if err := dst.Begin(QueryTable); err != nil {
 		return err
@@ -233,26 +302,23 @@ func Query(ctx context.Context, s *sqlserver.Session, opts QueryOptions, dst mod
 	if err := dst.Row(queryRow); err != nil {
 		return err
 	}
-	if err := dst.End(true, true); err != nil {
-		return err
-	}
-
-	plans, err := queryRows(ctx, s.Conn, plansQueryFor(s.Major),
-		sql.Named("id", opts.ID),
-		sql.Named("since", opts.Window.Since),
-		sql.Named("until", opts.Window.Until),
-	)
-	if err != nil {
+	if err := dst.End(true, propertiesComplete); err != nil {
 		return err
 	}
 
 	if err := dst.Begin(PlansTable); err != nil {
 		return err
 	}
-	for _, row := range plans {
-		if err := dst.Row(row); err != nil {
-			return err
-		}
+	// queryRows streams straight into dst; QueryTable above must
+	// already be written and closed, since a Sink only ever holds one
+	// table open at a time (fix 1's A3: no more accumulating the full
+	// plan set into a slice first).
+	if err := queryRows(ctx, s.Conn, plansQueryFor(s.Major), dst,
+		sql.Named("id", opts.ID),
+		sql.Named("since", opts.Window.Since),
+		sql.Named("until", opts.Window.Until),
+	); err != nil {
+		return err
 	}
 	return dst.End(true, true)
 }

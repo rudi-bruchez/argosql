@@ -33,7 +33,18 @@ import (
 // is computed once per test binary, not once per Lab: several Labs created
 // in the same run share it, which is what makes a single audit command
 // enough for the whole run.
-var testRunID = randomHex(6)
+//
+// ASQ_TEST_RUN_ID overrides the random default - fix 1's A6: a parent
+// process that builds and runs this package's own test binary as a
+// child subprocess (TestSignalInterruptRemovesContainer) needs to know
+// the child's run ID in advance to filter on it, which a purely random
+// value computed inside the child would never let it do.
+var testRunID = func() string {
+	if v := os.Getenv("ASQ_TEST_RUN_ID"); v != "" {
+		return v
+	}
+	return randomHex(6)
+}()
 
 // readyTimeout bounds the whole polling loop that waits for a freshly
 // started container's SQL Server to accept connections. bootstrapTimeout
@@ -541,15 +552,20 @@ func TestCleanupRemovesByID(t *testing.T) {
 
 // TestSignalInterruptRemovesContainer reproduces, in-process, the defect
 // TestMain's signal handler exists to fix: it builds this package's own
-// test binary, runs it as a subprocess with ASQ_TEST_IMAGE set, waits
-// (bounded, polling, never a fixed sleep) for that child to have actually
-// created a labeled container, sends it SIGINT, and asserts that no
-// container carrying io.argosql.test survives once the child has exited.
+// test binary, runs it as a subprocess with ASQ_TEST_IMAGE and a known,
+// unique ASQ_TEST_RUN_ID set, waits (bounded, polling, never a fixed
+// sleep) for that child to have actually created a container carrying
+// that exact run ID, sends it SIGINT, and asserts that no container
+// carrying it survives once the child has exited.
 //
-// This assumes nothing else on the host is concurrently running this same
-// suite (the baseline check below enforces that, rather than silently
-// trusting it): this package's own tests are always run one process at a
-// time, never fanned out in parallel against a shared Podman host.
+// Fix 1's A6: this used to filter on the bare "io.argosql.test" label,
+// with no run ID - which made it fail whenever ANY other container
+// anywhere carried that label, including another concurrent run of this
+// same suite's own containers. Measured by two independent reviewers at
+// once, each breaking the other's run without realizing it. Filtering
+// on childRunID, generated here and handed to the child, means this
+// test's own correctness no longer depends on being the only thing
+// using Podman on the host.
 func TestSignalInterruptRemovesContainer(t *testing.T) {
 	image := os.Getenv("ASQ_TEST_IMAGE")
 	if image == "" {
@@ -562,9 +578,8 @@ func TestSignalInterruptRemovesContainer(t *testing.T) {
 		t.Fatalf("go not found on PATH: %v", err)
 	}
 
-	if before := podmanContainerIDs(t, "label=io.argosql.test"); len(before) != 0 {
-		t.Fatalf("containers already carry io.argosql.test before the child process even starts (another run concurrent with this one?): %v", before)
-	}
+	childRunID := "sigdrill-" + randomHex(6)
+	childLabelFilter := "label=io.argosql.test=" + childRunID
 
 	moduleRoot, err := exec.Command("go", "list", "-m", "-f", "{{.Dir}}").Output()
 	if err != nil {
@@ -581,7 +596,7 @@ func TestSignalInterruptRemovesContainer(t *testing.T) {
 	}
 
 	cmd := exec.Command(binPath, "-test.run=TestSessionTLS", "-test.count=1", "-test.v")
-	cmd.Env = append(os.Environ(), "ASQ_TEST_IMAGE="+image)
+	cmd.Env = append(os.Environ(), "ASQ_TEST_IMAGE="+image, "ASQ_TEST_RUN_ID="+childRunID)
 	var childOut strings.Builder
 	cmd.Stdout = &childOut
 	cmd.Stderr = &childOut
@@ -594,14 +609,14 @@ func TestSignalInterruptRemovesContainer(t *testing.T) {
 	var childContainers []string
 	deadline := time.Now().Add(60 * time.Second)
 	for {
-		childContainers = podmanContainerIDs(t, "label=io.argosql.test")
+		childContainers = podmanContainerIDs(t, childLabelFilter)
 		if len(childContainers) > 0 {
 			break
 		}
 		if time.Now().After(deadline) {
 			cmd.Process.Kill()
 			cmd.Wait()
-			t.Fatalf("child process never created a labeled container within 60s; child output:\n%s", childOut.String())
+			t.Fatalf("child process never created a container labeled %q within 60s; child output:\n%s", childLabelFilter, childOut.String())
 		}
 		time.Sleep(300 * time.Millisecond)
 	}
@@ -621,7 +636,7 @@ func TestSignalInterruptRemovesContainer(t *testing.T) {
 		t.Fatalf("child process did not exit within 30s of SIGINT; child output:\n%s", childOut.String())
 	}
 
-	after := podmanContainerIDs(t, "label=io.argosql.test")
+	after := podmanContainerIDs(t, childLabelFilter)
 	if len(after) != 0 {
 		// This test just proved the orphan the handler is supposed to
 		// prevent; do not also leave it behind.

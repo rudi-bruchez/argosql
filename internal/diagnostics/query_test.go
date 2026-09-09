@@ -71,6 +71,7 @@ type fakeQueryConn struct {
 	plans     [][]driver.Value
 	plansErr  error
 	plansArgs []driver.NamedValue
+	plansRows *fakeStaticRows // set by QueryContext, for TestQueryRowsStreamsWithoutAccumulating to inspect how far it advanced
 }
 
 func (c *fakeQueryConn) Prepare(query string) (driver.Stmt, error) {
@@ -101,7 +102,8 @@ func (c *fakeQueryConn) QueryContext(ctx context.Context, query string, args []d
 		if c.plansErr != nil {
 			return nil, c.plansErr
 		}
-		return &fakeStaticRows{cols: plansColumns, types: plansTypes, data: c.plans}, nil
+		c.plansRows = &fakeStaticRows{cols: plansColumns, types: plansTypes, data: c.plans}
+		return c.plansRows, nil
 	}
 }
 
@@ -146,8 +148,9 @@ type queryCaptureSink struct {
 }
 
 type queryCapturedTable struct {
-	spec model.TableSpec
-	rows [][]model.Cell
+	spec                                   model.TableSpec
+	rows                                   [][]model.Cell
+	collectionComplete, propertiesComplete bool
 }
 
 type queryCapturedFile struct {
@@ -166,10 +169,12 @@ func (s *queryCaptureSink) Row(row []model.Cell) error {
 	s.cur.rows = append(s.cur.rows, row)
 	return nil
 }
-func (s *queryCaptureSink) End(bool, bool) error {
+func (s *queryCaptureSink) End(collectionComplete, propertiesComplete bool) error {
 	if s.cur == nil {
 		return fmt.Errorf("queryCaptureSink: End called with no open table")
 	}
+	s.cur.collectionComplete = collectionComplete
+	s.cur.propertiesComplete = propertiesComplete
 	s.tables = append(s.tables, *s.cur)
 	s.cur = nil
 	return nil
@@ -222,6 +227,21 @@ func defaultWindow() Window {
 // it. Both TableSpecs must declare exactly what the brief's prose, not
 // its SQL sketch, requires.
 func TestQueryTableColumns(t *testing.T) {
+	wantWindow := []model.Column{
+		{Name: "requested_since", SQLType: "DATETIMEOFFSET"},
+		{Name: "requested_until", SQLType: "DATETIMEOFFSET"},
+		{Name: "coverage_oldest", SQLType: "DATETIMEOFFSET"},
+		{Name: "coverage_newest", SQLType: "DATETIMEOFFSET"},
+	}
+	if len(QueryWindowTable.Columns) != len(wantWindow) {
+		t.Fatalf("QueryWindowTable: got %d columns, want %d: %+v", len(QueryWindowTable.Columns), len(wantWindow), QueryWindowTable.Columns)
+	}
+	for i, want := range wantWindow {
+		if QueryWindowTable.Columns[i] != want {
+			t.Fatalf("QueryWindowTable.Columns[%d]: got %+v, want %+v", i, QueryWindowTable.Columns[i], want)
+		}
+	}
+
 	wantQuery := []model.Column{
 		{Name: "query_id", SQLType: "BIGINT"},
 		{Name: "object_id", SQLType: "INT"},
@@ -299,19 +319,41 @@ func TestQueryNotFound(t *testing.T) {
 // result"). object_id = 0 here (ad hoc), so parent_module must stay nil
 // with no warning notice about it.
 func TestQueryInternalQuerySucceeds(t *testing.T) {
+	win := defaultWindow()
 	conn := &fakeQueryConn{
 		identityRow: []driver.Value{int64(42), int64(0), nil, nil, true, []byte{1, 2, 3, 4, 5, 6, 7, 8}, "SELECT 1"},
 	}
 	sess := newFakeQuerySession(t, conn)
 	sink := &queryCaptureSink{}
 
-	if err := Query(context.Background(), sess, QueryOptions{ID: 42, Window: defaultWindow()}, sink); err != nil {
+	if err := Query(context.Background(), sess, QueryOptions{ID: 42, Window: win}, sink); err != nil {
 		t.Fatalf("Query: %v", err)
+	}
+
+	// Fix 1's A1: the window table is published (requested_since/until,
+	// plus coverage_oldest/newest - nil here, fakeCoverageRows' own "no
+	// stored interval at all" default), never read and discarded.
+	winTbl := sink.table(QueryWindowTable.Name)
+	if winTbl == nil || len(winTbl.rows) != 1 {
+		t.Fatalf("window table missing or wrong row count: %+v", sink.tables)
+	}
+	winRow := winTbl.rows[0]
+	if got, ok := winRow[0].(string); !ok || got != formatDateTimeOffset(win.Since) {
+		t.Fatalf("requested_since: got %#v, want %q", winRow[0], formatDateTimeOffset(win.Since))
+	}
+	if got, ok := winRow[1].(string); !ok || got != formatDateTimeOffset(win.Until) {
+		t.Fatalf("requested_until: got %#v, want %q", winRow[1], formatDateTimeOffset(win.Until))
+	}
+	if winRow[2] != nil || winRow[3] != nil {
+		t.Fatalf("coverage_oldest/newest: got %#v/%#v, want nil/nil (no stored interval)", winRow[2], winRow[3])
 	}
 
 	tbl := sink.table(QueryTable.Name)
 	if tbl == nil || len(tbl.rows) != 1 {
 		t.Fatalf("query table missing or wrong row count: %+v", sink.tables)
+	}
+	if !tbl.propertiesComplete {
+		t.Fatalf("propertiesComplete: got false, want true (ad-hoc query, no parent module to fail to resolve)")
 	}
 	row := tbl.rows[0]
 	if got, ok := row[0].(int64); !ok || got != 42 {
@@ -344,12 +386,20 @@ func TestQueryParentModuleUnavailable(t *testing.T) {
 		t.Fatalf("Query: %v", err)
 	}
 
-	row := sink.table(QueryTable.Name).rows[0]
+	tbl := sink.table(QueryTable.Name)
+	row := tbl.rows[0]
 	if row[1] != int64(55) {
 		t.Fatalf("object_id: got %#v, want int64(55)", row[1])
 	}
 	if row[2] != nil {
 		t.Fatalf("parent_module: got %#v, want nil (unresolvable)", row[2])
+	}
+	// Fix 1's A2: propertiesComplete must go false here, or Render's
+	// model.ReasonPropertyUnavailable never reaches omitted_reasons and
+	// a consumer reading properties_complete=true is told the identity
+	// is fully known when it is not.
+	if tbl.propertiesComplete {
+		t.Fatalf("propertiesComplete: got true, want false (parent module unresolvable)")
 	}
 	notice := sink.noticeWithKind("parent_module_unavailable")
 	if notice == nil {
@@ -357,6 +407,13 @@ func TestQueryParentModuleUnavailable(t *testing.T) {
 	}
 	if !strings.Contains(notice.Message, "55") {
 		t.Fatalf("notice does not name the object_id: %q", notice.Message)
+	}
+	// Fix 1's A4: the message must not assert the narrower "not
+	// visible" when the catalog cannot distinguish that from "no
+	// longer exists" - the same not_found_or_not_visible discipline
+	// sqlserver.Resolve already follows.
+	if !strings.Contains(notice.Message, "not found or not visible") {
+		t.Fatalf("notice asserts a narrower cause than the catalog can prove: %q", notice.Message)
 	}
 }
 
@@ -374,9 +431,13 @@ func TestQueryParentModuleResolved(t *testing.T) {
 		t.Fatalf("Query: %v", err)
 	}
 
-	row := sink.table(QueryTable.Name).rows[0]
+	tbl := sink.table(QueryTable.Name)
+	row := tbl.rows[0]
 	if got, ok := row[2].(string); !ok || got != "dbo.SomeProc" {
 		t.Fatalf("parent_module: got %#v, want %q", row[2], "dbo.SomeProc")
+	}
+	if !tbl.propertiesComplete {
+		t.Fatalf("propertiesComplete: got false, want true (parent module resolved)")
 	}
 	if notice := sink.noticeWithKind("parent_module_unavailable"); notice != nil {
 		t.Fatalf("unexpected parent_module_unavailable notice for a resolved module: %+v", notice)
@@ -494,6 +555,61 @@ func TestQueryPlansPermissionErrorNotSwallowed(t *testing.T) {
 	}
 	if plans := sink.table(PlansTable.Name); plans != nil {
 		t.Fatalf("plans table was written despite the permission error: %+v", plans)
+	}
+}
+
+// refusingPlansSink wraps queryCaptureSink but refuses the very first
+// Row call made once the "plans" table is open - used only by
+// TestQueryRowsStreamsWithoutAccumulating to prove queryRows (top.go)
+// never reads a second row off the wire once the Sink has already
+// refused the first (fix 1's A3: it used to accumulate every row into
+// a slice before the Sink ever saw one).
+type refusingPlansSink struct {
+	queryCaptureSink
+	refused bool
+}
+
+func (s *refusingPlansSink) Row(row []model.Cell) error {
+	if s.cur != nil && s.cur.spec.Name == PlansTable.Name && !s.refused {
+		s.refused = true
+		return fmt.Errorf("refusingPlansSink: refused the first plans row")
+	}
+	return s.queryCaptureSink.Row(row)
+}
+
+// TestQueryRowsStreamsWithoutAccumulating is fix 1's A3 regression
+// check: with five fake plan rows queued and a Sink that refuses the
+// very first one, queryRows must stop at that first row - the
+// underlying driver.Rows must never have been asked for a second one.
+// Before the fix, queryRows read every row into a slice before handing
+// any of them to the Sink, so this fake driver's Next would have been
+// called five times regardless of what the Sink did with the first.
+func TestQueryRowsStreamsWithoutAccumulating(t *testing.T) {
+	conn := &fakeQueryConn{
+		identityRow: []driver.Value{int64(13), int64(0), nil, nil, false, []byte{0, 0, 0, 0, 0, 0, 0, 7}, "SELECT 7"},
+		plans: [][]driver.Value{
+			{int64(1), nil, false, int64(1), float64(1), float64(1), float64(1), float64(1), float64(1), float64(1)},
+			{int64(2), nil, false, int64(1), float64(1), float64(1), float64(1), float64(1), float64(1), float64(1)},
+			{int64(3), nil, false, int64(1), float64(1), float64(1), float64(1), float64(1), float64(1), float64(1)},
+			{int64(4), nil, false, int64(1), float64(1), float64(1), float64(1), float64(1), float64(1), float64(1)},
+			{int64(5), nil, false, int64(1), float64(1), float64(1), float64(1), float64(1), float64(1), float64(1)},
+		},
+	}
+	sess := newFakeQuerySession(t, conn)
+	sink := &refusingPlansSink{}
+
+	err := Query(context.Background(), sess, QueryOptions{ID: 13, Window: defaultWindow()}, sink)
+	if err == nil {
+		t.Fatal("Query: got nil error, want the Sink's own refusal to propagate")
+	}
+	if !sink.refused {
+		t.Fatal("the plans Sink was never even asked to accept a row")
+	}
+	if conn.plansRows == nil {
+		t.Fatal("the plans query was never issued")
+	}
+	if conn.plansRows.idx != 1 {
+		t.Fatalf("driver.Rows advanced %d rows before the Sink's refusal stopped it, want exactly 1 (no accumulation)", conn.plansRows.idx)
 	}
 }
 

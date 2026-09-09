@@ -486,9 +486,10 @@ func qsQueryCommand() Command {
 			"VIEW DATABASE PERFORMANCE STATE (2022+; implied by VIEW DATABASE STATE)",
 		},
 		Versions: []string{"2019", "2022"},
-		// query first, plans second: the design spec's declared table
-		// order ("qs query": query, plans).
-		Tables: []model.TableSpec{diagnostics.QueryTable, diagnostics.PlansTable},
+		// window first (fix 1's A1: same header-before-data order as
+		// "qs top"'s ranking table, which predates the design spec's
+		// own declared table order for "qs query": query, plans).
+		Tables: []model.TableSpec{diagnostics.QueryWindowTable, diagnostics.QueryTable, diagnostics.PlansTable},
 		Flags: []Flag{
 			{Name: "hours", Kind: FlagInt64, Default: int64(24), Min: 1, Max: math.MaxInt64, ExclusiveWith: []string{"since", "until"}},
 			{Name: "since", Kind: FlagString, ExclusiveWith: []string{"hours"}},

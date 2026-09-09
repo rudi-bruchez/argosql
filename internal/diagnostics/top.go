@@ -341,17 +341,6 @@ func Top(ctx context.Context, s *sqlserver.Session, opts TopOptions, dst model.S
 	// own placeholder unresolved, exactly as measured against a real
 	// server (SQL Server reports it as an undeclared scalar variable).
 	query := strings.ReplaceAll(topQueryFor(s.Major), OrderPlaceholder, orderColumn)
-	rows, err := queryRows(ctx, s.Conn, query,
-		sql.Named("since", opts.Window.Since),
-		sql.Named("until", opts.Window.Until),
-		sql.Named("include_internal", opts.IncludeInternal),
-		sql.Named("object_id", objectID),
-		sql.Named("min_executions", opts.MinExecutions),
-		sql.Named("top", opts.Top),
-	)
-	if err != nil {
-		return err
-	}
 
 	// See emitQueryStoreNotices' own doc comment for why these four
 	// facts are independent and never substitute for one another.
@@ -382,10 +371,18 @@ func Top(ctx context.Context, s *sqlserver.Session, opts TopOptions, dst model.S
 	if err := dst.Begin(TopQueriesTable); err != nil {
 		return err
 	}
-	for _, row := range rows {
-		if err := dst.Row(row); err != nil {
-			return err
-		}
+	// queryRows streams straight into dst; the ranking table above must
+	// still be written and closed first, since a Sink only ever holds
+	// one table open at a time.
+	if err := queryRows(ctx, s.Conn, query, dst,
+		sql.Named("since", opts.Window.Since),
+		sql.Named("until", opts.Window.Until),
+		sql.Named("include_internal", opts.IncludeInternal),
+		sql.Named("object_id", objectID),
+		sql.Named("min_executions", opts.MinExecutions),
+		sql.Named("top", opts.Top),
+	); err != nil {
+		return err
 	}
 	return dst.End(true, true)
 }
@@ -411,34 +408,42 @@ func topQueryFor(major int) string {
 func TopQuerySQL(major int) string { return topQueryFor(major) }
 
 // queryRows runs query (optionally parameterized, e.g. with sql.Named
-// values) and scans every returned row through output.ScanRow - the
-// same sanctioned SQL-value-to-model.Cell conversion queryOneRow (see
-// info.go) uses for its single row. Zero rows is not an error: a nil
-// slice, nil error.
-func queryRows(ctx context.Context, conn *sql.Conn, query string, args ...any) ([][]model.Cell, error) {
+// values) and streams every returned row straight to dst.Row as it is
+// scanned through output.ScanRow - the same sanctioned
+// SQL-value-to-model.Cell conversion queryOneRow (see info.go) uses for
+// its single row. It never accumulates the result set into a slice
+// first (design spec: "Stream table exports; never accumulate the full
+// result set solely to produce a preview") - fix 1 measured that the
+// previous accumulating form let a Sink that refused row 1 still pull
+// every one of 20,000 rows off the wire first, a cost qs top's own
+// bounded TOP(@top) always hid. The caller must already have called
+// dst.Begin for the table these rows belong to; zero rows is not an
+// error.
+func queryRows(ctx context.Context, conn *sql.Conn, query string, dst model.Sink, args ...any) error {
 	rows, err := conn.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, classifyQueryError(err, "ranking query failed")
+		return classifyQueryError(err, "ranking query failed")
 	}
 	defer rows.Close()
 
 	var types []*sql.ColumnType
-	var result [][]model.Cell
 	for rows.Next() {
 		if types == nil {
 			types, err = rows.ColumnTypes()
 			if err != nil {
-				return nil, &model.PublicError{Code: 5, Kind: "execution", Message: fmt.Sprintf("reading column types: %s", err.Error())}
+				return &model.PublicError{Code: 5, Kind: "execution", Message: fmt.Sprintf("reading column types: %s", err.Error())}
 			}
 		}
 		cells, err := output.ScanRow(rows, types)
 		if err != nil {
-			return nil, &model.PublicError{Code: 5, Kind: "execution", Message: fmt.Sprintf("scanning ranking row: %s", err.Error())}
+			return &model.PublicError{Code: 5, Kind: "execution", Message: fmt.Sprintf("scanning ranking row: %s", err.Error())}
 		}
-		result = append(result, cells)
+		if err := dst.Row(cells); err != nil {
+			return err
+		}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, classifyQueryError(err, "reading ranking rows")
+		return classifyQueryError(err, "reading ranking rows")
 	}
-	return result, nil
+	return nil
 }

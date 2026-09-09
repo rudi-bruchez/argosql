@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rudi-bruchez/argosql/internal/config"
 	"github.com/rudi-bruchez/argosql/internal/model"
 )
 
@@ -327,31 +328,68 @@ func (lab *Lab) ensurePrincipals(t *testing.T) principalPasswords {
 	return lab.secrets
 }
 
+// labRunContextName is the one profile name every temporary YAML
+// config.yaml buildChildConfigAndEnv writes declares.
+const labRunContextName = "lab"
+
+// labRunSecretEnv is the one environment variable name Lab.Run's
+// temporary profile names via password_env, and the one name the
+// child's environment ever carries a secret under.
+const labRunSecretEnv = "ASQ_LAB_SECRET"
+
 // labRunEnv builds the environment slice Lab.Run's child process
-// receives: the parent's own os.Environ() plus exactly one KEY=VALUE
-// entry carrying secret under secretEnv. Factored out of Run itself so
-// TestLabRunOnlyInjectsRequestedSecret can assert directly on what Run
-// actually constructs, without a container, a subprocess, or the asq
-// binary: the other two secrets a caller might hold are never read
-// here at all, by construction - not merely by convention - which is
-// exactly the property that test proves. Only this principal's own
-// secret ever becomes an environment variable in the first place
-// (randomPassword generates the other two as plain Go strings, never
-// exported anywhere), so inheriting the parent's own os.Environ()
-// cannot leak them either.
+// receives: EXACTLY one KEY=VALUE entry, secretEnv=secret, and nothing
+// else - fix 1's A5. It used to be the parent's own os.Environ() plus
+// that one entry; measured with three distinct fake secrets and two of
+// them placed in two otherwise-ordinary inherited variables, the child
+// launched for a THIRD principal received all three, because
+// inheriting the parent's environment is exactly as safe as trusting
+// every variable already sitting in it, which this harness cannot
+// promise for code the tâche 15 matrices will run under. The asq
+// binary itself needs nothing else from the environment to run: every
+// path this test package ever gives it (--config, --out-dir) is
+// already absolute and explicit, so there is no PATH lookup, no
+// $HOME-relative default, and no other inherited variable for it to
+// depend on.
 func labRunEnv(secretEnv, secret string) []string {
-	return append(os.Environ(), secretEnv+"="+secret)
+	return []string{secretEnv + "=" + secret}
+}
+
+// buildChildConfigAndEnv is Lab.Run's own profile/environment
+// construction, factored out so it can be exercised without a real
+// container or the real asq binary: it takes pw directly rather than
+// calling ensurePrincipals itself, which is what lets
+// TestLabRunOnlyInjectsRequestedSecret observe the REAL child process
+// and its REAL YAML file (fix 1's A5: "le test doit observer l'ENFANT,
+// pas la fonction qui prépare son environnement") with a synthetic,
+// container-free principalPasswords.
+func buildChildConfigAndEnv(t *testing.T, profile config.Profile, pw principalPasswords, principal string) (configPath string, env []string) {
+	t.Helper()
+	secret, ok := pw.secretFor(principal)
+	if !ok {
+		t.Fatalf("buildChildConfigAndEnv: unknown principal %q (want Q, I or S)", principal)
+	}
+	username := principalUsername(principal)
+
+	configPath = filepath.Join(t.TempDir(), "config.yaml")
+	configContent := fmt.Sprintf(
+		"profiles:\n  %s:\n    host: %q\n    port: %d\n    username: %q\n    password_env: %s\n    database: %q\n    trust_server_certificate: true\n",
+		labRunContextName, profile.Host, profile.Port, username, labRunSecretEnv, profile.Database,
+	)
+	if err := os.WriteFile(configPath, []byte(configContent), 0o600); err != nil {
+		t.Fatalf("buildChildConfigAndEnv: writing temporary profile: %v", err)
+	}
+	return configPath, labRunEnv(labRunSecretEnv, secret)
 }
 
 // Run writes a temporary profile naming principal's own context,
 // injects ONLY that principal's own secret into the child process's
-// environment - never the other two ensurePrincipals holds, the one
-// property this method exists to guarantee, proven by
-// TestLabRunOnlyInjectsRequestedSecret below - and runs this module's
-// own asq binary (buildTestBinary, built once for the whole run) as a
-// real subprocess against it. No test in this package calls
-// internal/cli.Run directly: every one of them either calls
-// internal/diagnostics functions directly against a real
+// environment - never the other two ensurePrincipals holds, nor
+// anything inherited from this process's own environment (fix 1's A5) -
+// and runs this module's own asq binary (buildTestBinary, built once
+// for the whole run) as a real subprocess against it. No test in this
+// package calls internal/cli.Run directly: every one of them either
+// calls internal/diagnostics functions directly against a real
 // *sqlserver.Session (the existing convention throughout this
 // package: status_test.go, top_test.go and permissions_test.go all do
 // this), or, for the one thing only a real subprocess can prove - that
@@ -376,32 +414,15 @@ func (lab *Lab) Run(t *testing.T, principal string, args []string) (model.Result
 	bin := buildTestBinary(t)
 
 	pw := lab.ensurePrincipals(t)
-	secret, ok := pw.secretFor(principal)
-	if !ok {
-		t.Fatalf("Lab.Run: unknown principal %q (want Q, I or S)", principal)
-	}
-	username := principalUsername(principal)
-
-	const ctxName = "lab"
-	const secretEnv = "ASQ_LAB_SECRET"
-
-	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	configPath, env := buildChildConfigAndEnv(t, lab.Profile, pw, principal)
 	outDir := filepath.Join(t.TempDir(), "out")
 
-	configContent := fmt.Sprintf(
-		"profiles:\n  %s:\n    host: %q\n    port: %d\n    username: %q\n    password_env: %s\n    database: %q\n    trust_server_certificate: true\n",
-		ctxName, lab.Profile.Host, lab.Profile.Port, username, secretEnv, lab.Profile.Database,
-	)
-	if err := os.WriteFile(configPath, []byte(configContent), 0o600); err != nil {
-		t.Fatalf("Lab.Run: writing temporary profile: %v", err)
-	}
-
-	fullArgs := append([]string{"--format", "json", "--ctx", ctxName, "--config", configPath, "--out-dir", outDir}, args...)
+	fullArgs := append([]string{"--format", "json", "--ctx", labRunContextName, "--config", configPath, "--out-dir", outDir}, args...)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, bin, fullArgs...)
-	cmd.Env = labRunEnv(secretEnv, secret)
+	cmd.Env = env
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -425,17 +446,78 @@ func (lab *Lab) Run(t *testing.T, principal string, args []string) (model.Result
 	return result, code
 }
 
+// envProbeSource is a standalone Go program, built on demand by
+// TestLabRunOnlyInjectsRequestedSecret, whose only job is to print its
+// own os.Environ() - one line per entry - so that test can inspect
+// what a REAL child process, launched exactly the way Lab.Run launches
+// the real asq binary, actually received. Asserting on labRunEnv's
+// return value alone (the previous form of this test) only proves what
+// the function that BUILDS the environment intends; fix 1's reviewers
+// measured that this left a green test when Run itself was mutated to
+// inject all three secrets, or when the YAML carried one in a comment.
+const envProbeSource = `package main
+
+import (
+	"bufio"
+	"os"
+)
+
+func main() {
+	w := bufio.NewWriter(os.Stdout)
+	defer w.Flush()
+	for _, kv := range os.Environ() {
+		w.WriteString(kv)
+		w.WriteByte('\n')
+	}
+}
+`
+
+// buildEnvProbe compiles envProbeSource into a temporary binary and
+// returns its path. Built fresh (not memoized like buildTestBinary):
+// this probe is only ever used by one test, and compiling a
+// ten-line program costs a fraction of a second.
+func buildEnvProbe(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	srcPath := filepath.Join(dir, "envprobe.go")
+	if err := os.WriteFile(srcPath, []byte(envProbeSource), 0o600); err != nil {
+		t.Fatalf("buildEnvProbe: writing probe source: %v", err)
+	}
+	binPath := filepath.Join(dir, "envprobe")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "go", "build", "-o", binPath, srcPath)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("buildEnvProbe: building probe: %v\n%s", err, out)
+	}
+	return binPath
+}
+
 // TestLabRunOnlyInjectsRequestedSecret proves the one property
-// Lab.Run exists to guarantee: only the requested principal's own
-// secret ever reaches labRunEnv's result, never either of the other
-// two. It needs no container, no podman, and no ASQ_TEST_IMAGE at
-// all - labRunEnv reads only its own two string arguments, so a
-// synthetic principalPasswords fabricated right here exercises the
-// exact same code Lab.Run's real subprocess path calls, without
-// paying for one.
+// Lab.Run exists to guarantee, on the REAL child process and its REAL
+// YAML file, not on labRunEnv's return value alone (fix 1's A5): only
+// the requested principal's own secret ever reaches the child's
+// environment, and the YAML config.yaml carries never carries a secret
+// literal at all, under any of the three principals. It needs no
+// container, no podman, and no ASQ_TEST_IMAGE: buildChildConfigAndEnv
+// takes a synthetic principalPasswords directly, and envprobe - a real
+// compiled binary, launched exactly the way Lab.Run launches the real
+// asq binary - reports what it actually received.
 func TestLabRunOnlyInjectsRequestedSecret(t *testing.T) {
+	probe := buildEnvProbe(t)
 	pw := principalPasswords{Q: "qSecretValueXYZ", I: "iSecretValueXYZ", S: "sSecretValueXYZ"}
 	all := []string{pw.Q, pw.I, pw.S}
+	profile := config.Profile{Host: "127.0.0.1", Port: 14330, Database: "AppDB"}
+
+	// Reproduces the reviewers' own repro for A5, inside THIS process's
+	// environment: two ordinary, otherwise-unrelated variables happen to
+	// carry the OTHER two principals' secrets, exactly as an operator's
+	// shell or a CI job might leave lying around. A labRunEnv that still
+	// inherited os.Environ() would leak both into the child launched for
+	// a third principal; building the child's environment explicitly
+	// must not, regardless of what this process's own environment holds.
+	t.Setenv("ASQ_UNRELATED_I", pw.I)
+	t.Setenv("ASQ_UNRELATED_S", pw.S)
 
 	for _, principal := range []string{"Q", "I", "S"} {
 		t.Run(principal, func(t *testing.T) {
@@ -444,25 +526,48 @@ func TestLabRunOnlyInjectsRequestedSecret(t *testing.T) {
 				t.Fatalf("secretFor(%q): not ok", principal)
 			}
 
-			env := labRunEnv("ASQ_LAB_SECRET", secret)
+			configPath, env := buildChildConfigAndEnv(t, profile, pw, principal)
+
+			configBytes, err := os.ReadFile(configPath)
+			if err != nil {
+				t.Fatalf("reading the written YAML profile: %v", err)
+			}
+			for _, s := range all {
+				if strings.Contains(string(configBytes), s) {
+					t.Fatalf("%s: YAML profile %s carries a secret literal: %q", principal, configPath, configBytes)
+				}
+			}
+			if !strings.Contains(string(configBytes), "password_env: "+labRunSecretEnv) {
+				t.Fatalf("%s: YAML profile does not name password_env: %s", principal, configBytes)
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, probe)
+			cmd.Env = env
+			out, err := cmd.Output()
+			if err != nil {
+				t.Fatalf("running envprobe: %v", describeExecError(err))
+			}
+			childEnv := strings.Split(strings.TrimRight(string(out), "\n"), "\n")
 
 			matches := 0
-			for _, kv := range env {
+			for _, kv := range childEnv {
 				if strings.Contains(kv, secret) {
 					matches++
 				}
 			}
 			if matches != 1 {
-				t.Fatalf("%s: requested secret appears in %d env entries, want exactly 1: %v", principal, matches, env)
+				t.Fatalf("%s: the real child's environment carries the requested secret in %d entries, want exactly 1: %v", principal, matches, childEnv)
 			}
 
 			for _, other := range all {
 				if other == secret {
 					continue
 				}
-				for _, kv := range env {
+				for _, kv := range childEnv {
 					if strings.Contains(kv, other) {
-						t.Fatalf("%s: env leaks another principal's secret %q via entry %q", principal, other, kv)
+						t.Fatalf("%s: the real child's environment leaks another principal's secret %q via entry %q", principal, other, kv)
 					}
 				}
 			}

@@ -340,3 +340,68 @@ func TestParseRejectsHoursWithValidSinceUntilPair(t *testing.T) {
 	_, _, err := Parse([]string{"--ctx", "client", "qs", "top", "--hours", "5", "--since", "2026-01-01T00:00:00Z", "--until", "2026-01-02T00:00:00Z"})
 	publicErrorCode(t, err, 2)
 }
+
+// TestParseEqualsForm is fix 1's A7 / pending-fixes.md P1: a
+// pre-existing, registered flag must be recognized in "--flag=value"
+// form, not rejected with a message claiming it does not exist.
+// Measured before this fix: "--top=5" produced "flag: --top=5: unknown
+// flag" - the flag exists, only the message, and the parse itself,
+// were wrong.
+func TestParseEqualsForm(t *testing.T) {
+	t.Run("--top=5 resolves top, not an unknown-flag error", func(t *testing.T) {
+		req, _, err := Parse([]string{"--ctx", "client", "qs", "top", "--top=5"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if req.Top != 5 {
+			t.Fatalf("Top: got %d, want 5", req.Top)
+		}
+	})
+
+	// Constraint 1: a FlagBool written with "=" must take the value on
+	// the right, not the loop's usual forced "true" for a bare
+	// "--no-truncate".
+	t.Run("--no-truncate=false values false, not the usual forced true", func(t *testing.T) {
+		req, _, err := Parse([]string{"--ctx", "client", "info", "--no-truncate=false"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if req.NoTruncate {
+			t.Fatal("NoTruncate: got true, want false")
+		}
+	})
+
+	// Constraint 2: the duplicate-flag-with-conflicting-values rule
+	// must still fire when the separated and "=" forms are mixed.
+	t.Run("mixing separated and equals forms still catches a conflicting duplicate", func(t *testing.T) {
+		_, _, err := Parse([]string{"--ctx", "client", "qs", "top", "--top", "5", "--top=6"})
+		publicErrorCode(t, err, 2)
+	})
+
+	// Constraint 3: a value that itself contains "=" must survive
+	// intact when it arrives as its own separate token (never cut),
+	// and cutting the "=" form on the FIRST sign, not the last, must
+	// keep everything after it together when the value embeds one.
+	t.Run("a value containing its own equals sign survives both forms", func(t *testing.T) {
+		// dbo.a=b is a syntactically valid two-part name by this
+		// project's own splitter (splitIdentifierParts only treats "."
+		// and brackets specially; "=" is an ordinary character within a
+		// part) - sqlserver.Resolve would fail to find it against a
+		// real catalog, but Parse itself must not reject or mangle it.
+		req, _, err := Parse([]string{"--ctx", "client", "qs", "top", "--object", "dbo.a=b"})
+		if err != nil {
+			t.Fatalf("unexpected error (separated form): %v", err)
+		}
+		if req.Object != "dbo.a=b" {
+			t.Fatalf("Object: got %q, want %q (separated form, never cut apart)", req.Object, "dbo.a=b")
+		}
+
+		req2, _, err2 := Parse([]string{"--ctx", "client", "qs", "top", "--object=dbo.a=b"})
+		if err2 != nil {
+			t.Fatalf("unexpected error (equals form): %v", err2)
+		}
+		if req2.Object != "dbo.a=b" {
+			t.Fatalf("Object: got %q, want %q (cut on the first \"=\" only)", req2.Object, "dbo.a=b")
+		}
+	})
+}
