@@ -34,6 +34,7 @@ func TestIndexesUnresolvedNameReturnsEight(t *testing.T) {
 func TestIndexesCellValues(t *testing.T) {
 	conn := &fakeObjConn{responses: []objQueryResponse{
 		resolveFoundResponse(701, "dbo", "ColumnsFixture", "U"),
+		permProbeResponse(int64(1)), // VIEW DEFINITION allowed: filter not masked
 		indexesRowsResponse([][]driver.Value{
 			{int64(1), "PK_ColumnsFixture", "CLUSTERED", "[Id] ASC", nil, nil, true, false},
 			{int64(2), "IX_ColumnsFixture_Composite", "NONCLUSTERED", "[Quantity] DESC, [Price] ASC", "[Note]", nil, false, false},
@@ -89,7 +90,8 @@ func TestTableAndIndexesShareTheSameReader(t *testing.T) {
 
 	tableConn := &fakeObjConn{responses: []objQueryResponse{
 		resolveFoundResponse(801, "dbo", "Orders", "U"),
-		tableRowResponse(int64(2), nil),
+		tableRowResponse(int64(2), int64(1), int64(1), nil),
+		permProbeResponse(int64(1)), // VIEW DEFINITION allowed
 		columnsRowsResponse(nil),
 		indexesRowsResponse(indexRows),
 	}}
@@ -101,6 +103,7 @@ func TestTableAndIndexesShareTheSameReader(t *testing.T) {
 
 	indexesConn := &fakeObjConn{responses: []objQueryResponse{
 		resolveFoundResponse(801, "dbo", "Orders", "U"),
+		permProbeResponse(int64(1)), // VIEW DEFINITION allowed
 		indexesRowsResponse(indexRows),
 	}}
 	indexesSess := newFakeObjSession(t, indexesConn)
@@ -123,5 +126,30 @@ func TestTableAndIndexesShareTheSameReader(t *testing.T) {
 				t.Fatalf("row %d cell %d differs: Table=%#v Indexes=%#v", i, j, fromTable.rows[i][j], fromIndexes.rows[i][j])
 			}
 		}
+	}
+}
+
+// TestIndexesRejectsWrongObjectType is task 13 fix-1's own A0 target
+// for "idx list": design spec line 202, "A resolved object of the
+// wrong type gives code 2" - measured before this fix: idx list on a
+// procedure resolved and then succeeded with an empty result declared
+// complete instead of naming the type mismatch.
+func TestIndexesRejectsWrongObjectType(t *testing.T) {
+	conn := &fakeObjConn{responses: []objQueryResponse{
+		resolveFoundResponse(999, "dbo", "PlainModule", "P"),
+	}}
+	sess := newFakeObjSession(t, conn)
+	sink := &objCaptureSink{}
+
+	err := Indexes(context.Background(), sess, "dbo.PlainModule", sink)
+	var pub *model.PublicError
+	if !errors.As(err, &pub) {
+		t.Fatalf("Indexes: want *model.PublicError, got %#v", err)
+	}
+	if pub.Code != 2 || pub.Kind != "invalid_argument" {
+		t.Fatalf("Indexes on a procedure: want code 2/invalid_argument, got code %d/%s", pub.Code, pub.Kind)
+	}
+	if len(sink.tables) != 0 {
+		t.Fatalf("wrong object type: want no table written, got %#v", sink.tables)
 	}
 }

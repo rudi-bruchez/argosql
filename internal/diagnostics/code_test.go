@@ -103,20 +103,18 @@ func TestCodeEncrypted(t *testing.T) {
 	}
 }
 
-// TestCodeOnNonModuleObject is fix-0's own point 2: obj code called
-// on a non-module object (a table, most commonly) must report
-// definitionStateDefinitionUnavailable at code 4, never code 5.
-// Measured directly against a real engine (tests/integration) before
-// this fix: OBJECTPROPERTYEX(object_id(dbo.Orders),'IsEncrypted')
-// returns NULL, and Code used to fall into unexpectedCell's generic
-// execution failure (code 5, "unexpected value from
-// sys.database_query_store_options" - a message copied from a
-// different query entirely) instead of the closed vocabulary's own
-// default state.
+// TestCodeOnNonModuleObject is task 13 fix-1's own A0 target: design
+// spec line 202, "A resolved object of the wrong type gives code 2" -
+// the clause that settles this BEFORE moduleQuery ever runs. This
+// replaces fix-0's own decision (code 4, definitionStateDefinitionUnavailable),
+// which was itself a correction of an even earlier code 5
+// (unexpectedCell, when OBJECTPROPERTYEX(...,'IsEncrypted') read NULL
+// for a table) - both wrong, because the question is an argument
+// error, never a definitionState question, and settles before Code
+// ever reaches moduleQuery.
 func TestCodeOnNonModuleObject(t *testing.T) {
 	conn := &fakeObjConn{responses: []objQueryResponse{
 		resolveFoundResponse(606, "dbo", "Orders", "U"),
-		moduleRowResponse(true, nil, nil),
 	}}
 	sess := newFakeObjSession(t, conn)
 	sink := &objCaptureSink{}
@@ -126,8 +124,8 @@ func TestCodeOnNonModuleObject(t *testing.T) {
 	if !errors.As(err, &pub) {
 		t.Fatalf("Code: want *model.PublicError, got %#v", err)
 	}
-	if pub.Code != 4 || pub.Kind != definitionStateDefinitionUnavailable {
-		t.Fatalf("Code on a non-module object: want code 4/%s, got code %d/%s", definitionStateDefinitionUnavailable, pub.Code, pub.Kind)
+	if pub.Code != 2 || pub.Kind != "invalid_argument" {
+		t.Fatalf("Code on a non-module object: want code 2/invalid_argument, got code %d/%s", pub.Code, pub.Kind)
 	}
 	if len(sink.tables) != 0 {
 		t.Fatalf("non-module object: want no table row, got %#v", sink.tables)

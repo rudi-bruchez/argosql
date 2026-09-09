@@ -44,7 +44,8 @@ func TestTableUnresolvedNameReturnsEight(t *testing.T) {
 func TestTableWritesTableColumnsIndexesInOrderWithCellValues(t *testing.T) {
 	conn := &fakeObjConn{responses: []objQueryResponse{
 		resolveFoundResponse(501, "dbo", "Orders", "U"),
-		tableRowResponse(int64(42), nil),
+		tableRowResponse(int64(42), int64(10), int64(12), nil),
+		permProbeResponse(int64(1)), // VIEW DEFINITION allowed: columns/indexes properties complete
 		columnsRowsResponse([][]driver.Value{
 			{int64(1), "OrderId", "int", int64(4), int64(10), int64(0), false, true, false, nil, nil},
 			{int64(2), "Total", "decimal", int64(9), int64(10), int64(2), false, false, false, "((0))", nil},
@@ -76,6 +77,18 @@ func TestTableWritesTableColumnsIndexesInOrderWithCellValues(t *testing.T) {
 	}
 	if got := tableTbl.rows[0][3]; got != int64(42) {
 		t.Fatalf("table row_count cell: got %#v, want int64(42)", got)
+	}
+	// design spec lines 53/174: size table (and, sharing this same row,
+	// obj table) must expose the used/reserved/unused totals, not only
+	// the per-row allocation breakdown (task 13 fix-1).
+	if got := tableTbl.rows[0][4]; got != int64(10*pageBytes) {
+		t.Fatalf("table total_used_bytes cell: got %#v, want %d", got, int64(10*pageBytes))
+	}
+	if got := tableTbl.rows[0][5]; got != int64(12*pageBytes) {
+		t.Fatalf("table total_reserved_bytes cell: got %#v, want %d", got, int64(12*pageBytes))
+	}
+	if got := tableTbl.rows[0][6]; got != int64(2*pageBytes) {
+		t.Fatalf("table total_unused_bytes cell: got %#v, want %d (reserved-used)", got, int64(2*pageBytes))
 	}
 	if !tableTbl.propertiesComplete {
 		t.Fatal("table.propertiesComplete: want true when row count is available")
@@ -113,6 +126,7 @@ func TestTableDegradesWhenSizePermissionAbsent(t *testing.T) {
 	conn := &fakeObjConn{responses: []objQueryResponse{
 		resolveFoundResponse(501, "dbo", "Orders", "U"),
 		tableErrResponse(mssql.Error{Number: 229, Message: "denied"}),
+		permProbeResponse(int64(1)), // VIEW DEFINITION allowed: columns/indexes properties complete
 		columnsRowsResponse(nil),
 		indexesRowsResponse(nil),
 	}}
@@ -146,7 +160,8 @@ func TestTableDegradesWhenSizePermissionAbsent(t *testing.T) {
 func TestTableDegradesOnMemoryOptimized(t *testing.T) {
 	conn := &fakeObjConn{responses: []objQueryResponse{
 		resolveFoundResponse(777, "dbo", "MemTab", "U"),
-		tableRowResponse(nil, true),
+		tableRowResponse(nil, nil, nil, true),
+		permProbeResponse(int64(1)), // VIEW DEFINITION allowed: columns/indexes properties complete
 		columnsRowsResponse(nil),
 		indexesRowsResponse(nil),
 	}}
@@ -162,5 +177,75 @@ func TestTableDegradesOnMemoryOptimized(t *testing.T) {
 	}
 	if tableTbl.propertiesComplete {
 		t.Fatal("table.propertiesComplete: want false for a memory-optimized table")
+	}
+}
+
+// TestTableRejectsWrongObjectType is task 13 fix-1's own A0 target:
+// design spec line 202, "A resolved object of the wrong type gives
+// code 2" - measured before this fix: obj table on dbo.PlainModule (a
+// procedure) resolved and then succeeded with an empty columns/indexes
+// result instead of naming the type mismatch.
+func TestTableRejectsWrongObjectType(t *testing.T) {
+	conn := &fakeObjConn{responses: []objQueryResponse{
+		resolveFoundResponse(999, "dbo", "PlainModule", "P"),
+	}}
+	sess := newFakeObjSession(t, conn)
+	sink := &objCaptureSink{}
+
+	err := Table(context.Background(), sess, "dbo.PlainModule", sink)
+	var pub *model.PublicError
+	if !errors.As(err, &pub) {
+		t.Fatalf("Table: want *model.PublicError, got %#v", err)
+	}
+	if pub.Code != 2 || pub.Kind != "invalid_argument" {
+		t.Fatalf("Table on a procedure: want code 2/invalid_argument, got code %d/%s", pub.Code, pub.Kind)
+	}
+	if len(sink.tables) != 0 {
+		t.Fatalf("wrong object type: want no table written, got %#v", sink.tables)
+	}
+}
+
+// TestTableColumnsPropertiesIncompleteWhenDefinitionDenied is task 13
+// fix-1's own A1 target: a principal with SELECT alone (no VIEW
+// DEFINITION) sees full column/type/nullability metadata, but
+// default_definition/computed_definition come back NULL exactly like
+// a genuinely absent default or computed formula - measured by the
+// reviewer against a real engine. columns must report
+// properties_complete=false with a notice rather than the fixed
+// "true" it used to pass regardless.
+func TestTableColumnsPropertiesIncompleteWhenDefinitionDenied(t *testing.T) {
+	conn := &fakeObjConn{responses: []objQueryResponse{
+		resolveFoundResponse(501, "dbo", "ColumnsFixture", "U"),
+		tableRowResponse(int64(2), int64(1), int64(1), nil),
+		permProbeResponse(int64(0)), // VIEW DEFINITION denied
+		columnsRowsResponse([][]driver.Value{
+			{int64(1), "Price", "decimal", int64(9), int64(12), int64(4), false, false, false, nil, nil},
+		}),
+		indexesRowsResponse(nil),
+	}}
+	sess := newFakeObjSession(t, conn)
+	sink := &objCaptureSink{}
+
+	if err := Table(context.Background(), sess, "dbo.ColumnsFixture", sink); err != nil {
+		t.Fatalf("Table: want success (masked properties, not a failure), got error: %v", err)
+	}
+
+	columnsTbl := sink.table("columns")
+	if columnsTbl == nil {
+		t.Fatal("columns table missing")
+	}
+	if columnsTbl.propertiesComplete {
+		t.Fatal("columns.propertiesComplete: want false when VIEW DEFINITION is denied - default_definition may be masked, not genuinely absent")
+	}
+	if sink.noticeWithKind("definition_properties_unavailable") == nil {
+		t.Fatal("want a definition_properties_unavailable notice when VIEW DEFINITION is denied")
+	}
+
+	indexesTbl := sink.table("indexes")
+	if indexesTbl == nil {
+		t.Fatal("indexes table missing")
+	}
+	if indexesTbl.propertiesComplete {
+		t.Fatal("indexes.propertiesComplete: want false too - readIndexes reuses the same VIEW DEFINITION answer Table already probed")
 	}
 }

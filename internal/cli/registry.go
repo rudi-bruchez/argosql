@@ -680,8 +680,13 @@ func sizeTableCommand() Command {
 			"used_pages, reserved_pages: 8-KB pages",
 			"used_bytes, reserved_bytes: bytes (pages * 8192); MiB = bytes / 1048576",
 		},
+		// VIEW DATABASE STATE was missing here (task 13 fix-1, measured:
+		// the fixture's own "I" bundle grants it, and
+		// sys.dm_db_partition_stats needs it on 2019, but help omitted
+		// it - an operator following this text alone would be denied
+		// while the green permission matrix quietly relied on it).
 		Permissions: []string{
-			"VIEW DEFINITION, SELECT (2019)",
+			"VIEW DATABASE STATE, VIEW DEFINITION, SELECT (2019)",
 			"VIEW DATABASE PERFORMANCE STATE, VIEW SECURITY DEFINITION (2022+, in addition to the above)",
 		},
 		Versions: []string{"2019", "2022"},

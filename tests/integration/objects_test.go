@@ -4,7 +4,9 @@ package integration
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -126,17 +128,336 @@ func TestObjCodePermissionDenied(t *testing.T) {
 	}
 }
 
-// TestObjCodeOnNonModuleObject is fix-0's second point: obj code
-// called on a table (not a module) must report
-// definition_unavailable at code 4, never code 5. Measured before
-// this fix, against a real engine: Code fell into unexpectedCell's
-// generic execution failure because
-// OBJECTPROPERTYEX(object_id,'IsEncrypted') is NULL for a table.
+// TestObjCodeOnNonModuleObject is task 13 fix-1's own A0 target:
+// design spec line 202, "A resolved object of the wrong type gives
+// code 2", settled BEFORE moduleQuery ever runs. This supersedes
+// fix-0's own decision (code 4, definition_unavailable) - itself a
+// correction of an even earlier code 5 (unexpectedCell, because
+// OBJECTPROPERTYEX(object_id,'IsEncrypted') reads NULL for a table).
+// Both were wrong: this is an argument error, never a
+// definition-state question.
 func TestObjCodeOnNonModuleObject(t *testing.T) {
 	lab := NewLab(t, os.Getenv("ASQ_TEST_IMAGE"))
 	r, code := lab.Run(t, "I", []string{"obj", "code", "dbo.Orders"})
-	if code != 4 || r.Error == nil || r.Error.Kind != "definition_unavailable" {
-		t.Fatalf("obj code dbo.Orders (a table) as I: got code %d, error %#v; want 4/definition_unavailable", code, r.Error)
+	if code != 2 || r.Error == nil || r.Error.Kind != "invalid_argument" {
+		t.Fatalf("obj code dbo.Orders (a table) as I: got code %d, error %#v; want 2/invalid_argument", code, r.Error)
+	}
+}
+
+// TestWrongObjectTypeRejected is task 13 fix-1's own A0 target for the
+// other three commands, the SIXTH lost clause the first pre-flight
+// missed: design spec line 202, "A resolved object of the wrong type
+// gives code 2". Measured by the first reviewer, before this fix, on
+// the visible procedure dbo.PlainModule: obj table succeeded claiming
+// it was a table with empty columns/indexes, idx list succeeded with
+// an empty result declared complete, and size table failed at code 4
+// (a reason that did not actually apply). All three must reject at
+// code 2 instead.
+func TestWrongObjectTypeRejected(t *testing.T) {
+	lab := NewLab(t, os.Getenv("ASQ_TEST_IMAGE"))
+
+	for _, args := range [][]string{
+		{"obj", "table", "dbo.PlainModule"},
+		{"idx", "list", "dbo.PlainModule"},
+		{"size", "table", "dbo.PlainModule"},
+	} {
+		t.Run(args[0]+" "+args[1], func(t *testing.T) {
+			r, code := lab.Run(t, "I", args)
+			if code != 2 || r.Error == nil || r.Error.Kind != "invalid_argument" {
+				t.Fatalf("%v on dbo.PlainModule (a procedure): got code %d, error %#v; want 2/invalid_argument", args, code, r.Error)
+			}
+		})
+	}
+}
+
+// TestColumnsAndIndexesPropertiesMaskedBySelectOnly is task 13 fix-1's
+// own A1 target: a principal with SELECT alone (no VIEW DEFINITION)
+// on dbo.ColumnsFixture sees full column/index structure, but
+// default_definition, computed_definition and filter all come back
+// NULL - measured by the reviewer to be indistinguishable, before
+// this fix, from those properties genuinely not existing, with
+// properties_complete=true and no warning either way. Granting Q
+// (which the shared fixture never gives object-level grants) SELECT
+// on this one table, ad hoc, isolates exactly this scenario without
+// touching the I/S bundles every other test in this package depends
+// on.
+func TestColumnsAndIndexesPropertiesMaskedBySelectOnly(t *testing.T) {
+	lab := NewLab(t, os.Getenv("ASQ_TEST_IMAGE"))
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	lab.ensurePrincipals(t) // creates asq_test_q and applies objects.sql
+	if _, err := lab.Admin.ExecContext(ctx, "GRANT SELECT ON dbo.ColumnsFixture TO asq_test_q;"); err != nil {
+		t.Fatalf("granting SELECT to Q: %v", err)
+	}
+
+	r, code := lab.Run(t, "Q", []string{"obj", "table", "dbo.ColumnsFixture"})
+	if code != 0 {
+		t.Fatalf("obj table dbo.ColumnsFixture as Q (SELECT only): got code %d, error %#v; want 0", code, r.Error)
+	}
+
+	var columns, indexes *model.TableResult
+	for i := range r.Tables {
+		switch r.Tables[i].Spec.Name {
+		case "columns":
+			columns = &r.Tables[i]
+		case "indexes":
+			indexes = &r.Tables[i]
+		}
+	}
+	if columns == nil || indexes == nil {
+		t.Fatalf("expected both columns and indexes tables, got %#v", r.Tables)
+	}
+	if columns.State.PropertiesComplete {
+		t.Fatal("columns.properties_complete: want false when VIEW DEFINITION is denied (SELECT alone) - defaults/computed formulas may be masked")
+	}
+	if indexes.State.PropertiesComplete {
+		t.Fatal("indexes.properties_complete: want false too - filter may be masked, not genuinely absent")
+	}
+	// The row/column shape must still be fully populated: masking hides
+	// definition TEXT only, never structural metadata SELECT already
+	// grants visibility into.
+	if len(columns.Rows) == 0 || len(indexes.Rows) == 0 {
+		t.Fatalf("SELECT alone must still see full column/index structure, got columns=%d indexes=%d rows", len(columns.Rows), len(indexes.Rows))
+	}
+}
+
+// TestObjTableSizeTableSurviveMissingViewDatabaseState is task 13
+// fix-1's own A1 target: the shared classifier used to recognize only
+// SQL error numbers 229 and 300 as permission denials, not 297 - the
+// number sys.dm_db_partition_stats actually raises. Measured by the
+// reviewer, and confirmed again while building this fixture: on 2022,
+// VIEW DATABASE STATE alone is NOT what gates this DMV for a
+// principal that also already holds VIEW DATABASE PERFORMANCE STATE
+// and VIEW SECURITY DEFINITION (I's own 2022 bundle) - revoking only
+// the first left the DMV fully readable, silently testing nothing.
+// All three of I's state-viewing grants that this major version
+// actually has must be revoked together to reproduce the reviewer's
+// own "I conservant ses droits sur les objets mais privé des
+// permissions d'état." I is used here, with its own state grants
+// revoked on top of its object-level ones, rather than a fresh
+// principal: the fixture's Q cannot resolve dbo.Orders at all (no
+// VIEW DEFINITION), which would test the wrong thing entirely.
+func TestObjTableSizeTableSurviveMissingViewDatabaseState(t *testing.T) {
+	lab := NewLab(t, os.Getenv("ASQ_TEST_IMAGE"))
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	lab.ensurePrincipals(t)
+	var major int
+	if err := lab.Admin.QueryRowContext(ctx, "SELECT CAST(SERVERPROPERTY('ProductMajorVersion') AS int)").Scan(&major); err != nil {
+		t.Fatalf("reading engine major version: %v", err)
+	}
+	revoke := "REVOKE VIEW DATABASE STATE FROM asq_test_i;"
+	grantBack := "GRANT VIEW DATABASE STATE TO asq_test_i;"
+	if major >= 16 {
+		revoke += " REVOKE VIEW DATABASE PERFORMANCE STATE FROM asq_test_i; REVOKE VIEW SECURITY DEFINITION FROM asq_test_i;"
+		grantBack += " GRANT VIEW DATABASE PERFORMANCE STATE TO asq_test_i; GRANT VIEW SECURITY DEFINITION TO asq_test_i;"
+	}
+	if _, err := lab.Admin.ExecContext(ctx, revoke); err != nil {
+		t.Fatalf("revoking state permissions from I: %v", err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		lab.Admin.ExecContext(cleanupCtx, grantBack)
+	})
+
+	r, code := lab.Run(t, "I", []string{"obj", "table", "dbo.Orders"})
+	if code != 0 || r.Error != nil {
+		t.Fatalf("obj table dbo.Orders as I (no VIEW DATABASE STATE): got code %d, error %#v; want 0", code, r.Error)
+	}
+	var tableRow *model.TableResult
+	for i := range r.Tables {
+		if r.Tables[i].Spec.Name == "table" {
+			tableRow = &r.Tables[i]
+		}
+	}
+	if tableRow == nil || len(tableRow.Rows) != 1 {
+		t.Fatalf("table row missing: %#v", r.Tables)
+	}
+	if tableRow.Rows[0][3] != nil {
+		t.Fatalf("rows cell: got %#v, want nil (size permissions absent)", tableRow.Rows[0][3])
+	}
+	if tableRow.State.PropertiesComplete {
+		t.Fatal("table.properties_complete: want false when size permissions are absent")
+	}
+
+	r2, code2 := lab.Run(t, "I", []string{"size", "table", "dbo.Orders"})
+	if code2 != 4 || r2.Error == nil || r2.Error.Kind != "permission" {
+		t.Fatalf("size table dbo.Orders as I (no VIEW DATABASE STATE): got code %d, error %#v; want 4/permission", code2, r2.Error)
+	}
+}
+
+// TestIdxListIgnoresPartitioningColumn is task 13 fix-1's own A1
+// target: a nonclustered index created on a partition scheme gets an
+// implicitly added partitioning column with key_ordinal=0 and
+// is_included_column=0 - neither a declared key nor an included
+// column. Measured by the reviewer: before this fix, idx list
+// reported it as the index's own FIRST key, ahead of the one column
+// actually declared.
+func TestIdxListIgnoresPartitioningColumn(t *testing.T) {
+	lab := NewLab(t, os.Getenv("ASQ_TEST_IMAGE"))
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	if err := applyObjects(ctx, lab.Admin); err != nil {
+		t.Fatalf("applying objects.sql: %v", err)
+	}
+	if _, err := lab.Admin.ExecContext(ctx,
+		"CREATE INDEX IX_ReviewPartition ON dbo.SizePartitioned(Value) ON AsqSizePS(Bucket);"); err != nil {
+		t.Fatalf("creating partitioned index: %v", err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		lab.Admin.ExecContext(cleanupCtx, "DROP INDEX IX_ReviewPartition ON dbo.SizePartitioned;")
+	})
+
+	sess, err := sqlserver.Open(ctx, lab.Profile)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer sess.Close()
+
+	sink := &captureSink{}
+	if err := diagnostics.Indexes(ctx, sess, "dbo.SizePartitioned", sink); err != nil {
+		t.Fatalf("Indexes: %v", err)
+	}
+	tbl := sink.table("indexes")
+	if tbl == nil {
+		t.Fatal("indexes table missing")
+	}
+	found := false
+	for _, row := range tbl.rows {
+		name, _ := row[1].(string)
+		if name != "IX_ReviewPartition" {
+			continue
+		}
+		found = true
+		if row[3] != "[Value] ASC" {
+			t.Fatalf("IX_ReviewPartition keys cell: got %#v, want %q (the partitioning column Bucket must not appear)", row[3], "[Value] ASC")
+		}
+	}
+	if !found {
+		t.Fatal("IX_ReviewPartition not found in idx list output")
+	}
+}
+
+// TestSizeTableExposesTotals is task 13 fix-1's own A2 target: size
+// table used to expose only the per-row allocation breakdown, never
+// the used/reserved/unused totals design spec lines 53/174 both
+// require. Compared against an independent SUM over the same DMV,
+// bypassing production's own unpivot entirely.
+func TestSizeTableExposesTotals(t *testing.T) {
+	lab := NewLab(t, os.Getenv("ASQ_TEST_IMAGE"))
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	if err := applyObjects(ctx, lab.Admin); err != nil {
+		t.Fatalf("applying objects.sql: %v", err)
+	}
+
+	var objectID, wantUsed, wantReserved int64
+	if err := lab.Admin.QueryRowContext(ctx, "SELECT OBJECT_ID(N'AppDB.dbo.SizeFixture')").Scan(&objectID); err != nil {
+		t.Fatalf("resolving object_id: %v", err)
+	}
+	if err := lab.Admin.QueryRowContext(ctx,
+		"SELECT SUM(used_page_count), SUM(reserved_page_count) FROM sys.dm_db_partition_stats WHERE object_id=@p1", objectID,
+	).Scan(&wantUsed, &wantReserved); err != nil {
+		t.Fatalf("independent totals: %v", err)
+	}
+
+	sess, err := sqlserver.Open(ctx, lab.Profile)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer sess.Close()
+
+	sink := &captureSink{}
+	if err := diagnostics.Size(ctx, sess, "dbo.SizeFixture", sink); err != nil {
+		t.Fatalf("Size: %v", err)
+	}
+	tbl := sink.table("table")
+	if tbl == nil || len(tbl.rows) != 1 {
+		t.Fatalf("table row missing: %#v", tbl)
+	}
+	wantUsedBytes := wantUsed * 8192
+	wantReservedBytes := wantReserved * 8192
+	wantUnusedBytes := wantReservedBytes - wantUsedBytes
+	if got := tbl.rows[0][4]; got != wantUsedBytes {
+		t.Fatalf("total_used_bytes cell: got %#v, want %d", got, wantUsedBytes)
+	}
+	if got := tbl.rows[0][5]; got != wantReservedBytes {
+		t.Fatalf("total_reserved_bytes cell: got %#v, want %d", got, wantReservedBytes)
+	}
+	if got := tbl.rows[0][6]; got != wantUnusedBytes {
+		t.Fatalf("total_unused_bytes cell: got %#v, want %d", got, wantUnusedBytes)
+	}
+}
+
+// TestIdxListHandlesWideIndex is task 13 fix-1's own A2 target: each
+// STRING_AGG in indexes.sql used to aggregate an NVARCHAR expression
+// of bounded length, capping its result at 4,000 characters -
+// measured by the reviewer with a 32-column index whose column names
+// are 123 characters each. This builds the same shape: enough key
+// columns, with long enough names, to exceed 4,000 characters in the
+// unfixed query.
+func TestIdxListHandlesWideIndex(t *testing.T) {
+	lab := NewLab(t, os.Getenv("ASQ_TEST_IMAGE"))
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	const columnCount = 32
+	const nameWidth = 123
+
+	var createCols, indexCols strings.Builder
+	for i := 0; i < columnCount; i++ {
+		name := fmt.Sprintf("C%0*d", nameWidth-1, i)
+		if i > 0 {
+			createCols.WriteString(", ")
+			indexCols.WriteString(", ")
+		}
+		fmt.Fprintf(&createCols, "[%s] INT NOT NULL", name)
+		fmt.Fprintf(&indexCols, "[%s]", name)
+	}
+
+	if _, err := lab.Admin.ExecContext(ctx, "IF OBJECT_ID(N'AppDB.dbo.WideIndexFixture') IS NOT NULL DROP TABLE dbo.WideIndexFixture;"); err != nil {
+		t.Fatalf("dropping WideIndexFixture: %v", err)
+	}
+	if _, err := lab.Admin.ExecContext(ctx, fmt.Sprintf("CREATE TABLE dbo.WideIndexFixture (%s);", createCols.String())); err != nil {
+		t.Fatalf("creating WideIndexFixture: %v", err)
+	}
+	if _, err := lab.Admin.ExecContext(ctx, fmt.Sprintf("CREATE INDEX IX_WideIndexFixture ON dbo.WideIndexFixture (%s);", indexCols.String())); err != nil {
+		t.Fatalf("creating wide index: %v", err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		lab.Admin.ExecContext(cleanupCtx, "DROP TABLE dbo.WideIndexFixture;")
+	})
+
+	sess, err := sqlserver.Open(ctx, lab.Profile)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer sess.Close()
+
+	sink := &captureSink{}
+	if err := diagnostics.Indexes(ctx, sess, "dbo.WideIndexFixture", sink); err != nil {
+		t.Fatalf("Indexes: %v", err)
+	}
+	tbl := sink.table("indexes")
+	if tbl == nil || len(tbl.rows) != 1 {
+		t.Fatalf("indexes table: want exactly one row, got %#v", tbl)
+	}
+	keys, _ := tbl.rows[0][3].(string)
+	if len(keys) <= 4000 {
+		t.Fatalf("this fixture's own keys text (%d chars) does not exceed the old 4000-char STRING_AGG cap - fixture too small to prove the fix", len(keys))
+	}
+	wantFirst := fmt.Sprintf("[C%0*d]", nameWidth-1, 0)
+	if !strings.HasPrefix(keys, wantFirst) {
+		t.Fatalf("keys cell does not start with the first declared key column: got prefix %q, want %q", keys[:min(len(keys), len(wantFirst))], wantFirst)
 	}
 }
 

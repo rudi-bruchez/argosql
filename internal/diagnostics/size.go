@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	_ "embed"
 	"fmt"
-	"sort"
 
 	"github.com/rudi-bruchez/argosql/internal/model"
 	"github.com/rudi-bruchez/argosql/internal/output"
@@ -53,11 +52,11 @@ var AllocationsTable = model.TableSpec{
 }
 
 // sizeUnavailableError builds the code-4 error Size returns when
-// tableHeaderRowCount could not produce a real row count for obj -
+// tableHeaderRowCount could not produce real size facts for obj -
 // unlike Table (table.go), which degrades on the exact same three
-// reasons, Size itself requires a real row count (design spec line
-// 172: "size table itself requires those permissions"), so every one
-// of tableHeaderRowCount's non-nil reasons is this command's own
+// reasons, Size itself requires them (design spec line 172: "size
+// table itself requires those permissions"), so every one of
+// tableHeaderRowCount's non-nil reasons is this command's own
 // failure, never a warning on an otherwise-successful result.
 func sizeUnavailableError(obj sqlserver.Object, reason rowCountUnavailableReason) error {
 	switch reason {
@@ -82,26 +81,33 @@ func sizeUnavailableError(obj sqlserver.Object, reason rowCountUnavailableReason
 	}
 }
 
-// Size runs "size table <schema.name>": obj's approximate row count
-// and its allocated/used/reserved space, broken down by index and
-// allocation type (design spec: "size table": "Approximate row count
-// and allocated/used/reserved space, with index and allocation-type
-// breakdowns that avoid double counting").
+// Size runs "size table <schema.name>": obj's approximate row count,
+// its total used/reserved/unused space, and its allocated space
+// broken down by index and allocation type (design spec: "size
+// table": "Approximate row count and allocated/used/reserved space,
+// with index and allocation-type breakdowns that avoid double
+// counting").
 //
 // Resolution precedes everything else (design spec line 172), exactly
-// like Table and Indexes: an unresolved name fails at code 8 before
-// this function ever runs a query that could otherwise fail at code 4
-// for an unrelated permission reason. Once obj resolves, this command
-// itself REQUIRES a real row count - unlike Table, which degrades on
-// the identical unavailability - so any of tableHeaderRowCount's three
-// reasons ends Size outright via sizeUnavailableError.
+// like Table and Indexes. A resolved object of the wrong type is
+// rejected at code 2 immediately after (design spec line 202) - task
+// 13 fix-1 measured that a procedure used to resolve and then fail at
+// code 4 (memory_optimized/size_unavailable) here instead of naming
+// the type mismatch, since neither reason actually applied. Once obj
+// resolves and its type is accepted, this command itself REQUIRES a
+// real row count/size - unlike Table, which degrades on the identical
+// unavailability - so any of tableHeaderRowCount's three reasons ends
+// Size outright via sizeUnavailableError.
 func Size(ctx context.Context, s *sqlserver.Session, name string, dst model.Sink) error {
 	obj, err := sqlserver.Resolve(ctx, s.Conn, name)
 	if err != nil {
 		return err
 	}
+	if !tableAllowedTypes[obj.Type] {
+		return wrongObjectTypeError(obj, "size table", "tables")
+	}
 
-	rows, reason, err := tableHeaderRowCount(ctx, s, obj)
+	header, reason, err := tableHeaderRowCount(ctx, s, obj)
 	if err != nil {
 		return err
 	}
@@ -112,7 +118,8 @@ func Size(ctx context.Context, s *sqlserver.Session, name string, dst model.Sink
 	if err := dst.Begin(TableTable); err != nil {
 		return err
 	}
-	if err := dst.Row([]model.Cell{obj.ID, obj.Schema, obj.Name, rows}); err != nil {
+	row := []model.Cell{obj.ID, obj.Schema, obj.Name, header.RowCount, header.TotalUsedBytes, header.TotalReservedBytes, header.TotalUnusedBytes}
+	if err := dst.Row(row); err != nil {
 		return err
 	}
 	if err := dst.End(true, true); err != nil {
@@ -122,31 +129,19 @@ func Size(ctx context.Context, s *sqlserver.Session, name string, dst model.Sink
 	return writeAllocations(ctx, s, obj, dst)
 }
 
-// allocationRow is one row this program will hand to AllocationsTable,
-// held in memory just long enough for writeAllocations to sort the
-// whole (small, bounded) set before writing any of it out.
-type allocationRow struct {
-	indexID, partitionNumber int64
-	allocationType           string
-	usedPages, reservedPages int64
-}
-
-// writeAllocations reads every row sql/size.sql returns for obj,
-// computes used_bytes/reserved_bytes from the raw page counts (see
-// pageBytes above), and writes them to AllocationsTable ordered by
-// (index_id, partition_number, allocation_type) - the design spec's
-// own declared row order (line 103: "allocation rows use index_id,
-// partition_number, allocation type"). The order is enforced here in
-// Go, with sort.SliceStable, rather than trusted to size.sql's own
-// ORDER BY alone: this table is small and bounded by construction (at
-// most three allocation types per index/partition, and this
-// program's diagnostics never inspect a table with an unbounded
-// number of indexes or partitions), so accumulating it in memory to
-// guarantee the order costs nothing worth avoiding, and it is what
-// makes the order independently verifiable and independently
-// breakable - see size_test.go's TestSizeAllocationsOrderedAcrossIndexes,
-// which feeds this function driver rows in scrambled order and would
-// not catch a lost ORDER BY in size.sql alone, only a lost sort here.
+// writeAllocations streams sql/size.sql's rows straight into
+// AllocationsTable, computing used_bytes/reserved_bytes from the raw
+// page counts (see pageBytes above) as it goes - never accumulating
+// the result set first (design spec line 111: "Stream table exports;
+// never accumulate the full result set"). This is task 13 fix-1's own
+// correction of a defect measured to repeat a pattern already fixed
+// once on this project (queryRows, task 11): the earlier version of
+// this function read every row into a slice and sorted it before the
+// first dst.Row call, with nothing bounding how many rows that could
+// be. Row order now comes entirely from sql/size.sql's own ORDER BY
+// (index_id, partition_number, allocation_type - the design spec's
+// declared row order, line 103), the same trust queryRows (top.go)
+// already places in its own callers' ORDER BY clauses.
 func writeAllocations(ctx context.Context, s *sqlserver.Session, obj sqlserver.Object, dst model.Sink) error {
 	rows, err := s.Conn.QueryContext(ctx, sizeQuery, sql.Named("id", obj.ID))
 	if err != nil {
@@ -154,7 +149,10 @@ func writeAllocations(ctx context.Context, s *sqlserver.Session, obj sqlserver.O
 	}
 	defer rows.Close()
 
-	var collected []allocationRow
+	if err := dst.Begin(AllocationsTable); err != nil {
+		return err
+	}
+
 	var types []*sql.ColumnType
 	for rows.Next() {
 		if types == nil {
@@ -167,18 +165,6 @@ func writeAllocations(ctx context.Context, s *sqlserver.Session, obj sqlserver.O
 		if err != nil {
 			return &model.PublicError{Code: 5, Kind: "execution", Message: fmt.Sprintf("scanning allocation row: %s", err.Error())}
 		}
-		indexID, ok := cells[0].(int64)
-		if !ok {
-			return unexpectedCell("index_id")
-		}
-		partitionNumber, ok := cells[1].(int64)
-		if !ok {
-			return unexpectedCell("partition_number")
-		}
-		allocationType, ok := cells[2].(string)
-		if !ok {
-			return unexpectedCell("allocation_type")
-		}
 		usedPages, ok := cells[3].(int64)
 		if !ok {
 			return unexpectedCell("used_pages")
@@ -187,38 +173,17 @@ func writeAllocations(ctx context.Context, s *sqlserver.Session, obj sqlserver.O
 		if !ok {
 			return unexpectedCell("reserved_pages")
 		}
-		collected = append(collected, allocationRow{
-			indexID: indexID, partitionNumber: partitionNumber, allocationType: allocationType,
-			usedPages: usedPages, reservedPages: reservedPages,
-		})
-	}
-	if err := rows.Err(); err != nil {
-		return classifyQueryError(err, "reading allocation rows")
-	}
-
-	sort.SliceStable(collected, func(i, j int) bool {
-		a, b := collected[i], collected[j]
-		if a.indexID != b.indexID {
-			return a.indexID < b.indexID
-		}
-		if a.partitionNumber != b.partitionNumber {
-			return a.partitionNumber < b.partitionNumber
-		}
-		return a.allocationType < b.allocationType
-	})
-
-	if err := dst.Begin(AllocationsTable); err != nil {
-		return err
-	}
-	for _, a := range collected {
 		row := []model.Cell{
-			a.indexID, a.partitionNumber, a.allocationType,
-			a.usedPages, a.reservedPages,
-			a.usedPages * pageBytes, a.reservedPages * pageBytes,
+			cells[0], cells[1], cells[2],
+			usedPages, reservedPages,
+			usedPages * pageBytes, reservedPages * pageBytes,
 		}
 		if err := dst.Row(row); err != nil {
 			return err
 		}
+	}
+	if err := rows.Err(); err != nil {
+		return classifyQueryError(err, "reading allocation rows")
 	}
 	return dst.End(true, true)
 }

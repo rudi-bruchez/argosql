@@ -131,19 +131,38 @@ func queryOneOptionalRow(ctx context.Context, conn *sql.Conn, query string, args
 	return cells, true, nil
 }
 
+// permissionSQLErrors lists every SQL Server error number this
+// package's own queries can raise that means "connected fine, but not
+// permitted", never an execution failure: 229 and 230 (object- and
+// column-level GRANT-style denial: "The … permission was denied on
+// the object/column …"), 297 (catalog/DMV metadata-visibility denial:
+// "The user does not have permission to perform this action" -
+// measured, task 13 fix-1, against sys.dm_db_partition_stats once
+// VIEW DATABASE STATE is revoked from a principal that still resolves
+// the object: obj table and size table both fell through to code 5
+// before this number was added), and 300 (the same object-level denial
+// as 229, worded slightly differently by the engine). Message text
+// for each of these four, read from sys.messages (English, id 1033),
+// confirms all four are the same "permission denied" family; 262
+// ("%ls permission denied in database") and 15151/15247 (system
+// stored procedure wording) were checked too and excluded: this
+// package never issues the DDL or sp_-style statements that raise
+// them.
+var permissionSQLErrors = map[int32]bool{229: true, 230: true, 297: true, 300: true}
+
 // classifyQueryError turns a driver error from one of this package's
-// own embedded queries into a *model.PublicError: SQL error numbers
-// 229 and 300 mean "connected fine, but not permitted" (code 4,
-// mirroring internal/sqlserver's own, private classifySQLError),
-// everything else is an execution failure (code 5). message is a
-// fixed, reformulated description, never the driver error's own text
-// verbatim - this package's queries carry no secrets, but repeating
-// that discipline here keeps it true everywhere in this codebase
-// without a case-by-case judgment call.
+// own embedded queries into a *model.PublicError: a permissionSQLErrors
+// number means "connected fine, but not permitted" (code 4, mirroring
+// internal/sqlserver's own, private classifySQLError), everything else
+// is an execution failure (code 5). message is a fixed, reformulated
+// description, never the driver error's own text verbatim - this
+// package's queries carry no secrets, but repeating that discipline
+// here keeps it true everywhere in this codebase without a
+// case-by-case judgment call.
 func classifyQueryError(err error, message string) error {
 	var sqlErr mssql.Error
 	if errors.As(err, &sqlErr) {
-		if sqlErr.Number == 229 || sqlErr.Number == 300 {
+		if permissionSQLErrors[sqlErr.Number] {
 			return &model.PublicError{Code: 4, Kind: "permission", Message: "insufficient permission", SQLNumber: sqlErr.Number}
 		}
 		return &model.PublicError{Code: 5, Kind: "execution", Message: message, SQLNumber: sqlErr.Number}

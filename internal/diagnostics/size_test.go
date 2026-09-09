@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql/driver"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/rudi-bruchez/argosql/internal/model"
@@ -25,6 +27,32 @@ func TestSizeUnresolvedNameReturnsEight(t *testing.T) {
 	}
 	if pub.Code != 8 || pub.Kind != "not_found_or_not_visible" {
 		t.Fatalf("Size on an unresolved name: want code 8/not_found_or_not_visible, got code %d/%s", pub.Code, pub.Kind)
+	}
+}
+
+// TestSizeRejectsWrongObjectType is task 13 fix-1's own A0 target for
+// "size table": design spec line 202, "A resolved object of the wrong
+// type gives code 2" - measured before this fix: size table on a
+// procedure resolved and then failed at code 4
+// (memory_optimized_unavailable or size_unavailable, neither of which
+// actually applied) instead of naming the type mismatch.
+func TestSizeRejectsWrongObjectType(t *testing.T) {
+	conn := &fakeObjConn{responses: []objQueryResponse{
+		resolveFoundResponse(999, "dbo", "PlainModule", "P"),
+	}}
+	sess := newFakeObjSession(t, conn)
+	sink := &objCaptureSink{}
+
+	err := Size(context.Background(), sess, "dbo.PlainModule", sink)
+	var pub *model.PublicError
+	if !errors.As(err, &pub) {
+		t.Fatalf("Size: want *model.PublicError, got %#v", err)
+	}
+	if pub.Code != 2 || pub.Kind != "invalid_argument" {
+		t.Fatalf("Size on a procedure: want code 2/invalid_argument, got code %d/%s", pub.Code, pub.Kind)
+	}
+	if len(sink.tables) != 0 {
+		t.Fatalf("wrong object type: want no table written, got %#v", sink.tables)
 	}
 }
 
@@ -61,7 +89,7 @@ func TestSizeFailsWhenPermissionAbsent(t *testing.T) {
 func TestSizeMemoryOptimizedReturnsFour(t *testing.T) {
 	conn := &fakeObjConn{responses: []objQueryResponse{
 		resolveFoundResponse(902, "dbo", "MemTab", "U"),
-		tableRowResponse(nil, true),
+		tableRowResponse(nil, nil, nil, true),
 	}}
 	sess := newFakeObjSession(t, conn)
 	sink := &objCaptureSink{}
@@ -88,7 +116,7 @@ func TestSizeMemoryOptimizedReturnsFour(t *testing.T) {
 func TestSizeAllocationsCellValuesAndByteMath(t *testing.T) {
 	conn := &fakeObjConn{responses: []objQueryResponse{
 		resolveFoundResponse(903, "dbo", "SizeFixture", "U"),
-		tableRowResponse(int64(50), nil),
+		tableRowResponse(int64(50), int64(52), int64(57), nil),
 		sizeRowsResponse([][]driver.Value{
 			{int64(1), int64(1), "IN_ROW_DATA", int64(10), int64(12)},
 			{int64(1), int64(1), "LOB_DATA", int64(30), int64(35)},
@@ -138,23 +166,26 @@ func TestSizeAllocationsCellValuesAndByteMath(t *testing.T) {
 	}
 }
 
-// TestSizeAllocationsOrderedAcrossIndexes is design spec line 103's
+// TestSizeAllocationsPreservesDriverOrder is design spec line 103's
 // row-order clause for allocations ("allocation rows use index_id,
-// partition_number, allocation type") and dispatch cassure 4's second
-// half. The fake driver hands rows back deliberately scrambled -
-// size.sql's own real ORDER BY cannot be exercised through a fake
-// driver at all, which is exactly why writeAllocations (size.go) sorts
-// this bounded result itself rather than trusting the driver's order:
-// removing that sort would make this test fail on these exact,
-// deliberately out-of-order input rows.
-func TestSizeAllocationsOrderedAcrossIndexes(t *testing.T) {
+// partition_number, allocation type"), re-targeted by task 13 fix-1:
+// writeAllocations no longer accumulates and sorts (see
+// TestSizeStreamsWithoutAccumulating below for why), so ordering is
+// now entirely size.sql's own ORDER BY's responsibility, unreachable
+// through this fake driver. What IS still this function's own job,
+// and what this test proves, is that it never reorders what the
+// driver hands it: fed rows already in the order a real ORDER BY
+// would produce, Size must write them in that same order, unchanged.
+// tests/integration's own TestSize/partitioned checks the real
+// ORDER BY against a genuinely multi-partition table.
+func TestSizeAllocationsPreservesDriverOrder(t *testing.T) {
 	conn := &fakeObjConn{responses: []objQueryResponse{
 		resolveFoundResponse(904, "dbo", "SizePartitioned", "U"),
-		tableRowResponse(int64(5), nil),
+		tableRowResponse(int64(5), int64(3), int64(3), nil),
 		sizeRowsResponse([][]driver.Value{
-			{int64(1), int64(3), "IN_ROW_DATA", int64(1), int64(1)},
 			{int64(1), int64(1), "IN_ROW_DATA", int64(1), int64(1)},
 			{int64(1), int64(2), "IN_ROW_DATA", int64(1), int64(1)},
+			{int64(1), int64(3), "IN_ROW_DATA", int64(1), int64(1)},
 		}),
 	}}
 	sess := newFakeObjSession(t, conn)
@@ -179,4 +210,59 @@ func TestSizeAllocationsOrderedAcrossIndexes(t *testing.T) {
 			t.Fatalf("allocations partition_number order: got %v, want %v", partitions, want)
 		}
 	}
+}
+
+// TestSizeStreamsWithoutAccumulating is task 13 fix-1's own A2 target:
+// the reviewer measured that writeAllocations used to read every
+// allocation row into a slice and sort it before the first dst.Row
+// call, with nothing bounding how many rows that could be - design
+// spec line 111 requires streaming, and this is the third time this
+// exact pattern has been found on this project (after queryRows, task
+// 11). Proof: a Sink that refuses the FIRST allocations row must stop
+// the driver's own Rows.Next() at row 1, never advance through all
+// three - which only holds if writeAllocations calls dst.Row as it
+// scans, rather than buffering first.
+func TestSizeStreamsWithoutAccumulating(t *testing.T) {
+	rows := &fakeStaticRows{
+		cols:  []string{"index_id", "partition_number", "allocation_type", "used_pages", "reserved_pages"},
+		types: []string{"INT", "INT", "NVARCHAR", "BIGINT", "BIGINT"},
+		data: [][]driver.Value{
+			{int64(1), int64(1), "IN_ROW_DATA", int64(1), int64(1)},
+			{int64(2), int64(1), "IN_ROW_DATA", int64(1), int64(1)},
+			{int64(3), int64(1), "IN_ROW_DATA", int64(1), int64(1)},
+		},
+	}
+	conn := &fakeObjConn{responses: []objQueryResponse{
+		resolveFoundResponse(905, "dbo", "SizeFixture", "U"),
+		tableRowResponse(int64(5), int64(3), int64(3), nil),
+		{
+			match:  func(q string) bool { return strings.Contains(q, "in_row_used_page_count") },
+			handle: func(args []driver.NamedValue) (driver.Rows, error) { return rows, nil },
+		},
+	}}
+	sess := newFakeObjSession(t, conn)
+	sink := &refusingAllocationsSink{}
+
+	err := Size(context.Background(), sess, "dbo.SizeFixture", sink)
+	if err == nil {
+		t.Fatal("Size: want the sink's refusal to propagate as an error")
+	}
+	if rows.idx != 1 {
+		t.Fatalf("driver rows advanced: got %d, want exactly 1 (streaming, no accumulation before the sink refused row 1)", rows.idx)
+	}
+}
+
+// refusingAllocationsSink refuses the first "allocations" row -
+// TestSizeStreamsWithoutAccumulating's own regression proof.
+type refusingAllocationsSink struct {
+	objCaptureSink
+	refused bool
+}
+
+func (s *refusingAllocationsSink) Row(row []model.Cell) error {
+	if s.cur != nil && s.cur.spec.Name == AllocationsTable.Name && !s.refused {
+		s.refused = true
+		return fmt.Errorf("refusingAllocationsSink: refused the first allocations row")
+	}
+	return s.objCaptureSink.Row(row)
 }

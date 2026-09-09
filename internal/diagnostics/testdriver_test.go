@@ -206,16 +206,16 @@ func resolveNotFoundResponse() objQueryResponse {
 
 // tableRowResponse matches table.sql (identified by its unique
 // is_memory_optimized projection) and answers it with one row:
-// rowCount/memOpt are driver.Value, so either may be passed as a bare
-// Go nil to mean SQL NULL.
-func tableRowResponse(rowCount, memOpt driver.Value) objQueryResponse {
+// rowCount/usedPages/reservedPages/memOpt are driver.Value, so any of
+// them may be passed as a bare Go nil to mean SQL NULL.
+func tableRowResponse(rowCount, usedPages, reservedPages, memOpt driver.Value) objQueryResponse {
 	return objQueryResponse{
 		match: func(q string) bool { return strings.Contains(q, "is_memory_optimized") },
 		handle: func(args []driver.NamedValue) (driver.Rows, error) {
 			return &fakeStaticRows{
-				cols:  []string{"row_count", "is_memory_optimized"},
-				types: []string{"BIGINT", "BIT"},
-				data:  [][]driver.Value{{rowCount, memOpt}},
+				cols:  []string{"row_count", "total_used_pages", "total_reserved_pages", "is_memory_optimized"},
+				types: []string{"BIGINT", "BIGINT", "BIGINT", "BIT"},
+				data:  [][]driver.Value{{rowCount, usedPages, reservedPages, memOpt}},
 			}, nil
 		},
 	}

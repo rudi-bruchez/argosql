@@ -102,24 +102,26 @@ func moduleDefinitionUnavailable(obj sqlserver.Object) error {
 	}
 }
 
-// moduleNotAModule is the definitionStateDefinitionUnavailable case
-// module.sql's own is_encrypted column reveals directly, without ever
-// probing a permission: OBJECTPROPERTYEX(..., 'IsEncrypted') is NULL
-// for any object type it does not apply to (only procedures,
-// functions, triggers and views do - measured against a real table,
-// which is exactly the mistake "obj code" run against a table makes).
-// obj.Type names which one it actually is, rather than inventing a
-// permission cause a category mismatch has nothing to do with -
-// design spec line 204's own default state, "without inventing its
-// cause", applied here to a cause this function CAN establish (the
-// object is not a module at all) rather than one it cannot.
-func moduleNotAModule(obj sqlserver.Object) error {
-	return &model.PublicError{
-		Code:    4,
-		Kind:    definitionStateDefinitionUnavailable,
-		Message: fmt.Sprintf("%s.%s (type %q) is not a module: obj code applies to procedures, functions, triggers and views only", obj.Schema, obj.Name, obj.Type),
-	}
-}
+// moduleAllowedTypes are the sys.objects.type codes "obj code"
+// accepts: procedures, scalar/inline-table/multi-statement-table
+// functions, triggers and views - every type sys.sql_modules can hold
+// a definition for. A resolved object of any other type (a table,
+// most commonly) is rejected at code 2 (design spec line 202, "A
+// resolved object of the wrong type gives code 2") rather than routed
+// through the definitionState vocabulary at all.
+//
+// Task 13 fix-1 replaces an earlier, WRONG decision here: obj code on
+// a table used to reach moduleQuery, read OBJECTPROPERTYEX's NULL
+// (the property does not apply to a table) and report
+// definitionStateDefinitionUnavailable at code 4 - itself a fix-0
+// correction of an even earlier code 5. Both were wrong: design spec
+// line 202 settles the question before any module-specific query
+// ever runs, exactly like it now does for obj table/idx list/size
+// table (see tableAllowedTypes in table.go) - a resolved object of
+// the wrong type is an argument error, never a definition-state
+// question. The message naming the real type, from the earlier fix,
+// was already correct and is kept.
+var moduleAllowedTypes = map[string]bool{"P": true, "FN": true, "IF": true, "TF": true, "TR": true, "V": true}
 
 // Code runs "obj code <schema.name>": exports obj's visible module
 // definition to a .sql artifact, or reports one of the three failure
@@ -135,9 +137,14 @@ func moduleNotAModule(obj sqlserver.Object) error {
 // function ever probes a permission that could otherwise be
 // misreported as the reason - Resolve's own not_found_or_not_visible
 // stays the one answer for "this name did not resolve", never
-// upgraded (or downgraded) to a permission-shaped error.
+// upgraded (or downgraded) to a permission-shaped error. Right after,
+// a resolved object of the wrong type is rejected at code 2 (design
+// spec line 202) - see moduleAllowedTypes' own doc comment for why
+// this replaces an earlier, wrong decision to route this case through
+// the definitionState vocabulary instead.
 //
-// Once obj resolves, moduleQuery reads sys.sql_modules.definition and
+// Once obj resolves and its type is accepted, moduleQuery reads
+// sys.sql_modules.definition and
 // OBJECTPROPERTYEX's own encryption flag in the same round trip,
 // rejoining sys.objects on obj.ID rather than trusting Resolve's
 // earlier read: zero rows here means obj disappeared in between
@@ -156,6 +163,9 @@ func Code(ctx context.Context, s *sqlserver.Session, name string, dst model.Sink
 	if err != nil {
 		return err
 	}
+	if !moduleAllowedTypes[obj.Type] {
+		return wrongObjectTypeError(obj, "obj code", "procedures, functions, triggers and views")
+	}
 
 	cells, found, err := queryOneOptionalRow(ctx, s.Conn, moduleQuery, sql.Named("id", obj.ID))
 	if err != nil {
@@ -165,20 +175,12 @@ func Code(ctx context.Context, s *sqlserver.Session, name string, dst model.Sink
 		return moduleDisappeared(obj)
 	}
 
-	if encrypted, ok := cells[1].(bool); ok {
-		if encrypted {
-			return moduleEncrypted(obj)
-		}
-	} else if cells[1] == nil {
-		// OBJECTPROPERTYEX(...,'IsEncrypted') itself is NULL: obj is
-		// not a module at all (a table, most likely - see
-		// moduleNotAModule's own doc comment). Reported directly,
-		// never as unexpectedCell's generic execution failure, and
-		// never by probing a permission that has nothing to do with
-		// the actual cause.
-		return moduleNotAModule(obj)
-	} else {
+	encrypted, ok := cells[1].(bool)
+	if !ok {
 		return unexpectedCell("is_encrypted")
+	}
+	if encrypted {
+		return moduleEncrypted(obj)
 	}
 
 	if cells[0] == nil {

@@ -225,6 +225,18 @@ func TestHelpOfflineRendersDeclaredMetadata(t *testing.T) {
 	if !strings.Contains(top.summary, "--object") {
 		t.Fatalf("qs top's summary does not name --object: %q", top.summary)
 	}
+	// task 13 fix-1, A2: help used to omit VIEW DATABASE STATE from
+	// "size table"'s permissions, even though the fixture grants it and
+	// sys.dm_db_partition_stats needs it - an operator following help
+	// alone would be denied while the green permission matrix quietly
+	// relied on it.
+	sizeTable, ok := rows["size table"]
+	if !ok {
+		t.Fatal("help output is missing command \"size table\"")
+	}
+	if !strings.Contains(sizeTable.permissions, "VIEW DATABASE STATE") {
+		t.Fatalf("size table's permissions do not mention VIEW DATABASE STATE: %q", sizeTable.permissions)
+	}
 }
 
 // TestHelpOfflineRendersFlagDefaultsBoundsAndEnum proves help's flags
