@@ -63,6 +63,7 @@ var (
 // query_plans_*.sql's plan rows.
 type fakeQueryConn struct {
 	actual, captureMode string
+	noHistory           bool
 
 	identityRow  []driver.Value
 	identityErr  error
@@ -84,7 +85,7 @@ func (c *fakeQueryConn) Begin() (driver.Tx, error) {
 func (c *fakeQueryConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
 	switch {
 	case strings.Contains(query, "database_query_store_options"):
-		return &fakeHealthRows{actual: c.actual, captureMode: c.captureMode}, nil
+		return &fakeHealthRows{actual: c.actual, captureMode: c.captureMode, noHistory: c.noHistory}, nil
 	case strings.Contains(query, "oldest_interval"):
 		return &fakeCoverageRows{}, nil
 	case strings.Contains(query, "query_store_query_text"):
@@ -219,6 +220,32 @@ func (s *queryCaptureSink) fileContent(kind string) []byte {
 func defaultWindow() Window {
 	now := time.Now().UTC()
 	return Window{Since: now.Add(-time.Hour), Until: now}
+}
+
+// TestPlansQueryForVersionRouting is fix 1's B1: nothing guarded the
+// 2019/2022 SQL routing at all - forcing the 2019 form onto a 2022
+// engine left both the unit and integration suites green, because the
+// real engine's own replica_group_id column (present on 2022, absent
+// on 2019) was never compared against which embedded text actually
+// ran. This checks the routing directly, by identity against the two
+// embedded constants: major 15 must select query_plans_2019.sql, and
+// every major this package accepts as 2022-shaped (16, and 17 for the
+// smoke-tested 2025 release, which shares 2022's replica_group_id
+// column) must select query_plans_2022.sql - never the reverse.
+func TestPlansQueryForVersionRouting(t *testing.T) {
+	if got := plansQueryFor(15); got != queryPlans2019 {
+		t.Fatalf("plansQueryFor(15) did not select query_plans_2019.sql")
+	}
+	for _, major := range []int{16, 17} {
+		if got := plansQueryFor(major); got != queryPlans2022 {
+			t.Fatalf("plansQueryFor(%d) did not select query_plans_2022.sql", major)
+		}
+	}
+	// The two embedded files must actually differ, or the comparisons
+	// above would trivially pass regardless of which branch ran.
+	if queryPlans2019 == queryPlans2022 {
+		t.Fatal("query_plans_2019.sql and query_plans_2022.sql are byte-identical: this test cannot distinguish them")
+	}
 }
 
 // TestQueryTableColumns is this task's own B6-equivalent: the sketch in
@@ -638,5 +665,37 @@ func TestQueryOffWithHistorySucceeds(t *testing.T) {
 	}
 	if !strings.Contains(notice.Message, "OFF") {
 		t.Fatalf("capture notice does not name OFF: %q", notice.Message)
+	}
+}
+
+// TestQueryErrorStateNoHistoryFailsAtCode4 is fix 1's B6, the ERROR
+// third of design spec line 83's four non-collecting states: OFF and
+// READ_ONLY are proven against a real engine (tests/integration's
+// TestQueryStoreUnavailableAndOffWithHistory), but neither reviewer
+// found a way to provoke Query Store's ERROR state on a real container
+// without corrupting its own internal structures - unit coverage only,
+// deliberately, rather than inventing an engine recipe neither of them
+// could reproduce. Measured before this test existed: removing "ERROR"
+// from nonCollectingStates left the entire 2022 integration suite
+// green (73 === RUN), because nothing exercised this state at any
+// level.
+func TestQueryErrorStateNoHistoryFailsAtCode4(t *testing.T) {
+	conn := &fakeQueryConn{actual: "ERROR", noHistory: true}
+	sess := newFakeQuerySession(t, conn)
+	sink := &queryCaptureSink{}
+
+	err := Query(context.Background(), sess, QueryOptions{ID: 1, Window: defaultWindow()}, sink)
+	var pub *model.PublicError
+	if !errors.As(err, &pub) {
+		t.Fatalf("Query: error is not a *model.PublicError: %v", err)
+	}
+	if pub.Code != 4 {
+		t.Fatalf("code: got %d, want 4", pub.Code)
+	}
+	if pub.Kind != "query_store_unavailable" {
+		t.Fatalf("kind: got %q, want %q", pub.Kind, "query_store_unavailable")
+	}
+	if conn.identityArgs != nil {
+		t.Fatalf("identity query was issued despite the health gate, args=%v", conn.identityArgs)
 	}
 }

@@ -332,3 +332,13 @@ func plansQueryFor(major int) string {
 	}
 	return queryPlans2019
 }
+
+// QueryPlansSQL exposes the exact embedded query text Query runs for
+// major, unmodified - the same reason top.go's TopQuerySQL exists:
+// tests/integration's own synthetic aggregation fixture for
+// query_plans_2022.sql runs this real text (with only its FROM/JOIN
+// table names substituted) against temp tables, rather than a
+// hand-duplicated copy of the formula, so a defect introduced into
+// this actual query is what that fixture is built to catch (fix 1's
+// B2/B3/B7).
+func QueryPlansSQL(major int) string { return plansQueryFor(major) }

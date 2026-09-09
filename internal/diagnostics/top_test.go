@@ -88,7 +88,14 @@ func (r *fakeTopRows) Next(dest []driver.Value) error {
 // capture/capture_mode notice), with history always true.
 type fakeHealthRows struct {
 	actual, captureMode string
-	done                bool
+	// noHistory forces has_history false (fix 1's B6: ReadHealth's
+	// ERROR state can only be exercised as a unit test, since neither
+	// reviewer found a way to provoke it on a real engine without
+	// corrupting Query Store's own internal structures). Zero value
+	// (false) preserves every existing test's own "history always
+	// true" baseline.
+	noHistory bool
+	done      bool
 }
 
 func (r *fakeHealthRows) Columns() []string {
@@ -127,7 +134,7 @@ func (r *fakeHealthRows) Next(dest []driver.Value) error {
 	dest[5] = []byte("10.00")
 	dest[6] = int64(30)
 	dest[7] = int64(1)
-	dest[8] = true
+	dest[8] = !r.noHistory
 	r.done = true
 	return nil
 }

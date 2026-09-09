@@ -405,3 +405,41 @@ func TestParseEqualsForm(t *testing.T) {
 		}
 	})
 }
+
+// TestParseQueryIDPositional is fix 1's B5: nothing protected the
+// "qs query" positional argument's own rejection. Measured: a mutant
+// that always accepts (the id<=0-or-unparseable guard forced false)
+// leaves every test in internal/diagnostics and internal/cli green,
+// while the real mutated binary answers "qs query abc" against an
+// unreachable server with exit code 3 (connection failure) instead of
+// 2 (argument error) - exactly the arguments-before-connection
+// regression task 10 already paid a whole pass to fix once. A
+// syntactically invalid or non-positive id must never reach a
+// connection attempt at all.
+func TestParseQueryIDPositional(t *testing.T) {
+	t.Run("non-numeric is rejected before any connection", func(t *testing.T) {
+		_, _, err := Parse([]string{"--ctx", "client", "qs", "query", "abc"})
+		publicErrorCode(t, err, 2)
+	})
+	t.Run("zero is rejected", func(t *testing.T) {
+		_, _, err := Parse([]string{"--ctx", "client", "qs", "query", "0"})
+		publicErrorCode(t, err, 2)
+	})
+	t.Run("negative is rejected", func(t *testing.T) {
+		_, _, err := Parse([]string{"--ctx", "client", "qs", "query", "-5"})
+		publicErrorCode(t, err, 2)
+	})
+	t.Run("missing entirely is rejected", func(t *testing.T) {
+		_, _, err := Parse([]string{"--ctx", "client", "qs", "query"})
+		publicErrorCode(t, err, 2)
+	})
+	t.Run("a valid positive id is accepted and resolves QueryID", func(t *testing.T) {
+		req, _, err := Parse([]string{"--ctx", "client", "qs", "query", "4821"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if req.QueryID != 4821 {
+			t.Fatalf("QueryID: got %d, want 4821", req.QueryID)
+		}
+	})
+}
