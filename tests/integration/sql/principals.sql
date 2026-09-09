@@ -98,16 +98,23 @@ GO
 DENY SELECT ON SCHEMA::Restricted TO asq_test_i, asq_test_s;
 GO
 
--- dbo.DeniedDefinitionProc (task 13, objects.sql): GRANT EXECUTE keeps
--- the object visible to sys.objects for I and S (VIEW DEFINITION is
--- about to be denied specifically, and metadata visibility only needs
--- SOME permission on the object, not that one); DENY VIEW DEFINITION
--- then wins over the schema-wide GRANT VIEW DEFINITION above - SQL
--- Server's own DENY-always-wins precedence, regardless of scope
--- specificity - so sys.sql_modules.definition comes back NULL for
--- this one object while the object itself stays resolvable. This is
--- "obj code"'s own confirmed permission_denied fixture (design spec
--- line 204).
+-- dbo.DeniedDefinitionProc (task 13, objects.sql): kept as a
+-- documented negative result (fix-0). Measured against a real engine:
+-- DENY VIEW DEFINITION on this object removes its sys.objects row
+-- entirely for I/S, regardless of the GRANT EXECUTE below - DENY wins
+-- over metadata visibility itself, not merely over reading the
+-- definition text. This does NOT build obj code's permission_denied
+-- fixture; see dbo.ExecuteOnlyProc below for the grant that does.
 GRANT EXECUTE ON dbo.DeniedDefinitionProc TO asq_test_i, asq_test_s;
 DENY VIEW DEFINITION ON dbo.DeniedDefinitionProc TO asq_test_i, asq_test_s;
+GO
+
+-- dbo.ExecuteOnlyProc (fix-0): obj code's REAL confirmed
+-- permission_denied fixture (design spec line 204). Q holds no VIEW
+-- DEFINITION anywhere (unlike I/S, which get it database-wide above) -
+-- GRANT EXECUTE alone, with no DENY at all, is enough for the object
+-- to stay visible in sys.objects while sys.sql_modules.definition
+-- reads NULL and HAS_PERMS_BY_NAME(...,'VIEW DEFINITION') reads 0 for
+-- Q. Measured directly (objects_test.go's TestObjCodePermissionDenied).
+GRANT EXECUTE ON dbo.ExecuteOnlyProc TO asq_test_q;
 GO

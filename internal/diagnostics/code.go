@@ -102,6 +102,25 @@ func moduleDefinitionUnavailable(obj sqlserver.Object) error {
 	}
 }
 
+// moduleNotAModule is the definitionStateDefinitionUnavailable case
+// module.sql's own is_encrypted column reveals directly, without ever
+// probing a permission: OBJECTPROPERTYEX(..., 'IsEncrypted') is NULL
+// for any object type it does not apply to (only procedures,
+// functions, triggers and views do - measured against a real table,
+// which is exactly the mistake "obj code" run against a table makes).
+// obj.Type names which one it actually is, rather than inventing a
+// permission cause a category mismatch has nothing to do with -
+// design spec line 204's own default state, "without inventing its
+// cause", applied here to a cause this function CAN establish (the
+// object is not a module at all) rather than one it cannot.
+func moduleNotAModule(obj sqlserver.Object) error {
+	return &model.PublicError{
+		Code:    4,
+		Kind:    definitionStateDefinitionUnavailable,
+		Message: fmt.Sprintf("%s.%s (type %q) is not a module: obj code applies to procedures, functions, triggers and views only", obj.Schema, obj.Name, obj.Type),
+	}
+}
+
 // Code runs "obj code <schema.name>": exports obj's visible module
 // definition to a .sql artifact, or reports one of the three failure
 // states the design spec's definition-state contract (line 204)
@@ -146,12 +165,20 @@ func Code(ctx context.Context, s *sqlserver.Session, name string, dst model.Sink
 		return moduleDisappeared(obj)
 	}
 
-	encrypted, ok := cells[1].(bool)
-	if !ok {
+	if encrypted, ok := cells[1].(bool); ok {
+		if encrypted {
+			return moduleEncrypted(obj)
+		}
+	} else if cells[1] == nil {
+		// OBJECTPROPERTYEX(...,'IsEncrypted') itself is NULL: obj is
+		// not a module at all (a table, most likely - see
+		// moduleNotAModule's own doc comment). Reported directly,
+		// never as unexpectedCell's generic execution failure, and
+		// never by probing a permission that has nothing to do with
+		// the actual cause.
+		return moduleNotAModule(obj)
+	} else {
 		return unexpectedCell("is_encrypted")
-	}
-	if encrypted {
-		return moduleEncrypted(obj)
 	}
 
 	if cells[0] == nil {

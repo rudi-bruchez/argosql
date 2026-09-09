@@ -103,6 +103,37 @@ func TestCodeEncrypted(t *testing.T) {
 	}
 }
 
+// TestCodeOnNonModuleObject is fix-0's own point 2: obj code called
+// on a non-module object (a table, most commonly) must report
+// definitionStateDefinitionUnavailable at code 4, never code 5.
+// Measured directly against a real engine (tests/integration) before
+// this fix: OBJECTPROPERTYEX(object_id(dbo.Orders),'IsEncrypted')
+// returns NULL, and Code used to fall into unexpectedCell's generic
+// execution failure (code 5, "unexpected value from
+// sys.database_query_store_options" - a message copied from a
+// different query entirely) instead of the closed vocabulary's own
+// default state.
+func TestCodeOnNonModuleObject(t *testing.T) {
+	conn := &fakeObjConn{responses: []objQueryResponse{
+		resolveFoundResponse(606, "dbo", "Orders", "U"),
+		moduleRowResponse(true, nil, nil),
+	}}
+	sess := newFakeObjSession(t, conn)
+	sink := &objCaptureSink{}
+
+	err := Code(context.Background(), sess, "dbo.Orders", sink)
+	var pub *model.PublicError
+	if !errors.As(err, &pub) {
+		t.Fatalf("Code: want *model.PublicError, got %#v", err)
+	}
+	if pub.Code != 4 || pub.Kind != definitionStateDefinitionUnavailable {
+		t.Fatalf("Code on a non-module object: want code 4/%s, got code %d/%s", definitionStateDefinitionUnavailable, pub.Code, pub.Kind)
+	}
+	if len(sink.tables) != 0 {
+		t.Fatalf("non-module object: want no table row, got %#v", sink.tables)
+	}
+}
+
 // TestCodePermissionDenied is the definitionStatePermissionDenied
 // path: a null definition on a visible, unencrypted module, where a
 // direct probe of VIEW DEFINITION on the object confirms a denial.

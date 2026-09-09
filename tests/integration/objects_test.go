@@ -70,22 +70,74 @@ func TestObjects(t *testing.T) {
 		})
 	}
 
-	// Measured, and NOT the scenario this suite can integration-test:
-	// dbo.DeniedDefinitionProc (GRANT EXECUTE, DENY VIEW DEFINITION,
-	// both confirmed via sqlserver.Probe in isolation) is still
-	// not_found_or_not_visible to I/S, code 8 - not permission_denied.
-	// EXECUTE alone does not keep a module's sys.objects row visible
-	// once VIEW DEFINITION is denied on that exact object: this
-	// project had assumed "any granted permission" preserves catalog
-	// visibility (objects.go's own doc comment on Resolve says so,
-	// citing ownership/VIEW DEFINITION/CONTROL/"another permission"),
-	// but VIEW DEFINITION itself appears to be what governs a
-	// procedure's row visibility, independent of EXECUTE. Constructing
-	// a resolvable-but-VIEW-DEFINITION-denied module through ordinary
-	// GRANT/DENY was not achieved here; Code's permission_denied branch
-	// is covered by TestCodePermissionDenied (code_test.go, a fake
-	// driver) instead. Left as an open question for the design review:
-	// is this branch reachable at all outside ownership/CONTROL?
+	// Measured (fix-0), and NOT confused with the fixture below:
+	// dbo.DeniedDefinitionProc (GRANT EXECUTE, DENY VIEW DEFINITION on
+	// the SAME object) is not_found_or_not_visible to I/S, code 8 -
+	// DENY VIEW DEFINITION removes the object's sys.objects row itself,
+	// not merely its definition text. That is a different question
+	// from the one design spec line 204 actually asks - see
+	// TestObjCodePermissionDenied, which asks the right one.
+}
+
+// TestObjCodePermissionDenied is design spec line 204's own confirmed
+// permission_denied fixture, fix-0's first point: "denied" there does
+// not require an explicit DENY - the ABSENCE of a VIEW DEFINITION
+// grant already makes the permission missing. Q holds no VIEW
+// DEFINITION anywhere (schema- or database-wide); principals.sql
+// grants it EXECUTE alone, with no DENY at all, on
+// dbo.ExecuteOnlyProc. Measured directly here, not merely inferred
+// from the exit code: HAS_PERMS_BY_NAME is two-state on this engine
+// (0 for an absent permission and for an invisible object alike - see
+// CLAUDE.md), so the object's actual presence in sys.objects is
+// asserted explicitly, via a successful sqlserver.Resolve, rather than
+// trusted to the VIEW DEFINITION probe alone.
+func TestObjCodePermissionDenied(t *testing.T) {
+	lab := NewLab(t, os.Getenv("ASQ_TEST_IMAGE"))
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	pw := lab.ensurePrincipals(t)
+	qProfile := principalProfile(lab, "asq_test_q", pw.Q)
+	sess, err := sqlserver.Open(ctx, qProfile)
+	if err != nil {
+		t.Fatalf("open as Q: %v", err)
+	}
+	defer sess.Close()
+
+	obj, err := sqlserver.Resolve(ctx, sess.Conn, "dbo.ExecuteOnlyProc")
+	if err != nil {
+		t.Fatalf("dbo.ExecuteOnlyProc must be visible to Q (EXECUTE only, no DENY): %v", err)
+	}
+	if obj.Schema != "dbo" || obj.Name != "ExecuteOnlyProc" {
+		t.Fatalf("Resolve: got %+v", obj)
+	}
+
+	perm, err := sqlserver.Probe(ctx, sess.Conn, "dbo.ExecuteOnlyProc", "OBJECT", "VIEW DEFINITION")
+	if err != nil {
+		t.Fatalf("VIEW DEFINITION probe: %v", err)
+	}
+	if perm != sqlserver.Denied {
+		t.Fatalf("VIEW DEFINITION probe for Q on dbo.ExecuteOnlyProc: got %v, want Denied", perm)
+	}
+
+	r, code := lab.Run(t, "Q", []string{"obj", "code", "dbo.ExecuteOnlyProc"})
+	if code != 4 || r.Error == nil || r.Error.Kind != "permission_denied" {
+		t.Fatalf("obj code dbo.ExecuteOnlyProc as Q: got code %d, error %#v; want 4/permission_denied", code, r.Error)
+	}
+}
+
+// TestObjCodeOnNonModuleObject is fix-0's second point: obj code
+// called on a table (not a module) must report
+// definition_unavailable at code 4, never code 5. Measured before
+// this fix, against a real engine: Code fell into unexpectedCell's
+// generic execution failure because
+// OBJECTPROPERTYEX(object_id,'IsEncrypted') is NULL for a table.
+func TestObjCodeOnNonModuleObject(t *testing.T) {
+	lab := NewLab(t, os.Getenv("ASQ_TEST_IMAGE"))
+	r, code := lab.Run(t, "I", []string{"obj", "code", "dbo.Orders"})
+	if code != 4 || r.Error == nil || r.Error.Kind != "definition_unavailable" {
+		t.Fatalf("obj code dbo.Orders (a table) as I: got code %d, error %#v; want 4/definition_unavailable", code, r.Error)
+	}
 }
 
 // TestSize proves size table's own extension and ordering

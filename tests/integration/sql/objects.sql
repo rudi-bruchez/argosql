@@ -86,16 +86,49 @@ END
 GO
 
 -- Task 13's own fixture objects, for obj table/obj code/idx list/size
--- table: a plain, unencrypted module (permissions.sql denies VIEW
--- DEFINITION on this one object specifically, so a principal that
--- otherwise holds the database-wide grant still hits a confirmed
--- object-level denial - see permission_denied in
--- tests/integration/objects_test.go).
+-- table.
+--
+-- dbo.DeniedDefinitionProc was built to demonstrate obj code's
+-- permission_denied state via an object-level DENY VIEW DEFINITION
+-- on top of I/S's own database-wide GRANT VIEW DEFINITION
+-- (principals.sql). Measured against a real engine (fix-0): this
+-- does NOT produce a visible-but-denied module - DENY VIEW DEFINITION
+-- removes the object's sys.objects row entirely for that principal,
+-- regardless of any other grant (GRANT EXECUTE included), so Resolve
+-- itself fails at code 8 rather than reaching a definition_state at
+-- all. Left in place as a documented negative result, not a fixture
+-- any test currently exercises for that purpose - see
+-- dbo.ExecuteOnlyProc below for the fixture that actually works.
 IF OBJECT_ID(N'AppDB.dbo.DeniedDefinitionProc') IS NOT NULL
     DROP PROCEDURE dbo.DeniedDefinitionProc;
 GO
 
 CREATE PROCEDURE dbo.DeniedDefinitionProc
+AS
+BEGIN
+    SELECT 1 AS Placeholder;
+END
+GO
+
+-- dbo.ExecuteOnlyProc: obj code's REAL permission_denied fixture
+-- (fix-0). Design spec line 204 says "a confirmed denied definition
+-- permission" - "denied" there does not require an explicit DENY: the
+-- ABSENCE of a VIEW DEFINITION grant is enough for the permission to
+-- be missing. principals.sql grants Q (who holds no VIEW DEFINITION
+-- anywhere, schema- or database-wide) EXECUTE on this one procedure
+-- and nothing else. Measured against a real engine: EXECUTE alone
+-- keeps the object visible in sys.objects (metadata visibility needs
+-- only SOME permission, and EXECUTE qualifies here - unlike the
+-- DeniedDefinitionProc case above, where VIEW DEFINITION was
+-- explicitly denied and removed visibility outright), while
+-- sys.sql_modules.definition reads NULL and HAS_PERMS_BY_NAME on VIEW
+-- DEFINITION reads 0 (Denied) for that same principal - exactly the
+-- state the spec describes.
+IF OBJECT_ID(N'AppDB.dbo.ExecuteOnlyProc') IS NOT NULL
+    DROP PROCEDURE dbo.ExecuteOnlyProc;
+GO
+
+CREATE PROCEDURE dbo.ExecuteOnlyProc
 AS
 BEGIN
     SELECT 1 AS Placeholder;
