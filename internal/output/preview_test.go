@@ -920,3 +920,65 @@ func TestRedistributeFollowsSpecOrder(t *testing.T) {
 		t.Fatalf("redistribution did not follow spec order: a=%d c=%d, want a=2 c=1 (a precedes c in the table list)", aShown, cShown)
 	}
 }
+
+// findTSVTableLine returns the "table" line for name from a TSV render, or
+// "" if there is none. A "table" line always starts with "table\t"
+// followed by the table's own name as its second field.
+func findTSVTableLine(b []byte, name string) string {
+	for _, line := range strings.Split(string(b), "\n") {
+		fields := strings.Split(line, "\t")
+		if len(fields) >= 2 && fields[0] == "table" && fields[1] == name {
+			return line
+		}
+	}
+	return ""
+}
+
+// TestTSVPreviewOmittedOnZeroShownWithRowsCollected checks design spec
+// line 101's "TSV states this explicitly": a table with rows_shown=0 while
+// rows_collected>0 must carry a literal preview_omitted=true field on its
+// "table" line, not just the rows_shown/omitted_reasons pair a reader
+// would otherwise have to infer it from.
+func TestTSVPreviewOmittedOnZeroShownWithRowsCollected(t *testing.T) {
+	r := model.Result{SchemaVersion: 1, OK: true, Tables: []model.TableResult{{
+		Spec:  model.TableSpec{Name: "t", Columns: []model.Column{{Name: "v", SQLType: "INT"}}},
+		Rows:  [][]model.Cell{{int64(1)}, {int64(2)}, {int64(3)}},
+		State: model.Completeness{RowsCollected: 3, CollectionComplete: true, PropertiesComplete: true},
+	}}}
+	b, err := Render(r, PreviewOptions{Rows: 0, ByteLimit: 32768}, "tsv")
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	line := findTSVTableLine(b, "t")
+	if line == "" {
+		t.Fatalf("no table line found for %q in:\n%s", "t", b)
+	}
+	if !strings.Contains(line, "preview_omitted=true") {
+		t.Fatalf("table line = %q, want it to carry preview_omitted=true (rows_shown=0, rows_collected=3)", line)
+	}
+}
+
+// TestTSVPreviewOmittedAbsentForLegitimatelyEmptyTable is the important
+// half of this pair: a table with zero rows collected and a complete
+// collection is legitimately empty, per design spec line 101 ("Only zero
+// collected rows with complete collection can be called empty"), and must
+// never carry preview_omitted=true. Emitting the field here would make
+// "empty" indistinguishable from "omitted" in the opposite direction from
+// the defect this whole correction exists to fix.
+func TestTSVPreviewOmittedAbsentForLegitimatelyEmptyTable(t *testing.T) {
+	r := model.Result{SchemaVersion: 1, OK: true, Tables: []model.TableResult{{
+		Spec:  model.TableSpec{Name: "t", Columns: []model.Column{{Name: "v", SQLType: "INT"}}},
+		State: model.Completeness{RowsCollected: 0, CollectionComplete: true, PropertiesComplete: true},
+	}}}
+	b, err := Render(r, PreviewOptions{Rows: 10, ByteLimit: 32768}, "tsv")
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	line := findTSVTableLine(b, "t")
+	if line == "" {
+		t.Fatalf("no table line found for %q in:\n%s", "t", b)
+	}
+	if strings.Contains(line, "preview_omitted") {
+		t.Fatalf("table line = %q, must not carry preview_omitted: this table is legitimately empty (zero collected, collection complete)", line)
+	}
+}

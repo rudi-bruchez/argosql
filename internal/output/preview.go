@@ -1034,14 +1034,24 @@ func encodeResultTSV(r model.Result) ([]byte, error) {
 		appendTSVLine(&buf, "artifact", tsvEscaper.Replace(a.Kind), tsvEscaper.Replace(a.Path), strconv.FormatInt(a.Bytes, 10), strconv.FormatBool(a.Complete))
 	}
 	for _, t := range r.Tables {
-		appendTSVLine(&buf, "table", tsvEscaper.Replace(t.Spec.Name),
+		tableFields := []string{"table", tsvEscaper.Replace(t.Spec.Name),
 			fmt.Sprintf("rows_collected=%d", t.State.RowsCollected),
 			fmt.Sprintf("collection_complete=%t", t.State.CollectionComplete),
 			fmt.Sprintf("properties_complete=%t", t.State.PropertiesComplete),
 			fmt.Sprintf("rows_shown=%d", t.Preview.RowsShown),
 			fmt.Sprintf("preview_complete=%t", t.Preview.PreviewComplete),
 			fmt.Sprintf("omitted_reasons=%s", strings.Join(t.Preview.OmittedReasons, ",")),
-		)
+		}
+		// Design spec, line 101: zero rows shown while rows were
+		// collected is preview_omitted, not empty, and "TSV states this
+		// explicitly" - so this field is emitted only in that exact
+		// condition, never for a table that is legitimately empty
+		// (zero collected, collection complete), which the spec is
+		// explicit must still be callable empty.
+		if t.Preview.RowsShown == 0 && t.State.RowsCollected > 0 {
+			tableFields = append(tableFields, "preview_omitted=true")
+		}
+		appendTSVLine(&buf, tableFields...)
 		names := make([]string, len(t.Spec.Columns)+1)
 		names[0] = "columns"
 		for i, c := range t.Spec.Columns {
