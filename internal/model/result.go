@@ -106,19 +106,30 @@ type TableResult struct {
 // Reason is set only for an OMITTED artifact - one that was never
 // written at all because a single collected value exceeded the
 // artifact byte quota (design spec, line 111: "return code 7 with an
-// explicit omitted-artifact record" - fix 1's A5). Path stays empty
-// (nothing was ever written) and Bytes holds however many bytes were
-// actually read before the quota breach was detected - a lower bound
-// on the source's true size, never a size that was ever committed to
-// disk. Drawn from the same closed vocabulary as every other omission
+// explicit omitted-artifact record" - fix 1's A5). For that case, Path
+// stays empty and Bytes stays zero: neither ever held a real value for
+// an omitted artifact, and leaving Bytes at whatever was read would
+// invite a consumer to read it as "the artifact's size", which is
+// exactly the artifact this record says was never produced.
+// BytesReadBeforeLimit carries the one fact this project actually
+// measured before refusing - however many bytes of the source were
+// read before the quota breach was detected - named for exactly that,
+// never for the source's true size: reading more of a value this
+// project has already decided to reject would defeat the point of
+// refusing it (fix 1's A5, sharpened by fix 2's B-addendum: "ne pas
+// laisser croire que c'est une taille"). Reason plus Complete=false
+// already states, in this same record, that the source was larger
+// than the quota; BytesReadBeforeLimit never claims to say by how
+// much. Drawn from the same closed vocabulary as every other omission
 // reason in this project (ReasonCollectionLimit); empty for every
 // ordinary, successfully written artifact.
 type Artifact struct {
-	Kind     string `json:"kind"`
-	Path     string `json:"path"`
-	Bytes    int64  `json:"bytes"`
-	Complete bool   `json:"complete"`
-	Reason   string `json:"reason,omitempty"`
+	Kind                 string `json:"kind"`
+	Path                 string `json:"path"`
+	Bytes                int64  `json:"bytes"`
+	Complete             bool   `json:"complete"`
+	Reason               string `json:"reason,omitempty"`
+	BytesReadBeforeLimit int64  `json:"bytes_read_before_limit,omitempty"`
 }
 
 // ContextInfo describes the connection the diagnostics ran against.

@@ -304,18 +304,19 @@ func (c *Collector) finalizeCurrent(collectionComplete, propertiesComplete bool)
 // accepted so far" to close cleanly around a single opaque object.
 //
 // A refusal also records an OMITTED artifact entry in c.artifacts - a
-// model.Artifact with no Path (nothing was ever written), Bytes set to
-// however many bytes were actually read before the breach was
-// detected, and Reason set to the closed vocabulary's own
-// "collection_limit" (design spec, line 111: "return code 7 with an
-// explicit omitted-artifact record" - fix 1's A5). Before this fix,
-// only the returned error named kind, in a sentence; a consumer of the
-// artifact registry (the manifest, or the live result - both share
-// this same slice, see Finish) found no structured trace that an
-// artifact had ever been attempted at all. This entry is recorded
-// regardless of what the caller does with the returned error - the
-// same "a Sink already accepted what it accepted" rule Finish itself
-// documents.
+// model.Artifact with no Path and no Bytes (nothing was ever written;
+// see model.Artifact's own doc comment on why Bytes must not carry a
+// value here), BytesReadBeforeLimit set to however many bytes were
+// actually read before the breach was detected, and Reason set to the
+// closed vocabulary's own "collection_limit" (design spec, line 111:
+// "return code 7 with an explicit omitted-artifact record" - fix 1's
+// A5). Before fix 1, only the returned error named kind, in a
+// sentence; a consumer of the artifact registry (the manifest, or the
+// live result - both share this same slice, see Finish) found no
+// structured trace that an artifact had ever been attempted at all.
+// This entry is recorded regardless of what the caller does with the
+// returned error - the same "a Sink already accepted what it
+// accepted" rule Finish itself documents.
 func (c *Collector) File(kind, suffix string, src io.Reader) (model.Artifact, error) {
 	remaining := c.store.budget - c.store.used
 	if remaining < 0 {
@@ -336,7 +337,7 @@ func (c *Collector) File(kind, suffix string, src io.Reader) (model.Artifact, er
 	if n > remaining {
 		f.Close()
 		os.Remove(path)
-		c.artifacts = append(c.artifacts, model.Artifact{Kind: kind, Bytes: n, Complete: false, Reason: model.ReasonCollectionLimit})
+		c.artifacts = append(c.artifacts, model.Artifact{Kind: kind, Complete: false, Reason: model.ReasonCollectionLimit, BytesReadBeforeLimit: n})
 		return model.Artifact{}, collectionLimitError(fmt.Sprintf("artifact %q exceeds the remaining byte budget", kind))
 	}
 	if err := f.Close(); err != nil {

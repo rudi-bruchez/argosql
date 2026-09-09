@@ -129,6 +129,17 @@ func TestSummarizeStatementCostUnavailableWhenAttributeMissing(t *testing.T) {
 // own repro, byte for byte: a StmtSimple whose StatementSubTreeCost
 // (12) differs from a descendant RelOp's own EstimatedTotalSubtreeCost
 // (3) - the summary must write 12, never 3.
+//
+// This case is constructed, not observed: every real plan measured
+// against a live engine for this task (both 2019 and 2022, via
+// tests/integration/plan_test.go's own TestPlanSummary) had its root
+// RelOp's cost equal its statement's cost, so a real repro of the bug
+// this test guards was never found in the time available. The case
+// stays plausible - nothing in the engine's own documentation
+// guarantees the two always coincide, and the previous implementation
+// silently assumed they did - which is why this synthetic fixture is
+// kept rather than dropped, not because it was ever seen on a real
+// engine (fix 2, resolving fix 1's own open concern on this point).
 func TestSummarizeReadsRealStatementCostFromStmtSimple(t *testing.T) {
 	doc := `<ShowPlanXML><StmtSimple StatementSubTreeCost="12"><QueryPlan>` +
 		`<RelOp NodeId="0"><RelOp NodeId="1" EstimatedTotalSubtreeCost="3"/></RelOp>` +
@@ -168,11 +179,29 @@ func TestSummarizeOperatorsCappedAndOrdered(t *testing.T) {
 	if !ops.collectionComplete {
 		t.Fatal("operators table: the operatorCap cap is this summary's own declared shape, never a reported collection limit")
 	}
+	// Fix 2's B3: physical_op, logical_op and estimated_subtree_cost were
+	// unchecked entirely - a reviewer measured that setting the first two
+	// to nil and the third to a fixed 0 for every row left this test
+	// green, because sorting operates on the candidates, never on the
+	// emitted cells. buildPlanXML names them "Root"/"Root" for NodeId 0
+	// and "Op<i>"/"L<i>" for NodeId i>=1, cost n-i.
 	wantNodeIDs := []int64{0, 1, 2, 3, 4}
+	wantPhysicalOps := []string{"Root", "Op1", "Op2", "Op3", "Op4"}
+	wantLogicalOps := []string{"Root", "L1", "L2", "L3", "L4"}
+	wantCosts := []float64{float64(n + 1000), float64(n - 1), float64(n - 2), float64(n - 3), float64(n - 4)}
 	for i, row := range ops.rows {
 		nodeID, ok := row[0].(int64)
 		if !ok || nodeID != wantNodeIDs[i] {
 			t.Fatalf("row %d node_id: got %#v, want %d (descending cost order)", i, row[0], wantNodeIDs[i])
+		}
+		if got, ok := row[1].(string); !ok || got != wantPhysicalOps[i] {
+			t.Fatalf("row %d physical_op: got %#v, want %q", i, row[1], wantPhysicalOps[i])
+		}
+		if got, ok := row[2].(string); !ok || got != wantLogicalOps[i] {
+			t.Fatalf("row %d logical_op: got %#v, want %q", i, row[2], wantLogicalOps[i])
+		}
+		if got, ok := row[3].(float64); !ok || got != wantCosts[i] {
+			t.Fatalf("row %d estimated_subtree_cost: got %#v, want %v", i, row[3], wantCosts[i])
 		}
 	}
 }
@@ -278,6 +307,30 @@ func TestSummarizeReferencesUnderCapStaysComplete(t *testing.T) {
 	if n := sink.noticeWithKind("plan_summary_truncated"); n != nil {
 		t.Fatalf("unexpected truncation notice under the cap: %+v", n)
 	}
+
+	// Fix 2's B4: no test checked a single reference cell's actual
+	// value - a reviewer measured that making trimBrackets the identity
+	// function (so every cell keeps its literal "[...]" brackets) left
+	// every existing test green. buildPlanXML's Object elements always
+	// carry Database="[AppDB]" Schema="[dbo]" Table="[T<i>]"
+	// Index="[IX_T<i>]"; the unbracketed forms must be exactly what
+	// each cell holds.
+	found := false
+	for _, row := range refs.rows {
+		db, _ := row[0].(string)
+		schema, _ := row[1].(string)
+		table, _ := row[2].(string)
+		index, _ := row[3].(string)
+		if db == "AppDB" && schema == "dbo" && table == "T0" && index == "IX_T0" {
+			found = true
+		}
+		if strings.ContainsAny(db+schema+table+index, "[]") {
+			t.Fatalf("reference cell still carries a bracket: %+v", row)
+		}
+	}
+	if !found {
+		t.Fatalf("no reference row matches the unbracketed AppDB/dbo/T0/IX_T0 tuple: %+v", refs.rows)
+	}
 }
 
 // TestSummarizeWarningsUnknownTypeAndCap covers the brief's own
@@ -318,6 +371,13 @@ func TestSummarizeWarningsUnknownTypeAndCap(t *testing.T) {
 	}
 	if !foundKnown || !foundUnknown {
 		t.Fatalf("expected both a known and an unrecognized warning type retained (order-of-arrival, both before the cap): known=%v unknown=%v", foundKnown, foundUnknown)
+	}
+	// Fix 2's B7: the references test already checks its own truncation
+	// notice, but nothing checked the warnings one - a reviewer measured
+	// that removing dst.Notice from writeWarningsTable left this test
+	// green, because it only ever checked warn.collectionComplete.
+	if n := sink.noticeWithKind("plan_summary_truncated"); n == nil {
+		t.Fatal("no truncation notice emitted for warnings")
 	}
 }
 
@@ -371,6 +431,34 @@ func TestSummarizeWarningsAttributeFormAndNestedChildrenInSameDocument(t *testin
 	}
 	if !sawChild {
 		t.Fatalf("Warnings' own ColumnsWithNoStatistics child was dropped: %+v", warn.rows)
+	}
+}
+
+// TestSummarizeWarningChildDetailCarriesAttributes is fix 2's B5: no
+// existing test read a warning row's own "detail" column, only its
+// "warning_type" - a reviewer measured that making warningDetail
+// return an unconditional empty string left every test green. A
+// direct child of Warnings with two attributes must render both, in
+// declaration order, joined by "; ".
+func TestSummarizeWarningChildDetailCarriesAttributes(t *testing.T) {
+	doc := `<ShowPlanXML><QueryPlan>` +
+		`<Warnings><SpillToTempDb SpillLevel="1" SpilledThreadCount="4"/></Warnings>` +
+		`</QueryPlan></ShowPlanXML>`
+	sink := &fakeSink{}
+	if err := Summarize(strings.NewReader(doc), sink); err != nil {
+		t.Fatal(err)
+	}
+	warn := sink.table(WarningsTable.Name)
+	if warn == nil || len(warn.rows) != 1 {
+		t.Fatalf("warnings retained: got %+v, want exactly 1 row", warn)
+	}
+	row := warn.rows[0]
+	if row[0] != "SpillToTempDb" {
+		t.Fatalf("warning_type: got %#v, want %q", row[0], "SpillToTempDb")
+	}
+	want := "SpillLevel=1; SpilledThreadCount=4"
+	if row[1] != want {
+		t.Fatalf("detail: got %#v, want %q", row[1], want)
 	}
 }
 
@@ -464,14 +552,25 @@ func TestSummarizeMalformedXMLReturnsCode5(t *testing.T) {
 	}
 }
 
-// TestSummarizeBoundedRetentionAcrossGrowingDocumentSize is this
-// task's own load-bearing proof against "un résumé à cinq lignes
-// produit par un parseur qui a chargé tout le document satisfait
-// l'assertion et viole la clause" (this task's dispatch, quoting
-// design spec line 89): growing the document 200x (100 operators/refs/
-// warnings to 20,000) must produce ZERO growth in what any of the four
-// tables retains - operators, references and warnings each stay at or
-// under their fixed cap regardless of N.
+// TestSummarizeBoundedRetentionAcrossGrowingDocumentSize checks that
+// growing the document 200x (100 operators/refs/warnings to 20,000)
+// produces ZERO growth in what any of the four tables retains -
+// operators, references and warnings each stay at or under their
+// fixed cap regardless of N.
+//
+// Fix 2's B9 corrects what fix 1's own report claimed for this test:
+// it is NOT the primary proof of bounded parsing, and it does not
+// distinguish a token-by-token reader from a whole-document DOM. A
+// reviewer built four different DOM-shaped implementations of
+// Summarize (a pointer tree copying attributes, a tree of pre-parsed
+// fields, a plain io.ReadAll + xml.Unmarshal, and a flat-array tree) -
+// every one of them PASSES this test, because every one of them still
+// truncates its own final result to the same five/100/100 shape
+// before handing rows to dst. This test only proves the OUTPUT is
+// capped; TestSummarizeDoesNotHoldWholeDocumentInMemory, below, is the
+// one test that actually caught all four DOM-shaped implementations -
+// see its own doc comment for why, and do not remove it on the belief
+// that this test already covers the same ground.
 func TestSummarizeBoundedRetentionAcrossGrowingDocumentSize(t *testing.T) {
 	for _, n := range []int{100, 20000} {
 		types := []string{"ColumnsWithNoStatistics"}
@@ -504,29 +603,52 @@ func TestSummarizeBoundedRetentionAcrossGrowingDocumentSize(t *testing.T) {
 // TestSummarizeDoesNotHoldWholeDocumentInMemory is this task's own
 // instrumentation of the parser's own memory footprint, as the brief
 // requires explicitly ("instrumenter... les allocations pour prouver
-// qu'aucune représentation complète du document n'est construite" -
-// not decorative, since the output-shape tests above would stay green
-// even against a full xml.Unmarshal-into-a-tree implementation that
-// only truncates its RESULT to five/100/100 rows afterwards).
+// qu'aucune représentation complète du document n'est construite").
+//
+// Fix 2's B9: this is the PRIMARY, DISCRIMINATING evidence against a
+// whole-document DOM, not a secondary or "necessarily coarse" signal -
+// fix 1's own report had these two roles backwards, and a reviewer
+// measured exactly why that was dangerous. Four separately-built
+// DOM-shaped implementations of Summarize (a pointer tree copying
+// attributes, a tree of pre-parsed fields, plain io.ReadAll +
+// xml.Unmarshal, and a flat-array tree) all PASS
+// TestSummarizeBoundedRetentionAcrossGrowingDocumentSize, because a
+// DOM can truncate its own final result to the same shape a token
+// reader produces - that test only ever looks at the OUTPUT. All four
+// FAIL this one. This is the only test in this file that actually
+// tells a token-by-token reader apart from a DOM; do not read the
+// retention test above as "the real proof" and treat this one as
+// removable padding.
 //
 // It samples runtime.MemStats.HeapAlloc from a second goroutine WHILE
-// Summarize is running against a 20,000-operator, 1MB+ fixture, and
-// asserts the observed peak growth stays within a small, generous
-// multiple of the document's own byte size. A genuine whole-document
-// DOM (one Go value - struct, slice, or attribute map - per element,
-// held simultaneously for the call's whole duration) costs several
-// times the raw byte size in Go's own struct/pointer/interface
-// overhead; this bounded, token-by-token parser's own working set is a
-// handful of fixed-size slices plus whatever short-lived garbage a
-// single xml.Decoder.Token() call produces, which GC can reclaim
-// between samples.
+// Summarize is running against a 20,000-operator, ~1.9 MB fixture, and
+// asserts the observed peak growth stays within 3x the document's own
+// byte size. A genuine whole-document DOM (one Go value - struct,
+// slice, or attribute map - per element, held simultaneously for the
+// call's whole duration) costs several times the raw byte size in
+// Go's own struct/pointer/interface overhead; this bounded,
+// token-by-token parser's own working set is a handful of fixed-size
+// slices plus whatever short-lived garbage a single
+// xml.Decoder.Token() call produces, which GC can reclaim between
+// samples.
 //
-// This measurement is necessarily coarse - GC timing and allocator
-// behavior are not fully deterministic - which is why the bound is
-// generous and why TestSummarizeBoundedRetentionAcrossGrowingDocumentSize
-// above, not this test, is the primary, exact evidence; this one is a
-// second, independent signal specifically against a DOM-shaped
-// regression.
+// The factor was measured, not guessed. On a real 1,895,827-byte
+// fixture, a reviewer's four DOM-shaped implementations grew the heap
+// by 12,238,856 to 15,587,480 bytes (6.5x to 8.2x); this project's own
+// honest, token-by-token Summarize grew it by 2,673,072 to 2,815,392
+// bytes (1.4x to 1.5x) on the reviewer's machine, and 2,558,832 to
+// 2,889,856 bytes (1.35x to 1.52x) across five runs measured on the
+// machine this fix was written on. A limit of 6x, this test's own
+// previous value, left only 7.6% of headroom below the cheapest DOM
+// measured - close enough that a leaner DOM variant, or one lucky GC
+// pass, could have passed it. 3x keeps roughly double the honest
+// implementation's own worst measured growth as margin while sitting
+// comfortably below every DOM variant measured; five consecutive runs
+// on this machine stayed under it (worst-case growth 2,889,856 bytes
+// against a 5,687,571-byte limit for this fixture's size). This
+// measurement still carries ordinary GC/allocator noise and is not
+// exact to the byte, which is why the margin exists at all - but it is
+// the discriminating measurement in this file, not a decorative one.
 func TestSummarizeDoesNotHoldWholeDocumentInMemory(t *testing.T) {
 	doc := buildPlanXML(20000, 0, nil)
 	if len(doc) < 1024*1024 {
@@ -565,7 +687,7 @@ func TestSummarizeDoesNotHoldWholeDocumentInMemory(t *testing.T) {
 	}
 
 	growth := int64(peak) - int64(base.HeapAlloc)
-	limit := int64(6 * len(doc))
+	limit := int64(3 * len(doc))
 	if growth > limit {
 		t.Fatalf("peak heap growth while parsing: %d bytes, for a %d-byte document (limit %d) - looks like a retained whole-document structure", growth, len(doc), limit)
 	}

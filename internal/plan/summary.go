@@ -332,8 +332,13 @@ func summaryTruncatedError() error {
 // Memory is bounded independent of document size: at most operatorCap
 // operators, referenceCap distinct references and warningCap warnings
 // are ever held at once, via considerOperator's heap and two
-// length-capped slices - see summary_test.go's own retention test for
-// the load-bearing proof against a 10,000-operator, 80 KiB+ document.
+// length-capped slices. summary_test.go's own
+// TestSummarizeBoundedRetentionAcrossGrowingDocumentSize proves this
+// output shape holds against a 10,000-operator, 80 KiB+ document, but
+// that test alone cannot tell this token-by-token reader apart from a
+// whole-document DOM that truncates its own result the same way (see
+// TestSummarizeDoesNotHoldWholeDocumentInMemory, fix 2's B9, which is
+// the one that actually can, and does).
 //
 // The statement's own estimated cost (design spec, line 87: "the
 // statement's estimated cost") is read from the StatementSubTreeCost

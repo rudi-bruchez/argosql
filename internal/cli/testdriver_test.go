@@ -36,11 +36,18 @@ import (
 // once.
 var cliFakeDriverSeq atomic.Int64
 
-type cliFakeDriver struct{}
+// cliFakeDriver's planXML, when non-empty, is what its own connections
+// answer sql/plan.sql's query with - fix 2's B10 own addition, needed
+// to drive the "plan" command through Run/run for the first time in
+// this package. Every existing caller of newFakeSession leaves this at
+// its zero value ("") and never reaches the plan-query case at all.
+type cliFakeDriver struct{ planXML string }
 
-func (cliFakeDriver) Open(name string) (driver.Conn, error) { return &cliFakeConn{}, nil }
+func (d cliFakeDriver) Open(name string) (driver.Conn, error) {
+	return &cliFakeConn{planXML: d.planXML}, nil
+}
 
-type cliFakeConn struct{}
+type cliFakeConn struct{ planXML string }
 
 func (c *cliFakeConn) Prepare(query string) (driver.Stmt, error) {
 	return nil, fmt.Errorf("cliFakeConn: Prepare not supported, use *Context")
@@ -84,6 +91,16 @@ func (c *cliFakeConn) QueryContext(ctx context.Context, query string, args []dri
 			types: []string{"DATETIME2", "DATETIME2"},
 			row:   []driver.Value{nil, nil},
 		}, nil
+	case strings.Contains(query, "query_store_plan") && c.planXML != "":
+		// sql/plan.sql (internal/diagnostics) - only answered when a
+		// test actually configured a plan XML via
+		// newFakeSessionWithPlanXML; every other caller of
+		// newFakeSession never sends this query at all.
+		return &cliFakeRows{
+			cols:  []string{"query_plan"},
+			types: []string{"XML"},
+			row:   []driver.Value{c.planXML},
+		}, nil
 	}
 	return nil, fmt.Errorf("cliFakeConn: unexpected query %q", query)
 }
@@ -117,9 +134,17 @@ func (r *cliFakeRows) Next(dest []driver.Value) error {
 // exactly as they would against a live server, answering from the
 // canned rows above instead of a network connection.
 func newFakeSession(t *testing.T, major int) *sqlserver.Session {
+	return newFakeSessionWithPlanXML(t, major, "")
+}
+
+// newFakeSessionWithPlanXML is newFakeSession, plus a query_plan value
+// for sql/plan.sql's own lookup - fix 2's B10, the first test in this
+// package to drive the "plan" command through Run/run rather than
+// info/qs status.
+func newFakeSessionWithPlanXML(t *testing.T, major int, planXML string) *sqlserver.Session {
 	t.Helper()
 	name := fmt.Sprintf("clifake-%d", cliFakeDriverSeq.Add(1))
-	sql.Register(name, cliFakeDriver{})
+	sql.Register(name, cliFakeDriver{planXML: planXML})
 	db, err := sql.Open(name, "")
 	if err != nil {
 		t.Fatalf("opening fake driver: %v", err)

@@ -443,3 +443,40 @@ func TestParseQueryIDPositional(t *testing.T) {
 		}
 	})
 }
+
+// TestParsePlanIDRequired is fix 2's B2: no test in this project parsed
+// "plan" at all, so the "--plan-id is required" check added in this
+// project's own dispatch for the plan command had nothing holding it -
+// a reviewer measured that removing it left the whole suite green, and
+// then measured the REAL consequence against the compiled binary: with
+// the check, "asq --ctx client plan 4821" (no --plan-id, no reachable
+// server) reports code 2, "flag: --plan-id is required"; without it,
+// the same call opens a connection to a dead port and reports code 3,
+// "connection: connection failed" - exactly the defect CLAUDE.md
+// records as measured and fixed once already (an argument error
+// reported after the connection attempt reads as a network problem to
+// an agent that retries the network instead of fixing its own
+// argument). This is the second time on this project a correct
+// argument check shipped with no test - the first was task 11's own
+// B5.
+func TestParsePlanIDRequired(t *testing.T) {
+	t.Run("missing --plan-id is rejected before any connection", func(t *testing.T) {
+		_, _, err := Parse([]string{"--ctx", "client", "plan", "4821"})
+		publicErrorCode(t, err, 2)
+	})
+	t.Run("a valid --plan-id is accepted and resolves PlanID", func(t *testing.T) {
+		req, cmd, err := Parse([]string{"--ctx", "client", "plan", "4821", "--plan-id", "9033"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cmd.Name != "plan" {
+			t.Fatalf("command: got %q, want %q", cmd.Name, "plan")
+		}
+		if req.QueryID != 4821 {
+			t.Fatalf("QueryID: got %d, want 4821", req.QueryID)
+		}
+		if req.PlanID != 9033 {
+			t.Fatalf("PlanID: got %d, want 9033", req.PlanID)
+		}
+	})
+}

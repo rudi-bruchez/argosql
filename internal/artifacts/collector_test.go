@@ -356,8 +356,18 @@ func TestFileLimitSingleSource(t *testing.T) {
 		if omitted.Reason != model.ReasonCollectionLimit {
 			t.Fatalf("omitted artifact reason: got %q, want %q", omitted.Reason, model.ReasonCollectionLimit)
 		}
-		if omitted.Bytes != budget+1 {
-			t.Fatalf("omitted artifact bytes: got %d, want %d (bytes actually read before the breach)", omitted.Bytes, budget+1)
+		// Fix 2's B-addendum: Bytes must stay zero for an omitted
+		// artifact - nothing was ever written, and a nonzero Bytes here
+		// would read as "the artifact's size" exactly like it does for a
+		// complete one. The one fact this project actually measured -
+		// bytes read before the breach - lives under its own name,
+		// BytesReadBeforeLimit, which never claims to be the source's
+		// true size.
+		if omitted.Bytes != 0 {
+			t.Fatalf("omitted artifact bytes: got %d, want 0 (never a size for an artifact that was never written)", omitted.Bytes)
+		}
+		if omitted.BytesReadBeforeLimit != budget+1 {
+			t.Fatalf("omitted artifact bytes_read_before_limit: got %d, want %d (bytes actually read before the breach, not the source's true size)", omitted.BytesReadBeforeLimit, budget+1)
 		}
 
 		result, finishErr := c.Finish(model.ContextInfo{}, err)

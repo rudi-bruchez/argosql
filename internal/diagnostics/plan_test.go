@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/rudi-bruchez/argosql/internal/artifacts"
 	"github.com/rudi-bruchez/argosql/internal/model"
 	"github.com/rudi-bruchez/argosql/internal/plan"
 	"github.com/rudi-bruchez/argosql/internal/sqlserver"
@@ -211,6 +212,77 @@ func TestPlanExportsRawArtifactWithoutSummary(t *testing.T) {
 	}
 	if len(sink.tables) != 0 {
 		t.Fatalf("tables: got %d, want 0 (no --summary)", len(sink.tables))
+	}
+	// Fix 2's B8: forcing this notice to fire unconditionally (instead
+	// of only when NormalizeXML actually rewrote a declaration) left
+	// every existing test green, because none of them checked its
+	// ABSENCE. planXMLFixture carries no declaration at all - the
+	// ordinary shape of every real plan measured in this project - so
+	// this export must never claim a rewrite that never happened.
+	if n := sink.noticeWithKind(model.KindEncodingNormalized); n != nil {
+		t.Fatalf("unexpected encoding_normalized notice for a declaration-free source: %+v", n)
+	}
+}
+
+// TestPlanQuotaSaturationYieldsCode7NoArtifactNoTables is fix 2's B1:
+// internal/artifacts.Collector.File's own guard against an oversized
+// single value is proven by its own test, but nothing before this
+// exercised that path all the way through diagnostics.Plan - a
+// reviewer measured that neutralizing exportAndSummarize's own
+// propagation of that error (`if fileErr != nil { return fileErr }`
+// turned into a no-op) left the whole suite green. Without this test,
+// a plan whose normalized XML exceeds the run's artifact quota could
+// exit at code 0, with no plan_xml artifact recorded, and, under
+// --summary, a fully populated four-table summary describing a plan
+// that was never actually exported - a more misleading failure than a
+// truncated file, since a truncated file is visible on disk and a
+// clean exit code is not.
+func TestPlanQuotaSaturationYieldsCode7NoArtifactNoTables(t *testing.T) {
+	// The quota must breach on the raw ".sqlplan" export specifically,
+	// and ONLY on that export - not on the table writes Summarize would
+	// make afterwards, or this test cannot tell "the guard fired" apart
+	// from "some other quota fired first", which would pass even with
+	// exportAndSummarize's own error-propagation removed. bigXML pads
+	// itself past 6 KiB with an XML comment (invisible to both
+	// NormalizeXML's declaration scan and Summarize's own token loop),
+	// and the budget below (500 bytes, well under manifestReserveBytes)
+	// is comfortably large enough for the handful of small JSON table
+	// writes Summarize would make if it incorrectly got to run, and
+	// comfortably smaller than bigXML itself.
+	bigXML := `<ShowPlanXML><!--` + strings.Repeat("x", 6000) + `--><QueryPlan>` +
+		`<RelOp NodeId="0" PhysicalOp="Root" LogicalOp="Root" EstimatedTotalSubtreeCost="1.0"/>` +
+		`</QueryPlan></ShowPlanXML>`
+	// manifestReserveBytes (internal/artifacts/store.go, unexported) is
+	// 64 KiB; duplicated here as a literal since this test lives outside
+	// that package.
+	const manifestReserveBytes = 64 * 1024
+	const budget = 500
+	collector, err := artifacts.New(t.TempDir(), "json", artifacts.Limits{Rows: 1000, Bytes: manifestReserveBytes + budget})
+	if err != nil {
+		t.Fatalf("artifacts.New: %v", err)
+	}
+
+	sess := newFakePlanSession(t, &fakePlanConn{row: []driver.Value{bigXML}})
+	planErr := Plan(context.Background(), sess, 4821, 9033, true, collector)
+	var pub *model.PublicError
+	if !errors.As(planErr, &pub) {
+		t.Fatalf("Plan: error is not a *model.PublicError: %v", planErr)
+	}
+	if pub.Code != 7 {
+		t.Fatalf("code: got %d, want 7", pub.Code)
+	}
+
+	result, finishErr := collector.Finish(model.ContextInfo{}, planErr)
+	if finishErr != nil {
+		planErr = finishErr
+	}
+	if len(result.Tables) != 0 {
+		t.Fatalf("tables: got %d, want 0 - a quota breach on the raw export must never reach Summarize", len(result.Tables))
+	}
+	for _, a := range result.Artifacts {
+		if a.Kind == "plan_xml" && a.Complete {
+			t.Fatalf("a complete plan_xml artifact must not exist when the quota was exceeded: %+v", a)
+		}
 	}
 }
 

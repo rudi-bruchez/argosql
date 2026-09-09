@@ -604,3 +604,41 @@ func TestExitCodeForSeparatesSignalFromTimeout(t *testing.T) {
 		t.Fatalf("nil error, live context: got %d, want 0", code)
 	}
 }
+
+// TestRunPlanSummaryTruncationReachesExitCode is fix 2's B10: the
+// coordinator verified, by breaking it directly, that
+// internal/plan.Summarize RETURNS a code-7 error when its references
+// or warnings list is truncated (fix 1's A3) - but never that this
+// error actually reaches the compiled binary's own exit code, rather
+// than being absorbed or reclassified somewhere between
+// diagnostics.Plan and Run. This is the same "guard tested, propagation
+// not tested" gap the byte-quota guard had one layer down (fix 2's B1):
+// it is not enough for a function to return the right error if nothing
+// checks that the error survives to the process's own exit status.
+//
+// The fixture below carries 101 distinct Object references - one more
+// than referenceCap - inside a single RelOp, so Summarize's own
+// truncation path fires deterministically without needing the byte
+// quota at all.
+func TestRunPlanSummaryTruncationReachesExitCode(t *testing.T) {
+	var refs strings.Builder
+	for i := 0; i < 101; i++ {
+		fmt.Fprintf(&refs, `<Object Database="[D]" Schema="[s]" Table="[T%d]"/>`, i)
+	}
+	planXML := `<ShowPlanXML><StmtSimple StatementSubTreeCost="1"><QueryPlan>` +
+		`<RelOp NodeId="0" EstimatedTotalSubtreeCost="1">` + refs.String() + `</RelOp>` +
+		`</QueryPlan></StmtSimple></ShowPlanXML>`
+
+	profile := config.Profile{Host: "fake", Database: "db", Username: "user", Password: "secret", Port: 1433, TrustServerCertificate: true}
+	sess := newFakeSessionWithPlanXML(t, 16, planXML)
+
+	var out, errout bytes.Buffer
+	args := []string{"--ctx", "x", "--format", "json", "--out-dir", t.TempDir(), "plan", "4821", "--plan-id", "9033", "--summary"}
+	code := run(context.Background(), args, &out, &errout,
+		fakeLoadConfig(profile),
+		func(ctx context.Context, p config.Profile) (*sqlserver.Session, error) { return sess, nil },
+	)
+	if code != 7 {
+		t.Fatalf("got code %d, want 7 (truncated references must reach the process exit code): stdout=%s stderr=%s", code, out.String(), errout.String())
+	}
+}
