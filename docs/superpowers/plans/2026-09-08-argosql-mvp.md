@@ -346,8 +346,8 @@ Begin crée Encoder, Row appelle WriteRow, End appelle Close ; aucune goroutine/
 ```go
 func TestTSVEscapes(t *testing.T) {
     cases := []struct{ c model.Cell; want string }{
-        {model.Cell{Value:nil}, `\N`}, {model.Cell{Value:""}, ""},
-        {model.Cell{Value:`\N`}, `\\N`}, {model.Cell{Value:"a\tb\nc"}, `a\tb\nc`},
+        {nil, `\N`}, {"", ""},
+        {`\N`, `\\N`}, {"a\tb\nc", `a\tb\nc`},
     }
     for _, c := range cases { if got:=EncodeTSVCell(c.c); got!=c.want { t.Fatalf("%q != %q",got,c.want) } }
 }
