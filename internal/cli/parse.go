@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -87,12 +88,42 @@ func Parse(args []string) (Request, *Command, error) {
 	if err != nil {
 		return req, nil, err
 	}
-	if consumed < len(bare) {
-		return req, nil, &model.PublicError{
-			Code:    2,
-			Kind:    "extra_arguments",
-			Message: fmt.Sprintf("unexpected extra arguments: %s", strings.Join(bare[consumed:], " ")),
+
+	// A command with no declared Positional keeps matchCommand's
+	// ordinary contract: any bare token left over after its own words
+	// is an error. "qs query" is the one command that takes exactly
+	// one more - its query_id - parsed and range-checked here, before
+	// any connection opens, the same "syntactic check before
+	// connection" ordering already applied to --object below and to
+	// the window flags (design spec: "Query and plan IDs are positive
+	// signed 64-bit integers... Syntactically invalid IDs ... yield
+	// code 2").
+	extra := bare[consumed:]
+	if cmd.Positional == "" {
+		if len(extra) > 0 {
+			return req, nil, &model.PublicError{
+				Code:    2,
+				Kind:    "extra_arguments",
+				Message: fmt.Sprintf("unexpected extra arguments: %s", strings.Join(extra, " ")),
+			}
 		}
+	} else {
+		if len(extra) != 1 {
+			return req, nil, &model.PublicError{
+				Code:    2,
+				Kind:    "invalid_argument",
+				Message: fmt.Sprintf("%s requires exactly one %s argument", cmd.Name, cmd.Positional),
+			}
+		}
+		id, perr := strconv.ParseInt(extra[0], 10, 64)
+		if perr != nil || id <= 0 {
+			return req, nil, &model.PublicError{
+				Code:    2,
+				Kind:    "invalid_argument",
+				Message: fmt.Sprintf("%s: %q is not a valid positive %s", cmd.Name, extra[0], cmd.Positional),
+			}
+		}
+		req.QueryID = id
 	}
 
 	allowed := map[string]Flag{}

@@ -154,6 +154,19 @@ type Command struct {
 	Permissions []string
 	Versions    []string
 	Offline     bool
+
+	// Positional names one required positional integer argument the
+	// command takes beyond its own words - empty for every command
+	// except "qs query", whose query_id is never a flag (the design
+	// spec's own example invocation, "qs query 4821 --hours 24", and
+	// every test in this codebase write it bare, immediately after the
+	// command's two words). Parse validates and parses it into
+	// req.QueryID before any connection opens, the same "syntactic
+	// check before connection" ordering already applied to --object and
+	// the window flags. Empty means matchCommand's ordinary contract
+	// still applies: any bare token left over after the command's own
+	// words is an error.
+	Positional string
 }
 
 // Registry is the ordered list of every command this build of asq
@@ -184,16 +197,18 @@ func globalFlags() []Flag {
 }
 
 // NewRegistry builds the registry this build of asq serves: help, info,
-// qs status and qs top. help's Execute closes over the finished registry
-// through reg, a pointer to the slice NewRegistry is about to return:
-// by the time help actually runs, reg has been fully populated by the
-// composite literal below, even though help's own entry is built first.
+// qs status, qs top and qs query. help's Execute closes over the
+// finished registry through reg, a pointer to the slice NewRegistry is
+// about to return: by the time help actually runs, reg has been fully
+// populated by the composite literal below, even though help's own
+// entry is built first.
 func NewRegistry() Registry {
-	reg := make(Registry, 4)
+	reg := make(Registry, 5)
 	reg[0] = helpCommand(&reg)
 	reg[1] = infoCommand()
 	reg[2] = qsStatusCommand()
 	reg[3] = qsTopCommand()
+	reg[4] = qsQueryCommand()
 	return reg
 }
 
@@ -434,6 +449,54 @@ func qsTopCommand() Command {
 				IncludeInternal: req.IncludeInternal,
 			}
 			return diagnostics.Top(ctx, s, opts, dst)
+		},
+	}
+}
+
+// qsQueryCommand registers "qs query <query_id>": one query's identity
+// (parent_module, is_internal_query, query_hash, a text preview and a
+// complete exported .sql artifact) plus every recorded plan's
+// execution counts and averages over a requested window (design spec:
+// "qs query <query_id>": "Identity, parent object when visible, SQL
+// preview and full-text artifact, per-plan execution counts and
+// averages for the selected window"). Tables is diagnostics.QueryTable
+// and diagnostics.PlansTable themselves, for the same reason
+// infoCommand above uses diagnostics.InfoTable.
+//
+// query_id is Positional, never a flag - see Command.Positional's own
+// doc comment. --hours/--since/--until are exactly qsTopCommand's own
+// window flags, declared again here rather than shared by reference:
+// Flag is a plain value type with no notion of "the same flag as
+// another command", and each command's Flags slice is what both Parse
+// and help walk independently.
+func qsQueryCommand() Command {
+	return Command{
+		Name:       "qs query",
+		Positional: "query_id",
+		Summary:    "One Query Store query's identity (parent_module, is_internal_query, query_hash, text preview, full-text artifact) and its plans' execution counts/averages over a window; query_id is positional.",
+		Examples:   []string{"asq --ctx client --db AppDB qs query 4821 --hours 24"},
+		Units: []string{
+			"cpu_total_ms, cpu_avg_ms, duration_total_ms, duration_avg_ms: milliseconds",
+			"reads_total, reads_avg: 8-KB logical page reads",
+		},
+		// Same measured implication as qs top's own Permissions field:
+		// VIEW DATABASE STATE alone suffices on both versions.
+		Permissions: []string{
+			"VIEW DATABASE STATE (2019)",
+			"VIEW DATABASE PERFORMANCE STATE (2022+; implied by VIEW DATABASE STATE)",
+		},
+		Versions: []string{"2019", "2022"},
+		// query first, plans second: the design spec's declared table
+		// order ("qs query": query, plans).
+		Tables: []model.TableSpec{diagnostics.QueryTable, diagnostics.PlansTable},
+		Flags: []Flag{
+			{Name: "hours", Kind: FlagInt64, Default: int64(24), Min: 1, Max: math.MaxInt64, ExclusiveWith: []string{"since", "until"}},
+			{Name: "since", Kind: FlagString, ExclusiveWith: []string{"hours"}},
+			{Name: "until", Kind: FlagString, ExclusiveWith: []string{"hours"}},
+		},
+		Execute: func(ctx context.Context, s *sqlserver.Session, req Request, dst model.Sink) error {
+			opts := diagnostics.QueryOptions{ID: req.QueryID, Window: req.Window}
+			return diagnostics.Query(ctx, s, opts, dst)
 		},
 	}
 }

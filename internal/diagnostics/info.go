@@ -64,8 +64,9 @@ func Info(ctx context.Context, s *sqlserver.Session, dst model.Sink) error {
 	return dst.End(true, true)
 }
 
-// queryOneRow runs query, expected to return exactly one row, and
-// scans it through output.ScanRow - the project's one sanctioned
+// queryOneRow runs query (optionally parameterized, e.g. with
+// sql.Named values), expected to return exactly one row, and scans it
+// through output.ScanRow - the project's one sanctioned
 // SQL-value-to-model.Cell conversion (see internal/output/cell.go).
 // Every diagnostic in this package reaches this helper rather than
 // scanning into typed Go variables by hand, which would silently
@@ -73,31 +74,61 @@ func Info(ctx context.Context, s *sqlserver.Session, dst model.Sink) error {
 // cases - DECIMAL, MONEY, VARBINARY and UNIQUEIDENTIFIER all arrive
 // from the driver as the same Go type, []byte, and only
 // DatabaseTypeName can tell them apart.
-func queryOneRow(ctx context.Context, conn *sql.Conn, query string) ([]model.Cell, error) {
-	rows, err := conn.QueryContext(ctx, query)
+//
+// It is queryOneOptionalRow below, plus the one difference every
+// caller of this function actually wants: a query that is only ever
+// run against a system view guaranteed to hand back exactly one row
+// (sys.database_query_store_options, info.sql's own SERVERPROPERTY
+// SELECT, coverage.sql's unconditional MIN/MAX) treats zero rows as
+// its own execution defect (code 5), never a caller-visible "not
+// found". query.go's Query, looking up one query_id that may
+// genuinely not exist, needs the opposite - see
+// queryOneOptionalRow's own doc comment for why it is the one that
+// does not make this call.
+func queryOneRow(ctx context.Context, conn *sql.Conn, query string, args ...any) ([]model.Cell, error) {
+	cells, found, err := queryOneOptionalRow(ctx, conn, query, args...)
 	if err != nil {
-		return nil, classifyQueryError(err, "diagnostic query failed")
+		return nil, err
+	}
+	if !found {
+		return nil, &model.PublicError{Code: 5, Kind: "execution", Message: "diagnostic query returned no rows"}
+	}
+	return cells, nil
+}
+
+// queryOneOptionalRow runs query (optionally parameterized) and
+// returns its one row, or found=false if it returned zero rows -
+// never an error on zero rows by itself, unlike queryOneRow above.
+// query.go's Query uses this directly: zero rows from its own
+// identity lookup means the requested query_id does not exist, or is
+// not visible to the current principal (code 8, not_found_or_not_visible),
+// a fact only the caller - which alone knows what ID it asked for -
+// can report correctly.
+func queryOneOptionalRow(ctx context.Context, conn *sql.Conn, query string, args ...any) ([]model.Cell, bool, error) {
+	rows, err := conn.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, false, classifyQueryError(err, "diagnostic query failed")
 	}
 	defer rows.Close()
 
 	if !rows.Next() {
 		if err := rows.Err(); err != nil {
-			return nil, classifyQueryError(err, "reading diagnostic row")
+			return nil, false, classifyQueryError(err, "reading diagnostic row")
 		}
-		return nil, &model.PublicError{Code: 5, Kind: "execution", Message: "diagnostic query returned no rows"}
+		return nil, false, nil
 	}
 	types, err := rows.ColumnTypes()
 	if err != nil {
-		return nil, &model.PublicError{Code: 5, Kind: "execution", Message: fmt.Sprintf("reading column types: %s", err.Error())}
+		return nil, false, &model.PublicError{Code: 5, Kind: "execution", Message: fmt.Sprintf("reading column types: %s", err.Error())}
 	}
 	cells, err := output.ScanRow(rows, types)
 	if err != nil {
-		return nil, &model.PublicError{Code: 5, Kind: "execution", Message: fmt.Sprintf("scanning diagnostic row: %s", err.Error())}
+		return nil, false, &model.PublicError{Code: 5, Kind: "execution", Message: fmt.Sprintf("scanning diagnostic row: %s", err.Error())}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, classifyQueryError(err, "reading diagnostic rows")
+		return nil, false, classifyQueryError(err, "reading diagnostic rows")
 	}
-	return cells, nil
+	return cells, true, nil
 }
 
 // classifyQueryError turns a driver error from one of this package's

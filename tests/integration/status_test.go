@@ -33,6 +33,19 @@ type captureSink struct {
 	tables  []capturedTable
 	cur     *capturedTable
 	notices []model.Notice
+	files   []capturedFile
+}
+
+// capturedFile is one File call this sink recorded, content included:
+// task 9/9b's diagnostics (Info, Status) never called Sink.File at all,
+// so File used to just return an error unconditionally ("File not
+// supported"). Task 11's Query always exports one .sql artifact, so
+// this sink now captures it in memory instead - no disk write, no
+// internal/artifacts dependency, exactly this file's own reason for
+// being a minimal model.Sink in the first place.
+type capturedFile struct {
+	kind, suffix string
+	content      []byte
 }
 
 type capturedTable struct {
@@ -72,7 +85,12 @@ func (s *captureSink) End(collectionComplete, propertiesComplete bool) error {
 }
 
 func (s *captureSink) File(kind, suffix string, src io.Reader) (model.Artifact, error) {
-	return model.Artifact{}, fmt.Errorf("captureSink: File not supported")
+	b, err := io.ReadAll(src)
+	if err != nil {
+		return model.Artifact{}, fmt.Errorf("captureSink: reading %q: %w", kind, err)
+	}
+	s.files = append(s.files, capturedFile{kind: kind, suffix: suffix, content: b})
+	return model.Artifact{Kind: kind, Path: "(captured in memory by captureSink, never written to disk)", Bytes: int64(len(b)), Complete: true}, nil
 }
 
 func (s *captureSink) Notice(n model.Notice) { s.notices = append(s.notices, n) }
@@ -81,6 +99,17 @@ func (s *captureSink) table(name string) *capturedTable {
 	for i := range s.tables {
 		if s.tables[i].spec.Name == name {
 			return &s.tables[i]
+		}
+	}
+	return nil
+}
+
+// file returns the content of the first File call recorded for kind,
+// or nil if none was.
+func (s *captureSink) file(kind string) []byte {
+	for i := range s.files {
+		if s.files[i].kind == kind {
+			return s.files[i].content
 		}
 	}
 	return nil

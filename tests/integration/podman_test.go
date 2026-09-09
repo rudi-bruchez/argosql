@@ -18,6 +18,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -174,6 +175,18 @@ type Lab struct {
 	Profile     config.Profile
 	ContainerID string
 	ImageID     string
+
+	// principalsOnce/principalsErr/secrets back Lab.Run (fixture_test.go):
+	// the Q/I/S SQL logins Lab.Run's subprocess needs are created lazily,
+	// once per Lab, the first time any test on this Lab actually needs
+	// one - not by NewLab itself, which every test in this package calls
+	// whether or not it ever runs a command as one of these principals.
+	// See ensurePrincipals' own doc comment for why this reuses
+	// permissions_test.go's existing applyObjects/applyPrincipals rather
+	// than a second, divergent definition of the same three principals.
+	principalsOnce sync.Once
+	principalsErr  error
+	secrets        principalPasswords
 }
 
 // NewLab starts a brand-new, uniquely named SQL Server container from

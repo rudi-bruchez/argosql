@@ -214,12 +214,71 @@ var topAllowedObjectTypes = map[string]bool{"P": true, "FN": true, "IF": true, "
 // NONE (nothing new is being captured at all) from a merely selective
 // mode (AUTO or CUSTOM, which may still miss some queries, but is not
 // the same failure) - design spec: warn, never quantify what is
-// missing.
+// missing. Worded generically ("this result"), not "this ranking":
+// query.go's Query reuses this same message through
+// emitQueryStoreNotices below, and a query detail is not a ranking.
 func captureModeMessage(mode string) string {
 	if mode == "NONE" {
 		return "Query Store capture mode is NONE: no new queries are being captured"
 	}
-	return fmt.Sprintf("Query Store capture mode is %s: capture is selective, so this ranking may not include every query", mode)
+	return fmt.Sprintf("Query Store capture mode is %s: capture is selective, so this result may not include every query", mode)
+}
+
+// emitQueryStoreNotices writes the four independent health/coverage
+// facts every Query Store command discloses (design spec: "Every Query
+// Store command reads health first... Emit structured warnings for
+// non-READ_WRITE state, capture restrictions, and requested history
+// outside available coverage"), against table (the command's own
+// primary table name, used only to label each Notice). Shared by Top
+// and query.go's Query, rather than duplicated, because both commands
+// read the exact same Health and coverage facts before running their
+// own, different queries.
+//
+// The four facts are independent, never substituted for one another -
+// see each one's own comment below for why: "capture" is about the
+// engine's own collecting state (checked against READ_WRITE directly,
+// not against nonCollectingStates, which deliberately excludes
+// READ_CAPTURE_SECONDARY - a state this notice must still cover, since
+// it is not READ_WRITE either even though it is not a code-4 state);
+// "capture_mode" is the capture restriction the design spec names
+// separately, independent of the collecting state itself (a healthy
+// READ_WRITE database can still have capture mode NONE); "coverage" is
+// about this database having no runtime history at all, ever;
+// "coverage_window" is about a database that does have history, but
+// not covering the requested window.
+func emitQueryStoreNotices(dst model.Sink, table string, health Health, win Window, oldest, newest *time.Time) {
+	if health.Actual != "READ_WRITE" {
+		dst.Notice(model.Notice{
+			Kind:    "capture",
+			Message: fmt.Sprintf("Query Store is %s; this result may not reflect every execution in the requested window", health.Actual),
+			Table:   table,
+		})
+	}
+	if health.CaptureMode != "ALL" {
+		dst.Notice(model.Notice{
+			Kind:    "capture_mode",
+			Message: captureModeMessage(health.CaptureMode),
+			Table:   table,
+		})
+	}
+	if !health.HasHistory {
+		dst.Notice(model.Notice{
+			Kind:    "coverage",
+			Message: "this database has no Query Store runtime history yet",
+			Table:   table,
+		})
+	}
+	if oldest != nil && newest != nil && (win.Since.Before(*oldest) || win.Until.After(*newest)) {
+		dst.Notice(model.Notice{
+			Kind: "coverage_window",
+			Message: fmt.Sprintf(
+				"requested window [%s, %s) extends outside available coverage [%s, %s]",
+				formatDateTimeOffset(win.Since), formatDateTimeOffset(win.Until),
+				formatDateTimeOffset(*oldest), formatDateTimeOffset(*newest),
+			),
+			Table: table,
+		})
+	}
 }
 
 // Top runs "qs top": the exact Query Store ranking of queries by total
@@ -294,55 +353,9 @@ func Top(ctx context.Context, s *sqlserver.Session, opts TopOptions, dst model.S
 		return err
 	}
 
-	// Four independent facts, never claiming exhaustiveness beyond what
-	// each actually says, and never replacing one another: "capture" is
-	// about the engine's own collecting state (design spec line 81:
-	// "non-READ_WRITE state") - checked against READ_WRITE directly,
-	// not against nonCollectingStates (which deliberately excludes
-	// READ_CAPTURE_SECONDARY, a state this notice must still cover: it
-	// is not READ_WRITE either, even though it is not a code-4 state);
-	// "capture_mode" is about the capture restriction design spec line
-	// 81 names separately ("capture restrictions") - ALL, NONE, AUTO or
-	// CUSTOM, independent of the collecting state itself (a perfectly
-	// healthy READ_WRITE database can still have capture mode NONE);
-	// "coverage" is about this database having no runtime history at
-	// all, ever; "coverage_window" is about a database that DOES have
-	// history, but not covering the requested window - the empty (or
-	// partial) ranking a --since far in the past produces otherwise
-	// carries no explanation at all (design spec line 81: "requested
-	// history outside available coverage").
-	if health.Actual != "READ_WRITE" {
-		dst.Notice(model.Notice{
-			Kind:    "capture",
-			Message: fmt.Sprintf("Query Store is %s; this ranking may not reflect every execution in the requested window", health.Actual),
-			Table:   TopQueriesTable.Name,
-		})
-	}
-	if health.CaptureMode != "ALL" {
-		dst.Notice(model.Notice{
-			Kind:    "capture_mode",
-			Message: captureModeMessage(health.CaptureMode),
-			Table:   TopQueriesTable.Name,
-		})
-	}
-	if !health.HasHistory {
-		dst.Notice(model.Notice{
-			Kind:    "coverage",
-			Message: "this database has no Query Store runtime history yet",
-			Table:   TopQueriesTable.Name,
-		})
-	}
-	if oldest != nil && newest != nil && (opts.Window.Since.Before(*oldest) || opts.Window.Until.After(*newest)) {
-		dst.Notice(model.Notice{
-			Kind: "coverage_window",
-			Message: fmt.Sprintf(
-				"requested window [%s, %s) extends outside available coverage [%s, %s]",
-				formatDateTimeOffset(opts.Window.Since), formatDateTimeOffset(opts.Window.Until),
-				formatDateTimeOffset(*oldest), formatDateTimeOffset(*newest),
-			),
-			Table: TopQueriesTable.Name,
-		})
-	}
+	// See emitQueryStoreNotices' own doc comment for why these four
+	// facts are independent and never substitute for one another.
+	emitQueryStoreNotices(dst, TopQueriesTable.Name, health, opts.Window, oldest, newest)
 
 	if err := dst.Begin(TopRankingTable); err != nil {
 		return err
