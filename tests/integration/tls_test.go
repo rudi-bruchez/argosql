@@ -77,13 +77,17 @@ const tlsProbeTimeout = 15 * time.Second
 // ASQ_TEST_IMAGE unset is an explicit t.Fatal, never a silent t.Skip, same
 // as NewLab.
 //
-// The returned Lab's Profile always carries TrustServerCertificate: true
-// (so Admin, and any caller that does not override it, connects regardless
-// of this mode's certificate defect) and CAFile pointing at the CA that
-// legitimately signed this container's own certificate - a test exercising
-// trust_server_certificate: false copies Profile and flips that field
-// itself, exactly as session_test.go's tests already copy NewLab's Profile
-// to vary Database.
+// The returned Lab's Profile always carries TrustServerCertificate: false
+// and CAFile pointing at the CA that legitimately signed this container's
+// own certificate - never true together with CAFile, the combination spec
+// line 119 rejects as contradictory (internal/config already enforces it
+// for config.Load, task 2). Admin's own internal connection, below, is a
+// separate profile that does carry true, deliberately, since it must
+// connect regardless of this mode's certificate defect; a test exercising
+// trust_server_certificate: false simply copies Profile as returned here
+// (exactly as session_test.go's tests already copy NewLab's Profile to
+// vary Database), and the one case in this file that wants true instead
+// explains why at its own call site.
 //
 // Rootless permissions, measured rather than assumed: this host's Podman is
 // rootless, and SQL Server inside the mssql/server image runs as container
@@ -191,14 +195,19 @@ func NewTLSLab(t *testing.T, mode string) *Lab {
 		t.Fatalf("applying fixture bootstrap: %v", err)
 	}
 
-	appProfile := masterProfile
-	appProfile.Database = "AppDB"
-	appProfile.CAFile = caPEMPath
-	appDSN, err := config.DSN(appProfile)
+	// adminProfile is the connection NewTLSLab uses internally to open
+	// and bootstrap AppDB: TrustServerCertificate stays true, inherited
+	// from masterProfile, and carries no CAFile. It must succeed
+	// regardless of which defect this mode's own certificate has (wrong
+	// host, expired) - that is exactly what TrustServerCertificate: true
+	// is for. It is not the Profile handed back to callers; see below.
+	adminProfile := masterProfile
+	adminProfile.Database = "AppDB"
+	adminDSN, err := config.DSN(adminProfile)
 	if err != nil {
 		t.Fatalf("building AppDB connection string: %v", err)
 	}
-	appDB, err := sql.Open("sqlserver", appDSN)
+	appDB, err := sql.Open("sqlserver", adminDSN)
 	if err != nil {
 		t.Fatalf("opening AppDB pool: %v", err)
 	}
@@ -212,9 +221,22 @@ func NewTLSLab(t *testing.T, mode string) *Lab {
 	// closes Admin before the container is removed, matching NewLab.
 	t.Cleanup(func() { appDB.Close() })
 
+	// returnedProfile, not adminProfile, is what Lab.Profile carries:
+	// spec line 119 rejects trust_server_certificate: true together with
+	// ca_file as a contradictory combination, and internal/config already
+	// enforces exactly that for config.Load (task 2). adminProfile above
+	// models that combination on purpose, for a reason specific to this
+	// harness (see its own comment); the Profile callers actually see
+	// should not, so that a test copying it to exercise
+	// trust_server_certificate: false - the common case in this file -
+	// starts from a combination the project would actually accept.
+	returnedProfile := adminProfile
+	returnedProfile.TrustServerCertificate = false
+	returnedProfile.CAFile = caPEMPath
+
 	return &Lab{
 		Admin:       appDB,
-		Profile:     appProfile,
+		Profile:     returnedProfile,
 		ContainerID: containerID,
 		ImageID:     imageID,
 	}
@@ -277,9 +299,16 @@ func generateTLSCertSet(t *testing.T, certsDir, mode string) (caPEMPath string) 
 		t.Fatalf("generating CA key: %v", err)
 	}
 	caTemplate := &x509.Certificate{
-		SerialNumber:          randomSerial(t),
-		Subject:               pkix.Name{CommonName: "argosql integration test CA"},
-		NotBefore:             time.Now().Add(-1 * time.Hour),
+		SerialNumber: randomSerial(t),
+		Subject:      pkix.Name{CommonName: "argosql integration test CA"},
+		// -72h, not -1h: the expired leaf below starts its own validity
+		// window at -48h, and a CA must not issue a certificate that
+		// predates its own existence. Measured and flagged in review:
+		// with the CA at -1h, the expired leaf's NotBefore (-48h) fell
+		// 47h before its issuer's own NotBefore - a self-contradictory
+		// fixture, even though the test still failed for the right
+		// reason (x509.Expired) at the instant it actually ran.
+		NotBefore:             time.Now().Add(-72 * time.Hour),
 		NotAfter:              time.Now().Add(10 * 365 * 24 * time.Hour),
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
 		BasicConstraintsValid: true,
@@ -603,6 +632,14 @@ func TestTLSExpiredCertificate(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		p := lab.Profile
+		// Deliberately re-introduces true alongside the CAFile
+		// lab.Profile already carries: this subtest's entire point is
+		// that trust_server_certificate: true makes the connection
+		// ignore the certificate, ca_file included, so the defect
+		// (and ca_file's very presence) must not matter here. This is
+		// the one exception to "Lab.Profile never defaults to that
+		// combination" (see NewTLSLab) - it is this subtest's own
+		// override, not the default.
 		p.TrustServerCertificate = true
 		s, err := sqlserver.Open(ctx, p)
 		if err != nil {
@@ -623,4 +660,49 @@ func TestTLSExpiredCertificate(t *testing.T) {
 		_, err := sqlserver.Open(ctx, p)
 		assertConnectionExitCode3(t, err)
 	})
+}
+
+// TestTLSHandshakeErrorTextAssumptionHoldsForGoMssqldbV1_11_0 is a guard,
+// not a TLS assertion: its only job is to notice, on its own and with a
+// diagnostic that does not require reading its body, the day
+// github.com/microsoft/go-mssqldb's TLS handshake error text stops
+// matching what every negative case in this file assumes.
+//
+// Measured directly against this dependency: go-mssqldb@v1.11.0's tds.go,
+// line 1292, wraps a TLS handshake failure with
+// fmt.Errorf("TLS Handshake failed: %v", err) - a %v, not a %w. That
+// flattens the underlying x509 error into plain text and makes errors.As
+// blind to it (confirmed with a real probe against this package's own
+// wrong-host container: the error that comes back is a bare
+// *errors.errorString, and errors.As into any x509 error type returns
+// false). rawConnectError and assertTLSValidationFailure therefore
+// distinguish TLS validation causes by substring match on that flattened
+// text, which is the only option go-mssqldb leaves available on this code
+// path, not a shortcut taken for convenience. (The encrypt=strict /
+// TDS 8.0 path, which this project does not use, wraps correctly with %w
+// at tds.go:1162; that does not help here.)
+//
+// A substring match has no type system behind it: if this guard ever
+// fails, the most likely explanation is that a go-mssqldb upgrade changed
+// this wording, not that TLS validation broke. Every assertion in this
+// file that distinguishes a validation cause by substring needs to be
+// re-read against the new text before anything else is concluded from a
+// red run.
+func TestTLSHandshakeErrorTextAssumptionHoldsForGoMssqldbV1_11_0(t *testing.T) {
+	lab := NewTLSLab(t, tlsModeWrongHost)
+	logTLSIdentity(t, lab, tlsModeWrongHost)
+
+	p := lab.Profile
+	err := rawConnectError(t, p)
+	if err == nil {
+		t.Fatal("GUARD DID NOT FIRE AS EXPECTED (likely not a go-mssqldb text change): the wrong-host certificate was expected to fail the connection outright, but it succeeded - check whether NewTLSLab's own wrong-host fixture changed, not the error text this guard exists to watch")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "TLS Handshake failed") {
+		t.Fatalf("GUARD FAILED: github.com/microsoft/go-mssqldb appears to have changed the wording of its TLS handshake error. Measured against go-mssqldb@v1.11.0, tds.go:1292, which wraps the failure as \"TLS Handshake failed: %%v\"; the error returned here no longer contains that phrase. Got: %v. Every cause-distinguishing substring check in assertTLSValidationFailure (this file) needs to be revisited before trusting any of this file's negative-case results.", err)
+	}
+	wantSubstring := fmt.Sprintf("cannot validate certificate for %s", p.Host)
+	if !strings.Contains(msg, wantSubstring) {
+		t.Fatalf("GUARD FAILED: github.com/microsoft/go-mssqldb's x509 hostname-mismatch wording appears to have changed. Measured against go-mssqldb@v1.11.0 (via the standard library's x509 package at the time this was written), the expected substring was %q. Got: %v. The cause-distinguishing substrings in assertTLSValidationFailure (this file) need to be revisited before trusting any of this file's negative-case results.", wantSubstring, err)
+	}
 }
