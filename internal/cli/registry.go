@@ -249,15 +249,38 @@ func runHelp(reg Registry, dst model.Sink) error {
 // describeFlags renders c's accepted flags as "name:kind" pairs,
 // global flags first (unless c is offline, which accepts none of
 // them) and c's own flags after.
+// describe renders one flag as "name:kind", appending "=default" when a
+// default is declared, " range=min..max" when a bound is declared, and
+// " enum=a|b|c" when an enum is declared - design spec line 45: help's
+// inventory must carry "parameters, defaults, and examples", and an
+// agent reading it has to be able to tell which values are valid
+// without trying one.
+func (f Flag) describe() string {
+	var b strings.Builder
+	b.WriteString(f.Name)
+	b.WriteByte(':')
+	b.WriteString(f.Kind)
+	if f.Default != nil {
+		fmt.Fprintf(&b, "=%v", f.Default)
+	}
+	if f.Min != 0 || f.Max != 0 {
+		fmt.Fprintf(&b, " range=%d..%d", f.Min, f.Max)
+	}
+	if len(f.Enum) > 0 {
+		fmt.Fprintf(&b, " enum=%s", strings.Join(f.Enum, "|"))
+	}
+	return b.String()
+}
+
 func describeFlags(c Command) string {
 	var names []string
 	if !c.Offline {
 		for _, f := range globalFlags() {
-			names = append(names, f.Name+":"+f.Kind)
+			names = append(names, f.describe())
 		}
 	}
 	for _, f := range c.Flags {
-		names = append(names, f.Name+":"+f.Kind)
+		names = append(names, f.describe())
 	}
 	return strings.Join(names, "; ")
 }
