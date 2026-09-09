@@ -493,6 +493,28 @@ func buildEnvProbe(t *testing.T) string {
 	return binPath
 }
 
+// envKey returns the variable NAME of a KEY=VALUE entry, and envKeys
+// maps that over a whole environment. Every failure message in
+// TestLabRunOnlyInjectsRequestedSecret goes through these, because the
+// obvious form of those messages - printing the offending entry, or the
+// whole environment the probe reported - prints secrets. Measured while
+// verifying the A5 break by hand: the dump carried this machine's real
+// CLAUDE_CODE_MESSAGING_TOKEN and SSH_AUTH_SOCK, and a test failure is
+// exactly where that text gets pasted into a log or a bug report. A
+// variable name localises the leak just as well as its value does.
+func envKey(kv string) string {
+	name, _, _ := strings.Cut(kv, "=")
+	return name
+}
+
+func envKeys(env []string) []string {
+	names := make([]string, len(env))
+	for i, kv := range env {
+		names[i] = envKey(kv)
+	}
+	return names
+}
+
 // TestLabRunOnlyInjectsRequestedSecret proves the one property
 // Lab.Run exists to guarantee, on the REAL child process and its REAL
 // YAML file, not on labRunEnv's return value alone (fix 1's A5): only
@@ -558,7 +580,7 @@ func TestLabRunOnlyInjectsRequestedSecret(t *testing.T) {
 				}
 			}
 			if matches != 1 {
-				t.Fatalf("%s: the real child's environment carries the requested secret in %d entries, want exactly 1: %v", principal, matches, childEnv)
+				t.Fatalf("%s: the real child's environment carries the requested secret in %d entries, want exactly 1; child variable names were %v", principal, matches, envKeys(childEnv))
 			}
 
 			for _, other := range all {
@@ -567,7 +589,7 @@ func TestLabRunOnlyInjectsRequestedSecret(t *testing.T) {
 				}
 				for _, kv := range childEnv {
 					if strings.Contains(kv, other) {
-						t.Fatalf("%s: the real child's environment leaks another principal's secret %q via entry %q", principal, other, kv)
+						t.Fatalf("%s: the real child's environment leaks another principal's secret via variable %q", principal, envKey(kv))
 					}
 				}
 			}
