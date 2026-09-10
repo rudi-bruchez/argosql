@@ -188,12 +188,15 @@ type Command struct {
 // abbreviation.
 type Registry []Command
 
-// globalFlags are accepted by every connecting command (everything but
-// help): --ctx, --db, --config, --format, --timeout, --preview,
-// --truncate, --no-truncate, --out-dir. --ctx's requiredness is not
-// expressed as a Flag field - it is a property of the command, not of
-// the flag - see Command.Offline and Parse's check right after matching
-// the command.
+// globalFlags are accepted by every command, help included: --ctx, --db,
+// --config, --format, --timeout, --preview, --truncate, --no-truncate,
+// --out-dir. A connecting command uses several of them; help, which
+// connects to nothing, ignores --ctx, --db, --config, --timeout and
+// --out-dir but still honors --format, --preview, --truncate and
+// --no-truncate, which shape the stdout it does produce. --ctx's
+// requiredness is not expressed as a Flag field - it is a property of the
+// command, not of the flag - see Command.Offline and Parse's check right
+// after matching the command.
 func globalFlags() []Flag {
 	return []Flag{
 		{Name: "ctx", Kind: FlagString},
@@ -348,13 +351,16 @@ func runHelp(reg Registry, dst model.Sink) error {
 	return dst.End(true, true)
 }
 
-// flagsFor lists every flag c accepts: global flags first (unless c is
-// offline, which accepts none of them), then c's own.
+// flagsFor lists every flag c accepts: the global flags first, then c's
+// own. Global flags are accepted for help too, not only for connecting
+// commands: Parse allows them for every command, so help announces them
+// alongside its own. help has no use for --ctx, --db, --config, --timeout
+// or --out-dir and ignores them, while it does honor the output-shaping
+// --format, --preview, --truncate and --no-truncate. Parse builds its
+// allowed set from this function alone, so the flags a command accepts are
+// exactly the flags help announces for it.
 func flagsFor(c Command) []Flag {
-	var flags []Flag
-	if !c.Offline {
-		flags = append(flags, globalFlags()...)
-	}
+	flags := globalFlags()
 	return append(flags, c.Flags...)
 }
 

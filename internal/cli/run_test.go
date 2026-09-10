@@ -696,3 +696,31 @@ func TestRunPlanSummaryTruncationReachesExitCode(t *testing.T) {
 		t.Fatalf("got code %d, want 7 (truncated references must reach the process exit code): stdout=%s stderr=%s", code, out.String(), errout.String())
 	}
 }
+
+func TestRunRejectsEmptyFiltersBeforeConnecting(t *testing.T) {
+	for _, args := range [][]string{
+		{"qs", "top", "--object", ""},
+		{"qs", "top", "--object="},
+		{"idx", "missing", "--table", ""},
+		{"idx", "missing", "--table="},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			openCalled := false
+			open := func(context.Context, config.Profile) (*sqlserver.Session, error) {
+				openCalled = true
+				return nil, fmt.Errorf("unexpected connection")
+			}
+			var out, errout bytes.Buffer
+			args = append(args, "--ctx", "x", "--out-dir", t.TempDir())
+			code := run(context.Background(), args, &out, &errout, fakeLoadConfig(config.Profile{}), open)
+			if code != 2 || openCalled {
+				t.Fatalf("code=%d, connection attempted=%t; want 2 before connection", code, openCalled)
+			}
+		})
+	}
+	for _, args := range [][]string{{"qs", "top"}, {"idx", "missing"}} {
+		if _, _, err := Parse(append(args, "--ctx", "x")); err != nil {
+			t.Fatalf("absent filter rejected: %v", err)
+		}
+	}
+}

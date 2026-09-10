@@ -162,10 +162,7 @@ func Parse(args []string) (Request, *Command, error) {
 	}
 
 	allowed := map[string]Flag{}
-	for _, f := range globalFlags() {
-		allowed[f.Name] = f
-	}
-	for _, f := range cmd.Flags {
+	for _, f := range flagsFor(*cmd) {
 		allowed[f.Name] = f
 	}
 
@@ -255,7 +252,7 @@ func Parse(args []string) (Request, *Command, error) {
 	// resolved object (procedure vs. table vs. anything else) still has
 	// to wait for a real connection, since only the catalog can answer
 	// that.
-	if _, ok := allowed["object"]; ok && req.Object != "" {
+	if explicit["object"] {
 		if err := sqlserver.ValidateQualifiedName(req.Object); err != nil {
 			return req, nil, err
 		}
@@ -267,7 +264,7 @@ func Parse(args []string) (Request, *Command, error) {
 	// own optional schema.name filter (Command.Flags below), so the
 	// same pre-connection syntax check applies to it under its own flag
 	// name.
-	if _, ok := allowed["table"]; ok && req.Table != "" {
+	if explicit["table"] {
 		if err := sqlserver.ValidateQualifiedName(req.Table); err != nil {
 			return req, nil, err
 		}

@@ -174,6 +174,36 @@ func TestRegistryFlagsMatchSpec(t *testing.T) {
 	}
 }
 
+// TestOfflineCommandAnnouncesGlobalFlags pins the announced surface to the
+// accepted one. Parse accepts every global flag for every command, help
+// included; before this, help's own flags table omitted them, so
+// `asq help --db foo` was validated against a flag `help --json` listed
+// nowhere. An offline command now advertises the globals it accepts, so a
+// misspelled global is visibly not a help flag instead of being parsed
+// while the announcement says nothing about it.
+func TestOfflineCommandAnnouncesGlobalFlags(t *testing.T) {
+	reg := NewRegistry()
+	found := false
+	for _, c := range reg {
+		if !c.Offline {
+			continue
+		}
+		found = true
+		have := map[string]bool{}
+		for _, f := range flagsFor(c) {
+			have[f.Name] = true
+		}
+		for _, name := range globalFlagNames {
+			if !have[name] {
+				t.Errorf("offline command %q accepts but does not announce global flag --%s", c.Name, name)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("registry has no offline command to check")
+	}
+}
+
 // deferredCommandNames names the command-shaped capabilities spec line
 // 275 places out of scope for v0.1, each reduced to the registry.Name
 // string it would take if someone implemented it anyway: "arbitrary q"
