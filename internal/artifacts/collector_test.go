@@ -2,9 +2,11 @@ package artifacts
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -599,6 +601,62 @@ func TestEncodingNormalizedNoticeAbsentForCleanInput(t *testing.T) {
 	for _, n := range c.notices {
 		if n.Kind == model.KindEncodingNormalized {
 			t.Fatalf("expected zero encoding_normalized notices for clean input, got %+v", n)
+		}
+	}
+}
+
+func TestCollectionFailureIsNotLimit(t *testing.T) {
+	for _, format := range []string{"json", "tsv"} {
+		for _, cause := range []string{"permission", "execution", "rows", "bytes", "summary"} {
+			t.Run(format+"/"+cause, func(t *testing.T) {
+				c, err := New(t.TempDir(), format, Limits{Rows: 1, Bytes: 1 << 20})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err = c.Begin(intSpec("x")); err != nil {
+					t.Fatal(err)
+				}
+				var runErr error
+				switch cause {
+				case "permission":
+					runErr = &model.PublicError{Code: 4, Kind: "permission"}
+				case "execution":
+					if err = c.Row([]model.Cell{int64(1)}); err != nil {
+						t.Fatal(err)
+					}
+					runErr = &model.PublicError{Code: 5, Kind: "execution"}
+				case "rows", "bytes":
+					if cause == "bytes" {
+						c.store.budget = c.store.used
+					}
+					runErr = c.Row([]model.Cell{int64(1)})
+					if cause == "rows" {
+						runErr = c.Row([]model.Cell{int64(2)})
+					}
+				case "summary":
+					if err = c.End(false, true); err != nil {
+						t.Fatal(err)
+					}
+					runErr = collectionLimitError("summary capped")
+				}
+				r, err := c.Finish(model.ContextInfo{}, runErr)
+				if model.ExitCode(err) != model.ExitCode(runErr) {
+					t.Fatalf("Finish: %v", err)
+				}
+				b, err := output.Render(r, output.PreviewOptions{Rows: 10, CellLimit: 200, ByteLimit: 32768}, "json")
+				if err != nil {
+					t.Fatal(err)
+				}
+				var rendered model.Result
+				if err = json.Unmarshal(b, &rendered); err != nil {
+					t.Fatal(err)
+				}
+				state := rendered.Tables[0]
+				wantLimit := cause == "rows" || cause == "bytes" || cause == "summary"
+				if state.State.CollectionComplete || slices.Contains(state.Preview.OmittedReasons, model.ReasonCollectionLimit) != wantLimit {
+					t.Fatalf("cause=%s: state=%+v preview=%+v; want limit=%t and incomplete collection", cause, state.State, state.Preview, wantLimit)
+				}
+			})
 		}
 	}
 }

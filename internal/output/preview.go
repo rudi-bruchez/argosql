@@ -574,6 +574,27 @@ func tableReasons(w tableWork, selected int) (rowLimited, byteLimited, cellLimit
 	return rowLimited, byteLimited, cellLimited
 }
 
+// collectionLimited decides whether an incomplete table carries the
+// collection_limit reason. Incompleteness alone is not enough: the
+// collector closes a table incomplete both when a real ceiling stopped it
+// (a row or byte breach, or plan summary's capped list) and when the
+// diagnostic failed before End (a permission or execution error), and
+// the two are not the same fact. Every ceiling breach in this project
+// surfaces as the run error's code 7 with kind collection_limit
+// (internal/artifacts.collectionLimitError, and plan summary's own
+// summaryTruncatedError); a permission failure is code 4, an execution
+// failure code 5, and toPublicError's fallback is code 5 too. A nil run
+// error with an incomplete table is left on the historical
+// collection_limit reading, the only cause the collector cannot name.
+// Reading the fact off the run error keeps model.Completeness and the
+// manifest schema unchanged, and every artifact decoder keeps working.
+func collectionLimited(incomplete bool, runErr *model.PublicError) bool {
+	if !incomplete {
+		return false
+	}
+	return runErr == nil || runErr.Code == 7
+}
+
 // buildPreviewState is the single place that turns a table's collected
 // count, how many rows ended up shown, and the specific limiting causes
 // that applied, into model.PreviewState - including the reasons
@@ -621,7 +642,7 @@ func buildResult(result model.Result, works []tableWork) model.Result {
 			Rows:  rows,
 			State: t.State,
 			Preview: buildPreviewState(w.collected, int64(w.selected), rowLimited, byteLimited, cellLimited,
-				!t.State.CollectionComplete, !t.State.PropertiesComplete),
+				collectionLimited(!t.State.CollectionComplete, result.Error), !t.State.PropertiesComplete),
 		}
 	}
 	return out
@@ -645,7 +666,7 @@ func buildZeroResult(result model.Result, works []tableWork) model.Result {
 			Rows:  nil,
 			State: t.State,
 			Preview: buildPreviewState(w.collected, 0, rowLimited, byteLimited, cellLimited,
-				!t.State.CollectionComplete, !t.State.PropertiesComplete),
+				collectionLimited(!t.State.CollectionComplete, result.Error), !t.State.PropertiesComplete),
 		}
 	}
 	return out
