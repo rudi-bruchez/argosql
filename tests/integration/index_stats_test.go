@@ -4,8 +4,10 @@ package integration
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -395,6 +397,62 @@ END`
 	})
 }
 
+// adminStatsColumns re-reads a statistic's own ordered key columns
+// directly from sys.stats_columns/sys.columns, via lab.Admin (always
+// visible, regardless of the principal "stats list" itself ran as) -
+// fix 2's A2, a genuine second reading of the engine rather than a
+// literal copied from the fixture's own CREATE STATISTICS text: this
+// aggregates the names in Go, not by reusing sql/stats.sql's own
+// STRING_AGG, so a defect in that shared query (wrong join, wrong
+// order column) cannot also corrupt this comparison's own expectation.
+func adminStatsColumns(t *testing.T, lab *Lab, ctx context.Context, objectID, statsID int64) string {
+	t.Helper()
+	rows, err := lab.Admin.QueryContext(ctx,
+		"SELECT c.name FROM sys.stats_columns AS sc JOIN sys.columns AS c ON c.object_id = sc.object_id AND c.column_id = sc.column_id "+
+			"WHERE sc.object_id = @p1 AND sc.stats_id = @p2 ORDER BY sc.stats_column_id",
+		objectID, statsID)
+	if err != nil {
+		t.Fatalf("adminStatsColumns: %v", err)
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("adminStatsColumns: scanning: %v", err)
+		}
+		names = append(names, "["+name+"]")
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("adminStatsColumns: %v", err)
+	}
+	return strings.Join(names, ", ")
+}
+
+// adminStatsProperties is a second, independent reading of
+// sys.dm_db_stats_properties, via lab.Admin rather than the principal
+// "stats list" itself ran as (fix 2's A2). lab.Admin is sysadmin, so
+// this always sees real values regardless of any other principal's own
+// SELECT grants - exactly the asymmetry TestStatsMixedAvailabilityPrincipal
+// needs to prove a denial is real and per-row, not a coincidental NULL.
+type adminStatsProperties struct {
+	rows, rowsSampled, modCounter sql.NullInt64
+	lastUpdated                   sql.NullTime
+}
+
+func readAdminStatsProperties(t *testing.T, lab *Lab, ctx context.Context, objectID, statsID int64) adminStatsProperties {
+	t.Helper()
+	var p adminStatsProperties
+	err := lab.Admin.QueryRowContext(ctx,
+		"SELECT rows, rows_sampled, last_updated, modification_counter FROM sys.dm_db_stats_properties(@p1, @p2)",
+		objectID, statsID,
+	).Scan(&p.rows, &p.rowsSampled, &p.lastUpdated, &p.modCounter)
+	if err != nil {
+		t.Fatalf("readAdminStatsProperties: %v", err)
+	}
+	return p
+}
+
 // TestStatsMixedAvailabilityPrincipal is design spec line 176's second
 // additional principal (dispatch's own reproduction, verbatim): "SELECT
 // on only one statistic's columns (mixed availability)". A principal
@@ -446,63 +504,118 @@ func TestStatsMixedAvailabilityPrincipal(t *testing.T) {
 	if err := diagnostics.Stats(ctx, sess, "dbo.StatsFixture", sink); err != nil {
 		t.Fatalf("stats list dbo.StatsFixture as %s: %v", username, err)
 	}
-	// Three rows, not two: dbo.StatsFixture's own clustered primary key
-	// auto-creates a third statistic on Id, alongside the two explicit
-	// CREATE STATISTICS this test cares about - measured, not assumed.
+	// Four rows, not three: dbo.StatsFixture's own clustered primary
+	// key auto-creates its own statistic on Id, alongside the three
+	// explicit CREATE STATISTICS this test cares about - measured, not
+	// assumed. St_Ordered (fix 2's A1) is the two-column statistic that
+	// makes sql/stats.sql's own column ORDER BY observable at all - a
+	// single-column statistic cannot distinguish a correct order from a
+	// reversed or absent one.
 	tbl := sink.table("statistics")
-	if tbl == nil || len(tbl.rows) != 3 {
-		t.Fatalf("dbo.StatsFixture: want exactly three statistics rows (the PK's own plus St_Granted/St_Withheld), got %#v", tbl)
+	if tbl == nil || len(tbl.rows) != 4 {
+		t.Fatalf("dbo.StatsFixture: want exactly four statistics rows (the PK's own plus St_Granted/St_Withheld/St_Ordered), got %#v", tbl)
 	}
 	if tbl.propertiesComplete {
 		t.Fatalf("mixed availability: want properties_complete=false on the table, got true")
 	}
 
-	var grantedStatus, withheldStatus string
-	var grantedRowsCell model.Cell
-	var grantedColumns, withheldColumns string
+	type capturedStat struct {
+		statsID                        int64
+		status, columns                string
+		rows, rowsSampled, lastUpdated model.Cell
+		modCounter                     model.Cell
+	}
+	captured := map[string]capturedStat{}
 	for _, row := range tbl.rows {
 		name, _ := row[1].(string)
-		status, _ := row[11].(string)
+		if name != "St_Granted" && name != "St_Withheld" && name != "St_Ordered" {
+			continue
+		}
+		statsID, _ := row[0].(int64)
 		columns, _ := row[2].(string)
-		switch name {
-		case "St_Granted":
-			grantedStatus = status
-			grantedRowsCell = row[3]
-			grantedColumns = columns
-		case "St_Withheld":
-			withheldStatus = status
-			withheldColumns = columns
+		status, _ := row[11].(string)
+		captured[name] = capturedStat{
+			statsID: statsID, status: status, columns: columns,
+			rows: row[3], rowsSampled: row[4], lastUpdated: row[6], modCounter: row[7],
 		}
 	}
-	if grantedStatus != "available" {
-		t.Fatalf("St_Granted (column-level SELECT granted): want properties_status=available, got %q", grantedStatus)
+	granted, withheld, ordered := captured["St_Granted"], captured["St_Withheld"], captured["St_Ordered"]
+
+	if granted.status != "available" {
+		t.Fatalf("St_Granted (column-level SELECT granted): want properties_status=available, got %q", granted.status)
 	}
-	if grantedRowsCell == nil {
+	if granted.rows == nil {
 		t.Fatalf("St_Granted: properties_status=available but rows cell is NULL - the granted row must carry its own real values")
 	}
-	// Dispatch B5/B8: columns compared against a real, independently
-	// known value (the fixture's own column names), not merely proven
-	// non-empty - dbo.StatsFixture declares St_Granted ON (Granted) and
-	// St_Withheld ON (Withheld).
-	if grantedColumns != "[Granted]" {
-		t.Fatalf("St_Granted columns cell: got %q, want %q", grantedColumns, "[Granted]")
+	if withheld.status != "permission_denied" && withheld.status != "unavailable" {
+		t.Fatalf("St_Withheld (no SELECT granted): want permission_denied or unavailable, got %q", withheld.status)
 	}
-	if withheldColumns != "[Withheld]" {
-		t.Fatalf("St_Withheld columns cell: got %q, want %q", withheldColumns, "[Withheld]")
-	}
-	if withheldStatus != "permission_denied" && withheldStatus != "unavailable" {
-		t.Fatalf("St_Withheld (no SELECT granted): want permission_denied or unavailable, got %q", withheldStatus)
-	}
-	if withheldStatus == grantedStatus {
+	if withheld.status == granted.status {
 		t.Fatalf("St_Granted and St_Withheld must not share the same properties_status - that is exactly the "+
-			"decide-once-for-the-command defect this fixture exists to catch, got %q for both", grantedStatus)
+			"decide-once-for-the-command defect this fixture exists to catch, got %q for both", granted.status)
+	}
+	// St_Ordered needs SELECT on BOTH Withheld and Granted to be
+	// readable; this principal has only Granted, so it must be denied
+	// exactly like St_Withheld, never "available".
+	if ordered.status == "available" {
+		t.Fatalf("St_Ordered (SELECT missing on one of its two columns): want permission_denied or unavailable, got available")
+	}
+
+	// Dispatch A2 (fix 2): every cell compared below is a second,
+	// independent reading of the engine via lab.Admin (sysadmin, always
+	// visible) - never a literal copied from the fixture's own DDL, so
+	// this tells apart "the command read the right row" from "the
+	// command produced a plausible-looking value". No data in
+	// dbo.StatsFixture changes between the two reads (no INSERT/UPDATE
+	// runs anywhere in this test after objects.sql's own setup), so
+	// rows/rows_sampled/modification_counter/last_updated are stable
+	// and compared for exact equality - no invented tolerance.
+	var objectID int64
+	if err := lab.Admin.QueryRowContext(ctx, "SELECT OBJECT_ID(N'dbo.StatsFixture')").Scan(&objectID); err != nil {
+		t.Fatalf("resolving dbo.StatsFixture's own object_id: %v", err)
+	}
+
+	for name, stat := range map[string]capturedStat{"St_Granted": granted, "St_Withheld": withheld, "St_Ordered": ordered} {
+		wantColumns := adminStatsColumns(t, lab, ctx, objectID, stat.statsID)
+		if stat.columns != wantColumns {
+			t.Fatalf("%s columns cell: got %q, want %q (re-read from sys.stats_columns/sys.columns)", name, stat.columns, wantColumns)
+		}
+	}
+
+	grantedAdmin := readAdminStatsProperties(t, lab, ctx, objectID, granted.statsID)
+	if !grantedAdmin.rows.Valid || !grantedAdmin.rowsSampled.Valid || !grantedAdmin.modCounter.Valid || !grantedAdmin.lastUpdated.Valid {
+		t.Fatalf("St_Granted: admin's own independent read found an unreadable property, fixture assumption broken: %#v", grantedAdmin)
+	}
+	if granted.rows != grantedAdmin.rows.Int64 {
+		t.Fatalf("St_Granted rows cell: got %v, admin's independent read says %d", granted.rows, grantedAdmin.rows.Int64)
+	}
+	if granted.rowsSampled != grantedAdmin.rowsSampled.Int64 {
+		t.Fatalf("St_Granted rows_sampled cell: got %v, admin's independent read says %d", granted.rowsSampled, grantedAdmin.rowsSampled.Int64)
+	}
+	if granted.modCounter != grantedAdmin.modCounter.Int64 {
+		t.Fatalf("St_Granted modification_counter cell: got %v, admin's independent read says %d", granted.modCounter, grantedAdmin.modCounter.Int64)
+	}
+	wantLastUpdated := grantedAdmin.lastUpdated.Time.Format("2006-01-02T15:04:05.9999999")
+	if granted.lastUpdated != wantLastUpdated {
+		t.Fatalf("St_Granted last_updated cell: got %v, admin's independent read says %q", granted.lastUpdated, wantLastUpdated)
+	}
+
+	// The asymmetry that proves the denial is real and per-row: admin's
+	// own independent read of St_Withheld sees real values (the blob
+	// exists, this principal simply cannot read it), while the command
+	// itself rendered every one of those same cells NULL.
+	withheldAdmin := readAdminStatsProperties(t, lab, ctx, objectID, withheld.statsID)
+	if !withheldAdmin.rows.Valid || !withheldAdmin.modCounter.Valid {
+		t.Fatalf("St_Withheld: admin's own independent read found it unreadable too, fixture assumption broken: %#v", withheldAdmin)
+	}
+	if withheld.rows != nil || withheld.rowsSampled != nil || withheld.modCounter != nil || withheld.lastUpdated != nil {
+		t.Fatalf("St_Withheld: command must render every properties cell NULL when denied, got %#v", withheld)
 	}
 
 	// Dispatch B3: statistics' own stats_id ascending order (the same
 	// design spec declaration B2 covers for suggestions) was never
-	// checked against a real engine either - this table's own three
-	// rows (the PK's own auto-created statistic plus St_Granted/
-	// St_Withheld) are enough to prove it.
+	// checked against a real engine either - this table's own four
+	// rows are enough to prove it.
 	for i := 1; i < len(tbl.rows); i++ {
 		prevID, _ := tbl.rows[i-1][0].(int64)
 		curID, _ := tbl.rows[i][0].(int64)

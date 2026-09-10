@@ -195,17 +195,26 @@ func TestStatsLastUpdatedNullButAvailable(t *testing.T) {
 // could read this statistic's properties just fine - a permission
 // state that changed when an administrator inserted a row and ran
 // UPDATE STATISTICS without touching any grant, which is not a
-// permission state at all. No SELECT probe is registered on this
-// fake conn at all: reaching it at all, for any reason, fails this
-// test outright ("no responder matched"), which is a stronger proof
-// than counting calls after the fact.
+// permission state at all.
+//
+// Fix 2 moved the SELECT probe from lazy (only when a row needs it) to
+// eager (once, unconditionally, before sql/stats.sql's own rows ever
+// open) - measured on a real engine: a lazy probe issued WHILE those
+// rows are still open, mid-stream, nests a second request on the one
+// held connection, which only happened to work when the row needing it
+// was the LAST one returned; dbo.StatsFixture's fourth statistic
+// turned that coincidence into a real TDS-level hang. The probe below
+// answers Denied (0) - the opposite of "allowed" - specifically to
+// prove this row's own availability never even consults that answer:
+// a properties row that exists is available regardless of what the
+// SELECT probe says, eager or not.
 func TestStatsNullCounterAndLastUpdatedIsAvailable(t *testing.T) {
 	conn := &fakeObjConn{responses: []objQueryResponse{
 		resolveFoundResponse(701, "dbo", "EmptyEver", "U"),
 		statsRowsResponse([][]driver.Value{
 			{int64(2), "St_OnEmptyTable", "[A]", nil, nil, nil, nil, false, true, nil, int64(2)},
 		}),
-		permProbeResponse(int64(1)), // VIEW DEFINITION allowed: answers columnsPropertiesComplete only - the row must never reach the SELECT probe at all
+		permProbeResponse(int64(0)), // denied - irrelevant to this row, which must stay available regardless
 	}}
 	sess := newFakeObjSession(t, conn)
 	sink := &objCaptureSink{}
@@ -316,15 +325,15 @@ func TestStatsPermissionDeniedEstablishedByProbe(t *testing.T) {
 	}
 }
 
-// TestStatsProbesSelectPermissionAtMostOnce proves
-// selectPermissionCache actually caches: two rows that both need an
-// answer must only cost one SELECT probe, not one per row - and that
-// columnsPropertiesComplete's own VIEW DEFINITION probe (fix 1's A2,
-// now issued unconditionally once per command) is itself a SEPARATE,
-// single call, never conflated with the per-row SELECT probe. The two
-// probes share the exact same query text (hasPermsByNameQuery), so
-// this test tells them apart by their own @permission argument rather
-// than by a shared counter, the same way the real driver would.
+// TestStatsProbesSelectPermissionAtMostOnce proves objectSelectDenied
+// (fix 2: eager, called once before sql/stats.sql's own rows ever
+// open, never lazily mid-stream - see its own doc comment for the real
+// hang a lazy version caused) and columnsPropertiesComplete's own VIEW
+// DEFINITION probe are each exactly one call, never conflated with
+// each other, regardless of how many rows need an answer from either.
+// The two probes share the exact same query text (hasPermsByNameQuery),
+// so this test tells them apart by their own @permission argument
+// rather than by a shared counter, the same way the real driver would.
 func TestStatsProbesSelectPermissionAtMostOnce(t *testing.T) {
 	calls := map[string]int{}
 	conn := &fakeObjConn{responses: []objQueryResponse{

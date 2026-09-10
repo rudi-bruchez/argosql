@@ -74,45 +74,39 @@ var StatisticsTable = model.TableSpec{
 	},
 }
 
-// selectPermissionCache lazily probes OBJECT/SELECT on obj exactly
-// once, however many rows of sql/stats.sql need an answer for it - the
-// same permission, on the same object, does not change row to row, so
-// a per-row probe would be a redundant round trip for every statistic
-// past the first one that needs it. Probe's own documented limitation
-// (AllProbes' object:SELECT entry, permissions.go) - a column-level-only
-// grant still probes Denied at the object level - does not cause a
-// false permission_denied here: a statistic whose own columns DO carry
-// enough SELECT for sys.dm_db_stats_properties to succeed never reaches
-// this probe at all, because sql/stats.sql's own properties_stats_id
-// column is non-NULL whenever the function returned a row (see Stats,
-// below) - regardless of whether modification_counter/last_updated
-// happen to be NULL too (a statistic on an empty table, or one whose
-// blob was never built, legitimately has both NULL on an otherwise
-// perfectly readable row; fix 1's A1, measured on a real engine). The
-// EARLIER version of this comment instead named modification_counter
-// as that signal, which is the exact defect A1 fixes: it let a
-// column-granted statistic on an empty table reach this probe, whose
-// OBJECT-level answer (Denied, correctly, since no OBJECT-wide grant
-// exists) was then reported as a confirmed permission_denied - a
-// permission state that changed when an administrator inserted a row
-// and ran UPDATE STATISTICS without touching any grant, which is not a
-// permission state at all. Measure this comment again before trusting
-// it a third time.
-type selectPermissionCache struct {
-	probed bool
-	denied bool
-}
-
-func (c *selectPermissionCache) deniedFor(ctx context.Context, s *sqlserver.Session, obj sqlserver.Object) (bool, error) {
-	if !c.probed {
-		perm, err := sqlserver.Probe(ctx, s.Conn, obj.Schema+"."+obj.Name, "OBJECT", "SELECT")
-		if err != nil {
-			return false, err
-		}
-		c.denied = perm == sqlserver.Denied
-		c.probed = true
+// objectSelectDenied probes OBJECT/SELECT on obj exactly once, BEFORE
+// sql/stats.sql's own rows are ever opened (fix 2, measured on a real
+// engine): a probe issued while those rows are still open, mid-stream,
+// nests a second request onto the SAME held connection
+// (internal/sqlserver.Session.Conn is one dedicated *sql.Conn, not a
+// pool) - fine by coincidence when the row needing it happens to be
+// the LAST one sql/stats.sql returns (the main result set is already
+// fully received off the wire by then), but a genuine TDS-level
+// deadlock when it is not: dbo.StatsFixture's fourth statistic,
+// St_Ordered, added after St_Withheld, turned exactly this coincidence
+// into a hang this project's own tests caught. Probing once, eagerly,
+// for the whole command - the same shape columnsPropertiesComplete
+// already uses for VIEW DEFINITION, right above - costs one round trip
+// even when every statistic turns out to be available, and removes the
+// hazard entirely rather than only making it rarer.
+//
+// Probe's own documented limitation (AllProbes' object:SELECT entry,
+// permissions.go) - a column-level-only grant still probes Denied at
+// the object level - does not cause a false permission_denied here: a
+// statistic whose own columns DO carry enough SELECT for
+// sys.dm_db_stats_properties to succeed never consults this value at
+// all, because sql/stats.sql's own properties_stats_id column is
+// non-NULL whenever the function returned a row (see Stats, below) -
+// regardless of whether modification_counter/last_updated happen to be
+// NULL too (a statistic on an empty table, or one whose blob was never
+// built, legitimately has both NULL on an otherwise perfectly readable
+// row; fix 1's A1, measured on a real engine).
+func objectSelectDenied(ctx context.Context, s *sqlserver.Session, obj sqlserver.Object) (bool, error) {
+	perm, err := sqlserver.Probe(ctx, s.Conn, obj.Schema+"."+obj.Name, "OBJECT", "SELECT")
+	if err != nil {
+		return false, err
 	}
-	return c.denied, nil
+	return perm == sqlserver.Denied, nil
 }
 
 // propertiesUnavailableNotice summarizes, once, how many of total rows
@@ -184,6 +178,10 @@ func Stats(ctx context.Context, s *sqlserver.Session, name string, dst model.Sin
 	if err != nil {
 		return err
 	}
+	selectDenied, err := objectSelectDenied(ctx, s, obj)
+	if err != nil {
+		return err
+	}
 
 	rows, err := s.Conn.QueryContext(ctx, statsQuery, sql.Named("id", obj.ID))
 	if err != nil {
@@ -195,7 +193,6 @@ func Stats(ctx context.Context, s *sqlserver.Session, name string, dst model.Sin
 		return err
 	}
 
-	var perm selectPermissionCache
 	total, deniedCount, unavailableCount := 0, 0, 0
 
 	var types []*sql.ColumnType
@@ -232,18 +229,12 @@ func Stats(ctx context.Context, s *sqlserver.Session, name string, dst model.Sin
 					samplePct = float64(sampledVal) * 100.0 / float64(rowsVal)
 				}
 			}
+		} else if selectDenied {
+			status = propertiesStatusPermissionDenied
+			deniedCount++
 		} else {
-			denied, perr := perm.deniedFor(ctx, s, obj)
-			if perr != nil {
-				return perr
-			}
-			if denied {
-				status = propertiesStatusPermissionDenied
-				deniedCount++
-			} else {
-				status = propertiesStatusUnavailable
-				unavailableCount++
-			}
+			status = propertiesStatusUnavailable
+			unavailableCount++
 		}
 
 		row := []model.Cell{

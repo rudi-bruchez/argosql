@@ -426,6 +426,17 @@ GO
 -- mixed availability within the same "stats list" table (design spec
 -- line 176: "SELECT on only one statistic's columns (mixed
 -- availability)").
+--
+-- St_Ordered (fix 2's A1) is a SECOND statistic, with two columns
+-- declared in an order that differs from their alphabetical order:
+-- St_Granted/St_Withheld alone cannot exercise sql/stats.sql's own
+-- "columns" STRING_AGG ... WITHIN GROUP (ORDER BY sc.stats_column_id),
+-- which carries design spec line 57's "Ordered columns" requirement -
+-- a single-column statistic makes that ordering clause unobservable
+-- (measured: removing or reversing it changes nothing when there is
+-- only ever one column to aggregate), the same shape of defect task 13
+-- paid for under a different name (an "across indexes" order asserted
+-- against a fixture with only one index).
 IF OBJECT_ID(N'dbo.StatsFixture') IS NULL
 BEGIN
     CREATE TABLE dbo.StatsFixture (
@@ -436,5 +447,6 @@ BEGIN
     INSERT INTO dbo.StatsFixture (Granted, Withheld) VALUES (N'a', N'x'), (N'b', N'y'), (N'c', N'z');
     CREATE STATISTICS St_Granted ON dbo.StatsFixture (Granted);
     CREATE STATISTICS St_Withheld ON dbo.StatsFixture (Withheld);
+    CREATE STATISTICS St_Ordered ON dbo.StatsFixture (Withheld, Granted);
 END
 GO
