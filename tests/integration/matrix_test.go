@@ -5,6 +5,7 @@ package integration
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	mssql "github.com/microsoft/go-mssqldb"
 	"github.com/rudi-bruchez/argosql/internal/config"
 )
 
@@ -201,9 +203,26 @@ func testAdminOperationsRefused(ctx context.Context, lab *Lab) func(t *testing.T
 				db := openAsPrincipal(t, lab, principal)
 
 				t.Run("DML", func(t *testing.T) {
-					_, err := db.ExecContext(ctx, "INSERT INTO dbo.Orders (CustomerId, Quantity) VALUES (1, 1)")
+					// The columns must be real ones. dbo.Orders is
+					// created with OrderId, CustomerName and Total
+					// (objects.sql): a statement naming columns that do
+					// not exist fails at name resolution (SQL error 207)
+					// whatever the principal's rights, so the old
+					// "CustomerId, Quantity" form proved nothing. With a
+					// valid statement the only reason left to fail is
+					// permission, and a permission refusal is recognized
+					// by its own SQL error number, never by the mere
+					// non-nilness of an error.
+					_, err := db.ExecContext(ctx, "INSERT INTO dbo.Orders (CustomerName, Total) VALUES (N'asq-matrix-probe', 0)")
 					if err == nil {
 						t.Fatalf("principal %s must be refused INSERT on dbo.Orders", principal)
+					}
+					var sqlErr mssql.Error
+					if !errors.As(err, &sqlErr) {
+						t.Fatalf("principal %s: INSERT error is not a *mssql.Error: %v", principal, err)
+					}
+					if sqlErr.Number != 229 {
+						t.Fatalf("principal %s: INSERT got SQL error %d, want 229 (INSERT permission denied); any other number means the statement failed for a reason other than permission: %v", principal, sqlErr.Number, err)
 					}
 				})
 				t.Run("DDL", func(t *testing.T) {
