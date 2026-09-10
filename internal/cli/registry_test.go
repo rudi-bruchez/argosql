@@ -1,6 +1,10 @@
 package cli
 
-import "testing"
+import (
+	"fmt"
+	"strings"
+	"testing"
+)
 
 // errorfHelper is the minimal subset of *testing.T the checks below need:
 // just enough to report a failure and mark the caller's own stack frame as
@@ -22,10 +26,21 @@ type errorfHelper interface {
 // observe the failure, rather than asserting by inspection that the
 // check "should" fail - the dispatch's own warning about a cassure that
 // does not actually mordre.
-type recordingT struct{ failed bool }
+type recordingT struct {
+	failed bool
+	// msgs keeps each reported message, not only the fact that one was
+	// reported: TestExactCommandSetCheckCatchesAnUnpredictedCommand has
+	// to prove the check named the command it was supposed to catch, and
+	// "something failed" is exactly the weak signal this project's method
+	// rejects everywhere else.
+	msgs []string
+}
 
-func (r *recordingT) Helper()               {}
-func (r *recordingT) Errorf(string, ...any) { r.failed = true }
+func (r *recordingT) Helper() {}
+func (r *recordingT) Errorf(format string, args ...any) {
+	r.failed = true
+	r.msgs = append(r.msgs, fmt.Sprintf(format, args...))
+}
 
 // specCommandNames is the design spec's own command table (spec lines
 // 46-53), verbatim in the document's order: the thirteen commands this
@@ -307,4 +322,72 @@ func TestMatchCommandPrefersLongestExactMatch(t *testing.T) {
 	if _, _, err := reg.matchCommand([]string{"q"}); err == nil {
 		t.Fatal("\"q\" matched a command by prefix, want an unknown-command error")
 	}
+}
+
+// assertRegistryIsExactlyTheSpecCommands pins the registry's command set
+// to specCommandNames in BOTH directions: every spec command present,
+// and nothing else present at all. It closes the structural gap
+// deferredCommandNames' own doc comment declares - that list can only
+// catch a deferred command someone remembered to add to it, so a
+// capability registered under a name nobody predicted passes the
+// absence check silently. Set equality needs no prediction: any
+// fourteenth command fails this, whatever it is called.
+//
+// Factored out of its test for the same reason the two checks above
+// are, so the proof below can run it against a fake registry through a
+// recordingT without ever touching NewRegistry().
+func assertRegistryIsExactlyTheSpecCommands(t errorfHelper, reg Registry, want []string) {
+	t.Helper()
+	wanted := map[string]bool{}
+	for _, n := range want {
+		wanted[n] = true
+	}
+	got := map[string]bool{}
+	for i := range reg {
+		got[reg[i].Name] = true
+		if !wanted[reg[i].Name] {
+			t.Errorf("registry registers %q, which the design spec's command table does not list: v0.1 ships exactly %d commands, and spec line 275 defers everything else", reg[i].Name, len(want))
+		}
+	}
+	for _, n := range want {
+		if !got[n] {
+			t.Errorf("registry does not register %q, which the design spec's command table lists", n)
+		}
+	}
+	if len(reg) != len(want) {
+		t.Errorf("registry holds %d commands, want exactly %d (duplicate names would show up here and nowhere else)", len(reg), len(want))
+	}
+}
+
+// TestRegistryRegistersExactlyTheSpecCommands is the scope gate for this
+// build: it fails both when a spec command disappears and when anything
+// at all is added, which is what TestDeferredCapabilitiesAbsent cannot
+// do on its own.
+func TestRegistryRegistersExactlyTheSpecCommands(t *testing.T) {
+	assertRegistryIsExactlyTheSpecCommands(t, NewRegistry(), specCommandNames)
+}
+
+// TestExactCommandSetCheckCatchesAnUnpredictedCommand is this check's
+// own required proof, in the same form as its two siblings: append a
+// command whose name appears in NO list in this file - not in
+// specCommandNames, not in deferredCommandNames - to a COPY of the real
+// registry, and confirm the check reports it. That is precisely the case
+// the absence list misses.
+func TestExactCommandSetCheckCatchesAnUnpredictedCommand(t *testing.T) {
+	real := NewRegistry()
+	fake := make(Registry, len(real), len(real)+1)
+	copy(fake, real)
+	fake = append(fake, Command{Name: "waits top", Execute: real[0].Execute})
+
+	var rec recordingT
+	assertRegistryIsExactlyTheSpecCommands(&rec, fake, specCommandNames)
+	if !rec.failed {
+		t.Fatal("the exact-set check passed a registry carrying an unlisted command: it cannot serve as a scope gate")
+	}
+	for _, e := range rec.msgs {
+		if strings.Contains(e, "waits top") {
+			return
+		}
+	}
+	t.Fatalf("the exact-set check reported something, but never named the added command: %v", rec.msgs)
 }
