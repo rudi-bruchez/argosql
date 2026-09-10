@@ -4,13 +4,16 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/json"
 	"errors"
 	"io"
+	"os"
 	"strings"
 	"testing"
 
 	"github.com/rudi-bruchez/argosql/internal/artifacts"
 	"github.com/rudi-bruchez/argosql/internal/model"
+	"github.com/rudi-bruchez/argosql/internal/output"
 	"github.com/rudi-bruchez/argosql/internal/plan"
 	"github.com/rudi-bruchez/argosql/internal/sqlserver"
 )
@@ -331,6 +334,80 @@ func TestPlanSummaryFailurePreservesRawArtifact(t *testing.T) {
 	}
 	if string(sink.files[0].content) != malformed {
 		t.Fatalf("raw artifact content changed: got %q, want %q", sink.files[0].content, malformed)
+	}
+}
+
+// TestPlanSummaryFailurePreservesRawArtifactOnDisk is fix 1's A6,
+// point 4: the test above proves the same contract through
+// queryCaptureSink, an in-memory model.Sink with no real file and no
+// rendered envelope. This version composes the two real production
+// pieces a live run actually uses - a real *artifacts.Collector
+// (internal/artifacts) writing to a real temp directory, and
+// output.Render producing the real JSON a caller would decode - around
+// the exact same fake driver and malformed XML. It never corrupts a
+// real database to produce this: CLAUDE.md's own recorded rule ("ERROR
+// et propriétés inconnues via backend de test, pas corruption de
+// base") applies identically here, and SQL Server's own Query Store
+// does not let a caller write malformed XML into sys.query_store_plan
+// in the first place - a fake driver is the only way to construct this
+// case at all, on a real file or otherwise.
+func TestPlanSummaryFailurePreservesRawArtifactOnDisk(t *testing.T) {
+	malformed := `<ShowPlanXML><QueryPlan><RelOp NodeId="0" EstimatedTotalSubtreeCost="1"></NotTheSameTag></ShowPlanXML>`
+	sess := newFakePlanSession(t, &fakePlanConn{row: []driver.Value{malformed}})
+
+	collector, err := artifacts.New(t.TempDir(), "json", artifacts.Limits{Rows: 10000, Bytes: 104857600})
+	if err != nil {
+		t.Fatalf("artifacts.New: %v", err)
+	}
+	planErr := Plan(context.Background(), sess, 4821, 9033, true, collector)
+	var pub *model.PublicError
+	if !errors.As(planErr, &pub) || pub.Code != 5 {
+		t.Fatalf("Plan: got %v, want a code-5 *model.PublicError", planErr)
+	}
+
+	result, finishErr := collector.Finish(model.ContextInfo{}, planErr)
+	finalErr := planErr
+	if finishErr != nil {
+		finalErr = finishErr
+	}
+	if len(result.Artifacts) != 1 || !result.Artifacts[0].Complete {
+		t.Fatalf("expected exactly one complete artifact, got %+v", result.Artifacts)
+	}
+	onDisk, readErr := os.ReadFile(result.Artifacts[0].Path)
+	if readErr != nil {
+		t.Fatalf("reading the real .sqlplan artifact: %v", readErr)
+	}
+	if string(onDisk) != malformed {
+		t.Fatalf("on-disk artifact content changed: got %q, want %q", onDisk, malformed)
+	}
+
+	out, renderErr := output.Render(result, output.PreviewOptions{Rows: 10, ByteLimit: 32768}, "json")
+	if renderErr != nil {
+		t.Fatalf("Render must still produce a response: %v", renderErr)
+	}
+	var decoded struct {
+		OK    bool `json:"ok"`
+		Error struct {
+			Code int `json:"code"`
+		} `json:"error"`
+		Artifacts []struct {
+			Complete bool `json:"complete"`
+		} `json:"artifacts"`
+	}
+	if err := json.Unmarshal(out, &decoded); err != nil {
+		t.Fatalf("decoding Render's own output: %v\noutput: %s", err, out)
+	}
+	if decoded.OK {
+		t.Fatal("decoded JSON: ok=true, want false")
+	}
+	if decoded.Error.Code != 5 {
+		t.Fatalf("decoded JSON error.code: got %d, want 5", decoded.Error.Code)
+	}
+	if len(decoded.Artifacts) != 1 || !decoded.Artifacts[0].Complete {
+		t.Fatalf("decoded JSON must still list the one complete artifact: %s", out)
+	}
+	if model.ExitCode(finalErr) != 5 {
+		t.Fatalf("model.ExitCode(finalErr): got %d, want 5", model.ExitCode(finalErr))
 	}
 }
 

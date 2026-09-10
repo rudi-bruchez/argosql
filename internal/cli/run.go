@@ -139,12 +139,29 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, loadConfi
 		// collection error - the project rule Finish itself documents.
 		finalErr = finishErr
 	}
+	// result.Error carries execErr's own message (Collector.Finish built
+	// it from the unredacted runErr it was handed) straight into the JSON
+	// envelope Render produces below. redact already applies to stderr
+	// (further down); without this, a message containing the connection
+	// secret - a driver error that echoes a DSN, or any error string
+	// that happens to embed it - reaches stdout in the clear while
+	// stderr masks the exact same text. Fix 1's A1.
+	result.Error = redactPublicError(result.Error, profile)
 
 	out, renderErr := output.Render(result, previewOptionsFrom(req), req.Format)
 	if renderErr != nil {
 		return emitErrorCtx(runCtx, stdout, stderr, req, renderErr, profile)
 	}
-	stdout.Write(out)
+	// Design spec line 210, verbatim: "A later output failure uses code
+	// 6 even if the collected data was already partial." A failed
+	// stdout write is exactly that: nothing was actually delivered, so
+	// this exit code wins over whatever finalErr would otherwise map
+	// to, rather than silently claiming finalErr's own code (often 0)
+	// for a response the caller never received.
+	if _, werr := stdout.Write(out); werr != nil {
+		fmt.Fprintln(stderr, werr.Error())
+		return exitCodeFor(runCtx, writeOutputError(werr))
+	}
 
 	if finalErr != nil {
 		fmt.Fprintln(stderr, redact(finalErr.Error(), profile))
@@ -184,7 +201,13 @@ func runOffline(cmd Command, req Request, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, renderErr.Error())
 		return model.ExitCode(renderErr)
 	}
-	stdout.Write(out)
+	// Same rule as run's own stdout.Write, below: design spec line 210,
+	// a later output failure is code 6 regardless of what the command
+	// itself produced.
+	if _, werr := stdout.Write(out); werr != nil {
+		fmt.Fprintln(stderr, werr.Error())
+		return model.ExitCode(writeOutputError(werr))
+	}
 
 	if execErr != nil {
 		fmt.Fprintln(stderr, execErr.Error())
@@ -240,6 +263,32 @@ func redact(msg string, p config.Profile) string {
 	return strings.ReplaceAll(msg, p.Password, "REDACTED")
 }
 
+// redactPublicError returns a copy of pe with Message passed through
+// redact, or nil when pe is nil. Fix 1's A1: every *model.PublicError
+// that can reach a JSON envelope (stdout) must be redacted exactly
+// like stderr already is - stdout and stderr must never disagree on
+// whether a secret is visible. A copy, never a mutation of pe itself:
+// errors.As (inside publicErrorOf) can hand back the same *PublicError
+// value a caller still holds elsewhere.
+func redactPublicError(pe *model.PublicError, p config.Profile) *model.PublicError {
+	if pe == nil {
+		return nil
+	}
+	out := *pe
+	out.Message = redact(out.Message, p)
+	return &out
+}
+
+// writeOutputError wraps a failed stdout write as the project's own
+// output-failure contract: design spec line 210, verbatim, "A later
+// output failure uses code 6 even if the collected data was already
+// partial." This always wins over whatever exit code the command's
+// own result would otherwise map to, because nothing was actually
+// delivered to the caller.
+func writeOutputError(err error) *model.PublicError {
+	return &model.PublicError{Code: 6, Kind: "output", Message: fmt.Sprintf("writing stdout: %s", err.Error())}
+}
+
 // publicErrorOf extracts the *model.PublicError behind err (at any
 // wrapping depth), or synthesizes a generic code-5 one when err is
 // non-nil but not a PublicError, or returns nil for a nil err.
@@ -261,7 +310,9 @@ func publicErrorOf(err error) *model.PublicError {
 // plain model.ExitCode here rather than exitCodeFor: an argument or
 // config error can never be a user interruption).
 func emitError(stdout, stderr io.Writer, req Request, err error, profile config.Profile) int {
-	writeError(stdout, stderr, req, err, profile)
+	if werr := writeError(stdout, stderr, req, err, profile); werr != nil {
+		return model.ExitCode(werr)
+	}
 	return model.ExitCode(err)
 }
 
@@ -269,22 +320,36 @@ func emitError(stdout, stderr io.Writer, req Request, err error, profile config.
 // existed (connection, collection, or render), so its exit code goes
 // through exitCodeFor and can come back 130 on user interruption.
 func emitErrorCtx(runCtx context.Context, stdout, stderr io.Writer, req Request, err error, profile config.Profile) int {
-	writeError(stdout, stderr, req, err, profile)
+	if werr := writeError(stdout, stderr, req, err, profile); werr != nil {
+		return exitCodeFor(runCtx, werr)
+	}
 	return exitCodeFor(runCtx, err)
 }
 
-// writeError is emitError's and emitErrorCtx's shared body.
-func writeError(stdout, stderr io.Writer, req Request, err error, profile config.Profile) {
+// writeError is emitError's and emitErrorCtx's shared body. It returns
+// a non-nil *model.PublicError only when the stdout write itself
+// failed (design spec line 210: code 6 wins over whatever err would
+// otherwise map to); a nil return means the caller should keep using
+// its own err for the exit code.
+func writeError(stdout, stderr io.Writer, req Request, err error, profile config.Profile) *model.PublicError {
 	fmt.Fprintln(stderr, redact(err.Error(), profile))
 	if !strings.EqualFold(req.Format, "json") {
-		return
+		return nil
 	}
-	fe := model.FallbackError{SchemaVersion: 1, OK: false, Error: publicErrorOf(err)}
+	// Fix 1's A1: publicErrorOf(err) can still carry the unredacted
+	// secret (a driver error that echoed a DSN, or any message that
+	// happens to contain it) - redactPublicError is what keeps this
+	// JSON envelope in agreement with the line above, which already
+	// redacts the same err for stderr.
+	fe := model.FallbackError{SchemaVersion: 1, OK: false, Error: redactPublicError(publicErrorOf(err), profile)}
 	b, merr := json.Marshal(fe)
 	if merr != nil {
-		return
+		return nil
 	}
-	stdout.Write(append(b, '\n'))
+	if _, werr := stdout.Write(append(b, '\n')); werr != nil {
+		return writeOutputError(werr)
+	}
+	return nil
 }
 
 // memSink is the model.Sink Run uses for an offline command: every row

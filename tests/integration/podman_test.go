@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -166,14 +167,39 @@ func driverModuleVersion() string {
 	return "unknown"
 }
 
+// engineProductVersion reads SERVERPROPERTY('ProductVersion') directly
+// (the full dotted version - "15.0.4480.2", "16.0.4265.3" - not the
+// major number alone), via lab's own Admin pool. Fix 1's A8: the
+// resolved image ID identifies an IMAGE, which is not the same
+// observation as the engine version a release record actually needs
+// (design spec lines 248/252/265); "unknown" on any read failure,
+// never fatal - logEngineIdentity's whole point is to record what was
+// actually run against, and a failed version probe is itself a fact
+// worth logging rather than aborting the test over.
+func engineProductVersion(lab *Lab) string {
+	ctx, cancel := context.WithTimeout(context.Background(), podmanCmdTimeout)
+	defer cancel()
+	var v string
+	if err := lab.Admin.QueryRowContext(ctx, "SELECT CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128))").Scan(&v); err != nil {
+		return "unknown"
+	}
+	return v
+}
+
 // logEngineIdentity records what a diagnostics test actually ran against:
-// the resolved image ID (never the mutable "latest" tag) and the server's
-// major version, plus the driver version. A result from a month ago is
-// otherwise unable to say what it was measured against. Deliberately logs
-// nothing from Profile: no host, no port, no credentials.
+// the resolved image ID (never the mutable "latest" tag), the server's
+// major version and its full ProductVersion, the Go toolchain this test
+// binary was built with, and the driver version. A result from a month
+// ago is otherwise unable to say what it was measured against - fix 1's
+// A8 names the image digest alone as insufficient for exactly this
+// reason: it identifies an image, not the engine version actually
+// observed, nor the Go version a release record also requires.
+// Deliberately logs nothing from Profile: no host, no port, no
+// credentials.
 func logEngineIdentity(t *testing.T, lab *Lab, majorVersion int) {
 	t.Helper()
-	t.Logf("engine identity: image=%s major_version=%d driver=go-mssqldb@%s", lab.ImageID, majorVersion, driverModuleVersion())
+	t.Logf("engine identity: image=%s major_version=%d product_version=%s go=%s driver=go-mssqldb@%s",
+		lab.ImageID, majorVersion, engineProductVersion(lab), runtime.Version(), driverModuleVersion())
 }
 
 // Lab is one disposable SQL Server container plus everything a test needs

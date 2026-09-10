@@ -113,7 +113,16 @@ type Collector struct {
 func New(dir, format string, limits Limits) (*Collector, error) {
 	st, err := newStore(dir, limits)
 	if err != nil {
-		return nil, err
+		// Fix 1's A2: newStore returns a plain Go error (creating the
+		// run directory failed - --out-dir names an ordinary file,
+		// say); left unwrapped, the CLI's own publicErrorOf falls back
+		// to a generic code-5 "execution" error. Design spec line 105,
+		// "Artifact-writing failure is likewise code 6", and line 210,
+		// "A later output failure uses code 6 even if the collected
+		// data was already partial", both name this a code-6 case, not
+		// a SQL execution failure - measured: --out-dir pointed at an
+		// ordinary file made "info" return 5 on both 2019 and 2022.
+		return nil, artifactError("creating artifact store", err)
 	}
 	return &Collector{store: st, format: format, limits: limits}, nil
 }

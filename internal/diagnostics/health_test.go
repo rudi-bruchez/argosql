@@ -1,9 +1,12 @@
 package diagnostics
 
 import (
+	"context"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/rudi-bruchez/argosql/internal/model"
@@ -171,5 +174,57 @@ func TestHealthFromCellsAcceptsErrorState(t *testing.T) {
 	want := []string{"no_reason_reported"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("DecodeReadOnly on ERROR with readonly_reason=0: got %v, want %v", got, want)
+	}
+}
+
+// TestStatusAcceptsErrorStateWithHistory is fix 1's A5: every other
+// ERROR-state test in this file (TestHealthFromCellsAcceptsErrorState
+// above) calls healthFromCells directly, a pure cell-shape converter -
+// never Status itself through a real model.Sink/backend boundary, the
+// gap the reviewer named explicitly. "ERROR avec historique" (as
+// opposed to the already-covered no-history case) is exercised here
+// through the SAME fake-driver discipline this package's own
+// CLAUDE.md-recorded rule requires for an engine state that cannot be
+// forced by real DDL ("ERROR et propriétés inconnues via backend de
+// test, pas corruption de base"): a fake backend answers health.sql's
+// one row with actual_state=ERROR and has_history=true, and Status
+// must still produce a complete "status"/"coverage" pair rather than
+// erroring out or panicking on a state it cannot itself provoke.
+func TestStatusAcceptsErrorStateWithHistory(t *testing.T) {
+	// fakeHealthRows (top_test.go, same package) already builds a
+	// correctly-typed health.sql row (decimal cells as []byte digit
+	// strings, the shape output.ScanRow actually requires) - reused
+	// here rather than a second, independently-typed literal.
+	conn := &fakeObjConn{responses: []objQueryResponse{
+		{
+			match:  func(q string) bool { return strings.Contains(q, "database_query_store_options") },
+			handle: func(args []driver.NamedValue) (driver.Rows, error) { return &fakeHealthRows{actual: "ERROR"}, nil },
+		},
+		{
+			match:  func(q string) bool { return strings.Contains(q, "query_store_runtime_stats_interval") },
+			handle: func(args []driver.NamedValue) (driver.Rows, error) { return &fakeCoverageRows{}, nil },
+		},
+	}}
+	sess := newFakeObjSession(t, conn)
+	sink := &objCaptureSink{}
+
+	if err := Status(context.Background(), sess, sink); err != nil {
+		t.Fatalf("Status on an ERROR/has_history row: %v", err)
+	}
+	status := sink.table("status")
+	if status == nil || len(status.rows) != 1 {
+		t.Fatalf("expected one status row, got %+v", status)
+	}
+	// Index 1: StatusTable's own column order (desired_state,
+	// actual_state, ...) - distinct from colActual, which indexes
+	// health.sql's QUERY result, a differently-shaped row (no
+	// readonly_reason_decoded column there; Status computes that one
+	// itself).
+	if got := status.rows[0][1]; got != "ERROR" {
+		t.Fatalf("status.actual_state: got %#v, want ERROR", got)
+	}
+	coverage := sink.table("coverage")
+	if coverage == nil || len(coverage.rows) != 1 {
+		t.Fatalf("expected one coverage row, got %+v", coverage)
 	}
 }

@@ -18,10 +18,13 @@ import (
 
 // TestPrincipalMatrix is task 15's own reproduction of the design
 // spec's Q/I/S permission matrix (lines 155-170), all thirteen
-// commands times all three principals, plus help (offline, no
-// container, no Lab.Run) and a direct confirmation that Admin DML/DDL/
-// EXEC are refused under every limited principal without ever handing
-// asq itself an arbitrary-SQL capability it does not have.
+// commands times all three principals, plus a direct confirmation that
+// Admin DML/DDL/EXEC are refused under every limited principal without
+// ever handing asq itself an arbitrary-SQL capability it does not
+// have. help's own offline guarantee is TestHelpNeverConnects, its own
+// top-level function (fix 1's A9: this function's first statement is
+// an unconditional NewLab, which a container-free guarantee must never
+// depend on, even when only that one subtest is selected).
 //
 // Every id this test feeds a command (query_id, plan_id) is discovered
 // against the real fixture through lab.QueryID/planIDFor, never
@@ -39,8 +42,6 @@ func TestPrincipalMatrix(t *testing.T) {
 		t.Fatalf("reading engine major version: %v", err)
 	}
 	logEngineIdentity(t, lab, major)
-
-	t.Run("help", testHelpNeverConnects)
 
 	queryID := lab.QueryID(t, "AsqMatrixMarker")
 	planID := planIDFor(ctx, t, lab, queryID)
@@ -104,7 +105,7 @@ func TestPrincipalMatrix(t *testing.T) {
 	t.Run("admin_refusals", testAdminOperationsRefused(ctx, lab))
 }
 
-// testHelpNeverConnects proves "help --json" is Command.Offline in the
+// TestHelpNeverConnects proves "help --json" is Command.Offline in the
 // deepest sense the dispatch asks for: it is launched with NEITHER
 // Lab.Run NOR any reachable SQL environment at all - built and run as
 // its own subprocess, pointed at a config file naming an unreachable
@@ -115,7 +116,19 @@ func TestPrincipalMatrix(t *testing.T) {
 // own deadline or take multiple seconds; returning almost instantly is
 // the evidence that no connection was ever attempted, not merely that
 // the exit code came back 0.
-func testHelpNeverConnects(t *testing.T) {
+//
+// Fix 1's A9: this used to be a subtest of TestPrincipalMatrix, whose
+// own first statement unconditionally calls NewLab - a container, and
+// ASQ_TEST_IMAGE, neither of which this specific guarantee should ever
+// need. Filtering -run to only this subtest still ran NewLab first
+// (Go runs every statement in a parent test function regardless of
+// which of its own t.Run subtests a -run pattern selects; only the
+// subtest bodies themselves are skipped), so the documented claim -
+// "help is launched without Lab.Run and without an SQL environment" -
+// was true of the subtest's own body but false of the only way to
+// actually exercise it in isolation. A standalone top-level function
+// needs neither NewLab nor ASQ_TEST_IMAGE at all.
+func TestHelpNeverConnects(t *testing.T) {
 	bin := buildTestBinary(t)
 
 	configPath := filepath.Join(t.TempDir(), "config.yaml")

@@ -491,9 +491,30 @@ func (lab *Lab) Run(t *testing.T, principal string, args []string) (model.Result
 	stdout, stderr, code := lab.RunRaw(t, principal, args)
 	var result model.Result
 	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
-		t.Fatalf("Lab.Run: decoding stdout as model.Result: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+		t.Fatalf("Lab.Run: decoding stdout as model.Result: %v\nstdout:\n%s\nstderr:\n%s", err, redactKnownSecrets(stdout, lab), redactKnownSecrets(stderr, lab))
 	}
 	return result, code
+}
+
+// redactKnownSecrets replaces every occurrence of every secret this
+// Lab's own principals hold with "REDACTED", for use in a test failure
+// message that would otherwise dump a child process's raw stdout or
+// stderr verbatim. Fix 1's A1: a reviewer found this exact defect at
+// task 11 already - a failing test is precisely the text that gets
+// pasted into a CI log or a bug report, so it must never carry a
+// literal secret even when something has already gone wrong. A no-op
+// when this Lab's principals were never created (lab.secrets is then
+// the zero value, every field an empty string, and
+// strings.ReplaceAll(s, "", ...) is never called here since empty
+// values are skipped).
+func redactKnownSecrets(s string, lab *Lab) string {
+	for _, secret := range []string{lab.secrets.Q, lab.secrets.I, lab.secrets.S, lab.secrets.MetadataOnly} {
+		if secret == "" {
+			continue
+		}
+		s = strings.ReplaceAll(s, secret, "REDACTED")
+	}
+	return s
 }
 
 // RunRaw is Run's own subprocess invocation, exposing the child's raw
@@ -530,7 +551,7 @@ func (lab *Lab) RunRaw(t *testing.T, principal string, args []string) (stdout, s
 		if errors.As(runErr, &exitErr) {
 			code = exitErr.ExitCode()
 		} else {
-			t.Fatalf("Lab.RunRaw: running %s: %v\nstderr:\n%s", bin, runErr, errBuf.String())
+			t.Fatalf("Lab.RunRaw: running %s: %v\nstderr:\n%s", bin, runErr, redactKnownSecrets(errBuf.String(), lab))
 		}
 	}
 	return outBuf.String(), errBuf.String(), code

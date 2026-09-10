@@ -2,6 +2,7 @@ package artifacts
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -34,6 +35,32 @@ import (
 //     names. TestFileSecondSourceOverflowRetainsFirstCompleted below is
 //     that case.
 //   - sanitizeName (store.go) had no test at all before this task.
+
+// TestNewReturnsCode6WhenStoreCreationFails is fix 1's A2: New must
+// wrap a store-creation failure as the project's own code-6 artifact
+// error, not let the underlying os.MkdirAll/os.Mkdir error reach the
+// CLI unwrapped - which publicErrorOf falls back to classifying as a
+// generic code-5 execution error. Design spec lines 105 and 210 both
+// name a local storage/output failure code 6; measured before this
+// fix, --out-dir pointed at an ordinary file made "info" return 5 on
+// both 2019 and 2022.
+func TestNewReturnsCode6WhenStoreCreationFails(t *testing.T) {
+	// An ordinary file, not a directory, at the path New will try to
+	// MkdirAll: os.MkdirAll refuses to create a directory where a file
+	// already exists.
+	blocker := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := New(blocker, "json", Limits{Rows: 1000, Bytes: 1 << 20})
+	if err == nil {
+		t.Fatal("New must fail when its base directory is an ordinary file")
+	}
+	if code := model.ExitCode(err); code != 6 {
+		t.Fatalf("exit code: got %d, want 6, err=%v", code, err)
+	}
+}
 
 // failWriter is the brief's own verbatim fault: a writer that refuses
 // every write it is ever given. Test-local, no production flag.
@@ -247,6 +274,78 @@ func TestFileSecondSourceOverflowRetainsFirstCompleted(t *testing.T) {
 	}
 	if !bytes.Contains(data, []byte(filepath.Base(first.Path))) {
 		t.Fatalf("manifest must still reference the first, completed artifact: %s", data)
+	}
+}
+
+// TestFileOverflowComposesWithRenderJSON is fix 1's A6, point 1: the
+// task-15 version of the second-file-overflow fault stopped at
+// Collector.Finish - it proved the in-memory model.Result and the
+// manifest on disk agree, but nothing ever fed that Result through
+// output.Render, the other real production piece that actually builds
+// the JSON this program's own stdout carries. No command in this
+// codebase calls Sink.File twice in one run (grep confirms exactly
+// one File call each in obj code, qs query and plan) - composing this
+// proof through cli.run's own Parse/registry dispatch is not possible
+// without a command shaped that way, so this composes the two REAL
+// pieces that matter, Collector and Render, directly: the exact
+// result TestFileSecondSourceOverflowRetainsFirstCompleted already
+// built, now rendered for real and decoded back from actual JSON
+// bytes, not inspected as a Go struct.
+func TestFileOverflowComposesWithRenderJSON(t *testing.T) {
+	const budget = 100
+	c, err := New(t.TempDir(), "json", Limits{Rows: 1000, Bytes: manifestReserveBytes + budget})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := c.File("module_definition", ".sql", bytes.NewReader(bytes.Repeat([]byte("a"), budget/2)))
+	if err != nil {
+		t.Fatalf("the first, well-within-budget file must succeed: %v", err)
+	}
+	_, secondErr := c.File("plan_xml", ".sqlplan", bytes.NewReader(bytes.Repeat([]byte("b"), budget)))
+	if model.ExitCode(secondErr) != 7 {
+		t.Fatalf("the second file must breach at exit code 7, got %v", secondErr)
+	}
+	result, _ := c.Finish(model.ContextInfo{}, secondErr)
+
+	out, renderErr := output.Render(result, output.PreviewOptions{Rows: 10, ByteLimit: 32768}, "json")
+	if renderErr != nil {
+		t.Fatalf("Render must still produce a response for a partial run, got: %v", renderErr)
+	}
+	var decoded struct {
+		OK    bool `json:"ok"`
+		Error struct {
+			Code int `json:"code"`
+		} `json:"error"`
+		Artifacts []struct {
+			Kind     string `json:"kind"`
+			Path     string `json:"path"`
+			Complete bool   `json:"complete"`
+			Reason   string `json:"reason"`
+		} `json:"artifacts"`
+	}
+	if err := json.Unmarshal(out, &decoded); err != nil {
+		t.Fatalf("Render's own output must be valid, complete JSON: %v\noutput: %s", err, out)
+	}
+	if decoded.OK {
+		t.Fatal("decoded JSON: ok=true, want false (the run did not complete cleanly)")
+	}
+	if decoded.Error.Code != 7 {
+		t.Fatalf("decoded JSON: error.code=%d, want 7", decoded.Error.Code)
+	}
+	var renderedFirst, renderedOmittedSecond bool
+	for _, a := range decoded.Artifacts {
+		if a.Complete && a.Path == first.Path {
+			renderedFirst = true
+		}
+		if a.Kind == "plan_xml" && !a.Complete && a.Reason == model.ReasonCollectionLimit {
+			renderedOmittedSecond = true
+		}
+	}
+	if !renderedFirst {
+		t.Fatalf("the rendered JSON must still list the first, completed artifact: %s", out)
+	}
+	if !renderedOmittedSecond {
+		t.Fatalf("the rendered JSON must carry the second file's omitted record: %s", out)
 	}
 }
 
