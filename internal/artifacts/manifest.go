@@ -142,7 +142,7 @@ func (c *Collector) writeManifest(result *model.Result) (string, error) {
 	}
 
 	path := filepath.Join(c.store.dir, "manifest.json")
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	f, err := c.store.root.OpenFile("manifest.json", os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return "", artifactError("creating manifest file", err)
 	}

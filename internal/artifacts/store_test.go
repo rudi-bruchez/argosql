@@ -80,3 +80,51 @@ func TestStoreCreateUniqueRunDir(t *testing.T) {
 		t.Fatalf("run directories must live directly under base %q, got %q and %q", base, c1.Dir(), c2.Dir())
 	}
 }
+
+func TestStoreOperationsAfterDirectorySwap(t *testing.T) {
+	c, err := New(t.TempDir(), "json", Limits{Rows: 10, Bytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, path, err := c.store.create("partial.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	c.store.record(path, 0, false)
+	victim := t.TempDir()
+	target := filepath.Join(victim, "partial.sql")
+	if err := os.WriteFile(target, []byte("keep"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	moved := c.Dir() + "-moved"
+	if err := os.Rename(c.Dir(), moved); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(victim, c.Dir()); err != nil {
+		t.Skipf("directory symlink unavailable: %v", err)
+	}
+	c.store.reclaimIncomplete()
+	if b, err := os.ReadFile(target); err != nil || string(b) != "keep" {
+		t.Errorf("reclaim changed third-party file: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(moved, "partial.sql")); !os.IsNotExist(err) {
+		t.Errorf("incomplete artifact remains: %v", err)
+	}
+	f, _, err = c.store.create("next.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	if _, err := c.Finish(model.ContextInfo{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"next.sql", "manifest.json"} {
+		if _, err := os.Stat(filepath.Join(moved, name)); err != nil {
+			t.Errorf("%s not created in opened directory: %v", name, err)
+		}
+		if _, err := os.Stat(filepath.Join(victim, name)); !os.IsNotExist(err) {
+			t.Errorf("%s created in third-party directory: %v", name, err)
+		}
+	}
+}

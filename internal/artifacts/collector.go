@@ -172,7 +172,7 @@ func (c *Collector) Begin(spec model.TableSpec) error {
 	real, err := output.NewTableEncoder(f, c.format, spec)
 	if err != nil {
 		f.Close()
-		os.Remove(path)
+		c.store.remove(path)
 		return artifactError("creating table encoder", err)
 	}
 
@@ -340,17 +340,17 @@ func (c *Collector) File(kind, suffix string, src io.Reader) (model.Artifact, er
 	n, copyErr := io.Copy(f, io.LimitReader(src, remaining+1))
 	if copyErr != nil {
 		f.Close()
-		os.Remove(path)
+		c.store.remove(path)
 		return model.Artifact{}, artifactError(fmt.Sprintf("writing %q artifact", kind), copyErr)
 	}
 	if n > remaining {
 		f.Close()
-		os.Remove(path)
+		c.store.remove(path)
 		c.artifacts = append(c.artifacts, model.Artifact{Kind: kind, Complete: false, Reason: model.ReasonCollectionLimit, BytesReadBeforeLimit: n})
 		return model.Artifact{}, collectionLimitError(fmt.Sprintf("artifact %q exceeds the remaining byte budget", kind))
 	}
 	if err := f.Close(); err != nil {
-		os.Remove(path)
+		c.store.remove(path)
 		return model.Artifact{}, artifactError(fmt.Sprintf("closing %q artifact", kind), err)
 	}
 
@@ -395,6 +395,7 @@ func toPublicError(err error) *model.PublicError {
 // Finish closes it out as incomplete before doing anything else, so it
 // is never silently lost from the run's accounting.
 func (c *Collector) Finish(info model.ContextInfo, runErr error) (model.Result, error) {
+	defer c.store.root.Close()
 	if c.current != nil {
 		if err := c.finalizeCurrent(false, false); err != nil {
 			return model.Result{}, err

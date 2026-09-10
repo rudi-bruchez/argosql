@@ -41,6 +41,7 @@ type storedFile struct {
 // every file it creates.
 type store struct {
 	dir    string
+	root   *os.Root
 	budget int64 // Limits.Bytes minus the manifest reservation
 	used   int64
 	files  []*storedFile
@@ -54,11 +55,15 @@ func newStore(base string, limits Limits) (*store, error) {
 	if err != nil {
 		return nil, err
 	}
+	root, err := os.OpenRoot(runDir)
+	if err != nil {
+		return nil, fmt.Errorf("artifacts: opening run directory: %w", err)
+	}
 	budget := limits.Bytes - manifestReserveBytes
 	if budget < 0 {
 		budget = 0
 	}
-	return &store{dir: runDir, budget: budget}, nil
+	return &store{dir: runDir, root: root, budget: budget}, nil
 }
 
 // uniqueRunDir creates, and returns the path of, a new, never-before-
@@ -117,7 +122,7 @@ func (s *store) create(name string) (*os.File, string, error) {
 			candidate = fmt.Sprintf("%s-%d%s", base, attempt+1, ext)
 		}
 		path := filepath.Join(s.dir, candidate)
-		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		f, err := s.root.OpenFile(candidate, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 		if err == nil {
 			return f, path, nil
 		}
@@ -152,7 +157,7 @@ func (s *store) reclaimIncomplete() []string {
 	kept := s.files[:0]
 	for _, f := range s.files {
 		if !f.complete {
-			_ = os.Remove(f.path)
+			_ = s.remove(f.path)
 			s.used -= f.bytes
 			removed = append(removed, f.path)
 			continue
@@ -161,4 +166,9 @@ func (s *store) reclaimIncomplete() []string {
 	}
 	s.files = kept
 	return removed
+}
+
+// remove uses only store-generated basenames relative to the opened directory.
+func (s *store) remove(path string) error {
+	return s.root.Remove(filepath.Base(path))
 }

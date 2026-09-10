@@ -353,3 +353,62 @@ func TestFileOverflowComposesWithRenderJSON(t *testing.T) {
 // so a refactor of its signature fails to build rather than silently
 // changing what this fault actually exercises.
 var _ io.Reader = &limitedErrReader{}
+
+// swapReader changes the path after File has opened its destination.
+type swapReader struct {
+	swap func()
+	err  error
+}
+
+func (r *swapReader) Read(p []byte) (int, error) {
+	if r.swap != nil {
+		r.swap()
+		r.swap = nil
+	}
+	p[0] = 'x'
+	return 1, r.err
+}
+
+func TestFileCleanupAfterDirectorySwap(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		readErr error
+		code    int
+	}{
+		{"read_error", errors.New("fixture read failure"), 6},
+		{"quota", nil, 7},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, err := New(t.TempDir(), "json", Limits{Rows: 10, Bytes: manifestReserveBytes + 2})
+			if err != nil {
+				t.Fatal(err)
+			}
+			victim := t.TempDir()
+			target := filepath.Join(victim, "plan_xml.sqlplan")
+			if err := os.WriteFile(target, []byte("keep"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			moved := c.Dir() + "-moved"
+			reader := &swapReader{err: tc.readErr, swap: func() {
+				if err := os.Rename(c.Dir(), moved); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(victim, c.Dir()); err != nil {
+					t.Skipf("directory symlink unavailable: %v", err)
+				}
+			}}
+			_, err = c.File("plan_xml", ".sqlplan", reader)
+			if model.ExitCode(err) != tc.code {
+				t.Fatalf("code = %d, want %d", model.ExitCode(err), tc.code)
+			}
+			if b, err := os.ReadFile(target); err != nil || string(b) != "keep" {
+				t.Errorf("third-party file changed: %v", err)
+			}
+			if _, err := os.Stat(filepath.Join(moved, "plan_xml.sqlplan")); !os.IsNotExist(err) {
+				t.Errorf("partial file remains: %v", err)
+			}
+			// Finish releases the opened directory even when the manifest exceeds quota.
+			_, _ = c.Finish(model.ContextInfo{}, nil)
+		})
+	}
+}
