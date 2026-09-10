@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -251,5 +252,58 @@ func TestManifestNeverCarriesTheSecret(t *testing.T) {
 		if strings.Contains(doc.Error.Message, secret) {
 			t.Fatalf("%s: error.message, once JSON-DECODED, still carries the secret: %q", m, doc.Error.Message)
 		}
+	}
+}
+
+type blockedWriter struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (w blockedWriter) Write(p []byte) (int, error) {
+	close(w.entered)
+	<-w.release
+	return len(p), nil
+}
+
+func TestRunClosesSessionBeforeBlockedOutput(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		code int
+	}{{"collected", 0}, {"store_error", 6}} {
+		t.Run(tc.name, func(t *testing.T) {
+			sess := newFakeSession(t, 16)
+			conn := sess.Conn
+			w := blockedWriter{make(chan struct{}), make(chan struct{})}
+			done := make(chan int, 1)
+			defer func() {
+				close(w.release)
+				if code := <-done; code != tc.code {
+					t.Errorf("run code = %d, want %d", code, tc.code)
+				}
+			}()
+			outDir := t.TempDir()
+			if tc.code == 6 {
+				outDir = filepath.Join(outDir, "file")
+				if err := os.WriteFile(outDir, nil, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			profile := config.Profile{Host: "fake", Database: "db", Username: "user", Port: 1433}
+			args := []string{"--ctx", "x", "--format", "json", "--out-dir", outDir, "--timeout", "1", "info"}
+			go func() {
+				var stderr bytes.Buffer
+				done <- run(context.Background(), args, w, &stderr, fakeLoadConfig(profile),
+					func(context.Context, config.Profile) (*sqlserver.Session, error) { return sess, nil })
+			}()
+			select {
+			case <-w.entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("output not reached")
+			}
+			if err := conn.PingContext(context.Background()); !errors.Is(err, sql.ErrConnDone) {
+				t.Fatalf("session retained while output is blocked: %v", err)
+			}
+		})
 	}
 }

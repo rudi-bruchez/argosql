@@ -111,6 +111,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, loadConfi
 	limits := artifacts.Limits{Rows: collectionRowLimit, Bytes: collectionByteLimit}
 	collector, err := artifacts.New(req.OutDir, req.Format, limits)
 	if err != nil {
+		sess.Close()
 		return emitErrorCtx(runCtx, stdout, stderr, req, err, profile)
 	}
 
@@ -133,6 +134,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, loadConfi
 		CertificateValidation: certValidation(profile),
 		CollectedAt:           time.Now().UTC(),
 	}
+	// SQL collection is over; local output may block without a deadline.
+	sess.Close()
+
 	// Finish writes manifest.json, and manifest.json serializes
 	// result.Error (internal/artifacts/manifest.go). So the manifest is
 	// a THIRD output that could carry a secret, after stdout and stderr,
