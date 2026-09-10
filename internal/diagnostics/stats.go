@@ -102,7 +102,7 @@ var StatisticsTable = model.TableSpec{
 // built, legitimately has both NULL on an otherwise perfectly readable
 // row; fix 1's A1, measured on a real engine).
 func objectSelectDenied(ctx context.Context, s *sqlserver.Session, obj sqlserver.Object) (bool, error) {
-	perm, err := sqlserver.Probe(ctx, s.Conn, obj.Schema+"."+obj.Name, "OBJECT", "SELECT")
+	perm, err := sqlserver.Probe(ctx, s.Conn, obj.QualifiedName(), "OBJECT", "SELECT")
 	if err != nil {
 		return false, err
 	}

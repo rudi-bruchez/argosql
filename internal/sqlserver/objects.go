@@ -21,6 +21,31 @@ type Object struct {
 	Type   string
 }
 
+// QualifiedName renders obj's two catalog halves back into a single
+// two-part identifier, each part bracket-delimited, safe to hand to
+// HAS_PERMS_BY_NAME. A plain obj.Schema+"."+obj.Name is not: for an
+// object whose catalog name itself contains a dot (CREATE TABLE
+// dbo.[Odd.Name]), the unquoted concatenation "dbo.Odd.Name" is a
+// THREE-part name that resolves to a different, absent securable.
+// Measured on SQL Server 2022, HAS_PERMS_BY_NAME then reports VIEW
+// DEFINITION as denied for metadata that is in fact readable, and the
+// command asks an operator for a grant that would change nothing.
+// Bracketing every part also makes an embedded "]" safe (the "]]"
+// escape) and costs nothing for an ordinary name, which the delimited
+// form accepts identically.
+func (o Object) QualifiedName() string {
+	return quoteIdentifier(o.Schema) + "." + quoteIdentifier(o.Name)
+}
+
+// quoteIdentifier wraps s in [..], doubling any embedded "]" per SQL
+// Server's own bracket-quoting rule. It always quotes rather than
+// testing whether a bare name would parse: the delimited form is
+// unambiguous for every identifier, so there is no reason to leave a
+// per-character decision to the caller.
+func quoteIdentifier(s string) string {
+	return "[" + strings.ReplaceAll(s, "]", "]]") + "]"
+}
+
 // resolveObjectQuery is the core of Resolve's catalog lookup. Both
 // parameters are passed as distinct bind parameters, never interpolated
 // into the statement text, so neither schema nor object name is ever

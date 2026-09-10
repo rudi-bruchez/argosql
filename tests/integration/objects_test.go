@@ -224,6 +224,57 @@ func TestColumnsAndIndexesPropertiesMaskedBySelectOnly(t *testing.T) {
 	}
 }
 
+// TestDottedNameProbesTheResolvedSecurable is the regression for the
+// unquoted-name defect. dbo.[Order.Detail] is the fixture table whose
+// catalog name itself contains a dot (objects.sql). The permission
+// probes must delimit both halves of the resolved name before handing
+// it to HAS_PERMS_BY_NAME: an unquoted "dbo.Order.Detail" is a
+// THREE-part name, which the engine resolves to a different, absent
+// securable, so VIEW DEFINITION and SELECT both come back denied about
+// metadata I can in fact read. I holds VIEW DEFINITION and SELECT on
+// dbo, so all three commands must report their properties complete,
+// with no "VIEW DEFINITION denied" notice. Measured without this fix on
+// SQL Server 2022: obj table, idx list and stats list all announced the
+// false denial.
+func TestDottedNameProbesTheResolvedSecurable(t *testing.T) {
+	lab := NewLab(t, os.Getenv("ASQ_TEST_IMAGE"))
+	lab.ensurePrincipals(t)
+
+	for _, tc := range []struct {
+		name  string
+		args  []string
+		table string
+	}{
+		{"obj table", []string{"obj", "table", "dbo.[Order.Detail]"}, "columns"},
+		{"idx list", []string{"idx", "list", "dbo.[Order.Detail]"}, "indexes"},
+		{"stats list", []string{"stats", "list", "dbo.[Order.Detail]"}, "statistics"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, code := lab.Run(t, "I", tc.args)
+			if code != 0 || r.Error != nil {
+				t.Fatalf("%s as I: got code %d, error %#v; want 0", tc.name, code, r.Error)
+			}
+			var tbl *model.TableResult
+			for i := range r.Tables {
+				if r.Tables[i].Spec.Name == tc.table {
+					tbl = &r.Tables[i]
+				}
+			}
+			if tbl == nil {
+				t.Fatalf("%s: no %q table in result: %#v", tc.name, tc.table, r.Tables)
+			}
+			if !tbl.State.PropertiesComplete {
+				t.Fatalf("%s: properties_complete=false; the probe on dbo.[Order.Detail] must reach the resolved securable", tc.name)
+			}
+			for _, n := range r.Notices {
+				if strings.Contains(n.Message, "VIEW DEFINITION denied") {
+					t.Fatalf("%s: false denial notice on a readable object: %q", tc.name, n.Message)
+				}
+			}
+		})
+	}
+}
+
 // TestObjTableSizeTableSurviveMissingViewDatabaseState is task 13
 // fix-1's own A1 target: the shared classifier used to recognize only
 // SQL error numbers 229 and 300 as permission denials, not 297 - the

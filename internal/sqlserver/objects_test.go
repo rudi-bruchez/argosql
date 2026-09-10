@@ -150,3 +150,26 @@ func TestResolveFound(t *testing.T) {
 		t.Fatalf("got %+v", obj)
 	}
 }
+
+// TestObjectQualifiedName pins the delimited form the permission probes
+// must receive. The embedded-dot case is the measured defect: an
+// unquoted "dbo.Odd.Name" is a three-part name, so HAS_PERMS_BY_NAME
+// resolves it to an absent securable and reports a permission denied
+// about metadata that is in fact readable. The bracket-in-name case
+// pins the "]]" escape, the same rule splitTwoPart already honors on
+// the way in.
+func TestObjectQualifiedName(t *testing.T) {
+	for _, tc := range []struct {
+		schema, name, want string
+	}{
+		{"dbo", "Orders", "[dbo].[Orders]"},
+		{"dbo", "Odd.Name", "[dbo].[Odd.Name]"},
+		{"My Schema", "My Table", "[My Schema].[My Table]"},
+		{"dbo", "Weird]Name", "[dbo].[Weird]]Name]"},
+	} {
+		obj := Object{Schema: tc.schema, Name: tc.name}
+		if got := obj.QualifiedName(); got != tc.want {
+			t.Fatalf("QualifiedName(%q, %q) = %q, want %q", tc.schema, tc.name, got, tc.want)
+		}
+	}
+}

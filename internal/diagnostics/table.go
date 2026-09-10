@@ -209,7 +209,7 @@ func rowCountUnavailableMessage(obj sqlserver.Object, reason rowCountUnavailable
 // (sqlserver.Unknown, always accompanied by a non-nil error) is
 // returned rather than silently treated as complete or incomplete.
 func columnsPropertiesComplete(ctx context.Context, s *sqlserver.Session, obj sqlserver.Object) (bool, error) {
-	perm, err := sqlserver.Probe(ctx, s.Conn, obj.Schema+"."+obj.Name, "OBJECT", "VIEW DEFINITION")
+	perm, err := sqlserver.Probe(ctx, s.Conn, obj.QualifiedName(), "OBJECT", "VIEW DEFINITION")
 	if err != nil {
 		return false, err
 	}

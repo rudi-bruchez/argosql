@@ -184,7 +184,7 @@ func Code(ctx context.Context, s *sqlserver.Session, name string, dst model.Sink
 	}
 
 	if cells[0] == nil {
-		qualified := obj.Schema + "." + obj.Name
+		qualified := obj.QualifiedName()
 		perm, perr := sqlserver.Probe(ctx, s.Conn, qualified, "OBJECT", "VIEW DEFINITION")
 		if perr != nil {
 			return perr
