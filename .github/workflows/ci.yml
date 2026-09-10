@@ -26,6 +26,8 @@ jobs:
       - run: go test -race ./...
 
   integration-2022:
+    env:
+      ASQ_TEST_RUN_ID: asq-${{ github.run_id }}-${{ github.run_attempt }}-2022
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -38,9 +40,14 @@ jobs:
       - name: tests/integration against SQL Server 2022
         env:
           ASQ_TEST_IMAGE: mcr.microsoft.com/mssql/server:2022-latest
-        run: go test ./tests/integration -tags=integration -count=1 -timeout=25m -v
+        run: sh tests/integration/run.sh go test ./tests/integration -tags=integration -count=1 -timeout=25m -v
+      - name: remove this run's remaining containers
+        if: always()
+        run: make integration-cleanup
 
   integration-2019:
+    env:
+      ASQ_TEST_RUN_ID: asq-${{ github.run_id }}-${{ github.run_attempt }}-2019
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -53,7 +60,10 @@ jobs:
       - name: tests/integration against SQL Server 2019
         env:
           ASQ_TEST_IMAGE: mcr.microsoft.com/mssql/server:2019-latest
-        run: go test ./tests/integration -tags=integration -count=1 -timeout=25m -v
+        run: sh tests/integration/run.sh go test ./tests/integration -tags=integration -count=1 -timeout=25m -v
+      - name: remove this run's remaining containers
+        if: always()
+        run: make integration-cleanup
 
   windows:
     runs-on: windows-latest

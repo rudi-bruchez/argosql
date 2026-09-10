@@ -1,4 +1,4 @@
-.PHONY: test race vet build integration-2019 integration-2022 smoke-2025
+.PHONY: test race vet build integration-2019 integration-2022 smoke-2025 integration-cleanup
 
 DIST := dist
 
@@ -32,11 +32,11 @@ build:
 # one go test invocation.
 integration-2019:
 	ASQ_TEST_IMAGE=mcr.microsoft.com/mssql/server:2019-latest \
-	  go test ./tests/integration -tags=integration -count=1 -timeout=15m -v
+	  sh tests/integration/run.sh go test ./tests/integration -tags=integration -count=1 -timeout=15m -v
 
 integration-2022:
 	ASQ_TEST_IMAGE=mcr.microsoft.com/mssql/server:2022-latest \
-	  go test ./tests/integration -tags=integration -count=1 -timeout=15m -v
+	  sh tests/integration/run.sh go test ./tests/integration -tags=integration -count=1 -timeout=15m -v
 
 # SQL Server 2025 is not part of the validated release matrix (CLAUDE.md):
 # this runs only the reference end-to-end workflow (TestWorkflow), never
@@ -44,4 +44,8 @@ integration-2022:
 # Passing this alone does not establish release support for 2025.
 smoke-2025:
 	ASQ_TEST_IMAGE=mcr.microsoft.com/mssql/server:2025-latest \
-	  go test ./tests/integration -tags=integration -run '^TestWorkflow$$' -count=1 -timeout=15m -v
+	  sh tests/integration/run.sh go test ./tests/integration -tags=integration -run '^TestWorkflow$$' -count=1 -timeout=15m -v
+
+# Requires the exact ID printed by the wrapper, never a container name.
+integration-cleanup:
+	sh tests/integration/run.sh --cleanup

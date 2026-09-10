@@ -33,21 +33,36 @@ Equivalently, by hand:
 
 ```sh
 ASQ_TEST_IMAGE=mcr.microsoft.com/mssql/server:2022-latest \
-  go test ./tests/integration -tags=integration -count=1 -timeout=15m -v
+  sh tests/integration/run.sh go test ./tests/integration -tags=integration -count=1 -timeout=15m -v
 ```
 
-Every container the suite creates is named `asq-test-<random>` and labeled
-`io.argosql.test=<this run's ID>`; cleanup happens in the test's own deferred teardown.
-To audit what a run left behind, or to recover after a run was killed before it could
-clean up:
+Every container the suite creates is labeled `io.argosql.test=<run ID>`. The Make
+integration targets use `tests/integration/run.sh`, which prints and exports
+`ASQ_TEST_RUN_ID`, runs the test in a child process, then removes remaining containers
+with that exact label. It preserves the test's exit status; a cleanup failure after a
+successful test makes the wrapper fail. CI also runs `make integration-cleanup` with
+`if: always()` and the same ID after the test step.
+
+A direct `go test` timeout panics inside `testing` and bypasses `t.Cleanup`. It can
+leave a container running indefinitely. Use the wrapper, including for filtered runs.
+If the wrapper itself is killed with `SIGKILL`, the host stops, or Podman cleanup
+fails, recover manually using the ID printed before the tests:
 
 ```sh
-podman ps -a --filter label=io.argosql.test=<run ID printed at the top of the test's own output>
+ASQ_TEST_RUN_ID='<exact run ID>' make integration-cleanup
 ```
 
-Never filter by name alone, or by a bare `podman ps -a`, on a machine that may be running
-other SQL Server containers for unrelated purposes: only the label identifies what this
-specific run created.
+The manual target refuses an empty ID. To inspect survivors without removing them:
+
+```sh
+podman ps -a --filter 'label=io.argosql.test=<exact run ID>'
+```
+
+Never select containers by name or omit the run's label value. The delivered `asq`
+binary never creates containers; this cleanup belongs only to the integration harness.
+`TestTimeoutCleanup` exercises a real child test timeout with one disposable container,
+checks that exit code `2` survives the wrapper, and requires zero survivors by label.
+Run it separately with `-run '^TestTimeoutCleanup$' -timeout=60s -v` through the wrapper.
 
 ### Running the full suite without exhausting memory
 
@@ -60,28 +75,30 @@ long-running process that starts and tears down dozens of containers in sequence
 accumulates memory that a process exit releases; five shorter processes do not carry that
 accumulation across the boundary.
 
-The suite has 55 top-level test functions (verified with
-`grep -rh '^func Test' tests/integration/*.go | grep -v TestMain | wc -l`; `TestMain`
-itself never prints a `=== RUN` line, so it is excluded from that count). The five
+The five historical groups cover 55 top-level test functions (verified with
+`grep -rh '^func Test' tests/integration/*.go | grep -v TestMain | grep -v TestTimeoutCleanup | wc -l`;
+`TestMain` itself never prints a `=== RUN` line, and `TestTimeoutCleanup` is excluded
+because it is an additional test run separately, as described above: without that
+exclusion the same command returns 56 and no longer reproduces the number quoted here). The five
 groups below, run as five separate invocations of the same image, partition that count
 exactly: 8, 10, 10, 20, and 7, summing to 55.
 
 ```sh
 IMG=mcr.microsoft.com/mssql/server:2022-latest
 
-ASQ_TEST_IMAGE=$IMG go test ./tests/integration -tags=integration -count=1 -timeout=15m -v \
+ASQ_TEST_IMAGE=$IMG sh tests/integration/run.sh go test ./tests/integration -tags=integration -count=1 -timeout=15m -v \
   -run '^(TestContainerCarriesRunLabel|TestCleanupRemovesByID|TestSignalInterruptRemovesContainer|TestFixtureQueryStoreFlush|TestLabRunOnlyInjectsRequestedSecret|TestErrors|TestSessionTLS|TestSessionLockConflict)$'
 
-ASQ_TEST_IMAGE=$IMG go test ./tests/integration -tags=integration -count=1 -timeout=15m -v \
+ASQ_TEST_IMAGE=$IMG sh tests/integration/run.sh go test ./tests/integration -tags=integration -count=1 -timeout=15m -v \
   -run '^(TestInfo|TestStatus|TestTop|TestQueryExport|TestQueryNotFound|TestQueryStoreUnavailableAndOffWithHistory|TestQueryNoExecutionsInWindowKeepsPlanRow|TestQueryParentModuleVisibility|TestQueryExportLongUnicodeTextByteIdentity|TestQueryPlansSyntheticAggregation)$'
 
-ASQ_TEST_IMAGE=$IMG go test ./tests/integration -tags=integration -count=1 -timeout=15m -v \
+ASQ_TEST_IMAGE=$IMG sh tests/integration/run.sh go test ./tests/integration -tags=integration -count=1 -timeout=15m -v \
   -run '^(TestPlanSummaryWarningAttributeForm|TestPlanExport|TestPlanNotFound|TestPlanMismatch|TestPlanSummary|TestPlanSucceedsWhileQueryStoreOff|TestPlanUnavailableForNullQueryPlan|TestExports|TestScanRowMeasuredGoTypes|TestConvertCellAgainstRealServer)$'
 
-ASQ_TEST_IMAGE=$IMG go test ./tests/integration -tags=integration -count=1 -timeout=15m -v \
+ASQ_TEST_IMAGE=$IMG sh tests/integration/run.sh go test ./tests/integration -tags=integration -count=1 -timeout=15m -v \
   -run '^(TestEncryptedModule|TestObjects|TestObjCodePermissionDenied|TestObjCodeOnNonModuleObject|TestWrongObjectTypeRejected|TestColumnsAndIndexesPropertiesMaskedBySelectOnly|TestObjTableSizeTableSurviveMissingViewDatabaseState|TestIdxListIgnoresPartitioningColumn|TestSizeTableExposesTotals|TestIdxListHandlesWideIndex|TestSize|TestSizeAllocationsOrderMatchesIndependentUnpivot|TestRegisteredTableOrderMatchesExecution|TestObjTableColumnsAndIndexes|TestIdxListOnHeapExcludesIndexZero|TestPartialStatistics|TestIndexDMV|TestStatsMixedAvailabilityPrincipal|TestPermissions|TestEveryProbeIsWellFormed)$'
 
-ASQ_TEST_IMAGE=$IMG go test ./tests/integration -tags=integration -count=1 -timeout=15m -v \
+ASQ_TEST_IMAGE=$IMG sh tests/integration/run.sh go test ./tests/integration -tags=integration -count=1 -timeout=15m -v \
   -run '^(TestPrincipalMatrix|TestHelpNeverConnects|TestTLSValidCertificate|TestTLSWrongHostCertificate|TestTLSExpiredCertificate|TestTLSHandshakeErrorTextAssumptionHoldsForGoMssqldbV1_11_0|TestWorkflow)$'
 ```
 
