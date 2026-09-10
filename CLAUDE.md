@@ -233,6 +233,18 @@ enfants imbriqués**, `ColumnsWithNoStatistics` portant des `ColumnReference`, d
 sans garde de profondeur transforme chaque descendant en avertissement et sature son plafond.
 Les deux faits tirent en sens inverse et se tiennent ensemble.
 
+Ce programme tient **une seule connexion épinglée**, et la conséquence est un piège de
+conception, pas une subtilité de pilote : une requête émise pendant qu'un jeu de lignes est
+encore ouvert sur cette connexion **bloque indéfiniment**. Ce n'est pas une erreur qu'on
+classe, c'est un blocage, donc la commande ne rend jamais rien et aucun code de sortie
+n'arrive. Mesuré ici sur `stats list`, dont la sonde de permission était paresseuse et ne
+se déclenchait, par coïncidence de fixture, que sur la DERNIÈRE ligne du jeu : ajouter une
+statistique supplémentaire après celle dont les propriétés sont refusées a suffi à faire
+apparaître le blocage. Toute sonde ou lecture secondaire se fait donc **avant** l'ouverture
+du jeu de lignes, ou **après** sa consommation complète, jamais pendant. Les quatre boucles
+`rows.Next()` du paquet `internal/diagnostics` ont été auditées une fois dans ce sens, et
+l'audit se refait quand on en ajoute une.
+
 **Révoquer une permission qui est IMPLIQUÉE par une autre ne la retire pas**, et une mesure
 construite sur un `REVOKE` ne prouve donc rien. Microsoft documente
 `sys.dm_db_partition_stats` comme exigeant, sur 2022 et au-delà, « VIEW DATABASE PERFORMANCE
