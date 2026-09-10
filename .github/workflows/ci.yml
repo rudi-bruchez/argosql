@@ -81,6 +81,19 @@ jobs:
       - name: "smoke: a missing --config reports a config error, not a crash"
         shell: pwsh
         run: |
+          # This step asserts a NON-ZERO exit code on purpose, so both of
+          # PowerShell's native-command error behaviours have to be stood
+          # down first. GitHub Actions runs pwsh with
+          # $ErrorActionPreference = 'Stop', and PowerShell 7.3 and later
+          # turn a native command's non-zero exit into a terminating error
+          # under that preference. Without these two lines the script dies
+          # on the asq.exe call itself and never reaches the comparison
+          # below, which is exactly how this step failed: the binary was
+          # already returning the right code 2, and the log showed its
+          # correct message, while the step reported exit 1 from a branch
+          # it had not run.
+          $ErrorActionPreference = 'Continue'
+          $PSNativeCommandUseErrorActionPreference = $false
           & .\asq.exe --ctx x --config .\does-not-exist.yaml info
           if ($LASTEXITCODE -ne 2) {
             Write-Error "expected exit code 2 for a missing config file, got $LASTEXITCODE"
