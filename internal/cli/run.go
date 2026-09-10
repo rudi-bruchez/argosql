@@ -173,6 +173,14 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, loadConfi
 // file, no connection, no deferred default resolved. It is the only
 // path through this package that may run when os.UserConfigDir and
 // os.UserCacheDir both fail.
+//
+// It takes no config.Profile, and that is why its own result.Error is
+// the one PublicError reaching stdout that redactPublicError does not
+// touch: this path never loads a profile, so no password exists in this
+// process to leak, and there is nothing to redact against. Do not
+// "fix" that asymmetry by threading a profile in here - that would
+// create the very exposure the redaction exists to prevent, by making
+// a secret reachable from a command that has no use for one.
 func runOffline(cmd Command, req Request, stdout, stderr io.Writer) int {
 	sink := &memSink{}
 	execErr := cmd.Execute(context.Background(), nil, req, sink)
