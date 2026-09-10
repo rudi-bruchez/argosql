@@ -79,23 +79,22 @@ jobs:
       - name: "smoke: help works with no configuration file"
         run: .\asq.exe help
       - name: "smoke: a missing --config reports a config error, not a crash"
-        shell: pwsh
+        # cmd, not pwsh, and the choice is deliberate. This step asserts a
+        # NON-ZERO exit code, which is the one thing PowerShell makes hard:
+        # GitHub Actions runs pwsh with $ErrorActionPreference = 'Stop', and
+        # PowerShell 7.3 and later turn a native command's non-zero exit
+        # into a terminating error under that preference, so the script dies
+        # on the asq.exe call and never reaches its own comparison. Measured
+        # twice on this runner: the binary printed its correct message and
+        # returned 2, while the step reported 1 from a branch it had not
+        # run, and standing both preferences down did not change that. cmd
+        # has no such semantics and %ERRORLEVEL% is exactly the child's
+        # code, so the assertion can be read literally.
+        shell: cmd
         run: |
-          # This step asserts a NON-ZERO exit code on purpose, so both of
-          # PowerShell's native-command error behaviours have to be stood
-          # down first. GitHub Actions runs pwsh with
-          # $ErrorActionPreference = 'Stop', and PowerShell 7.3 and later
-          # turn a native command's non-zero exit into a terminating error
-          # under that preference. Without these two lines the script dies
-          # on the asq.exe call itself and never reaches the comparison
-          # below, which is exactly how this step failed: the binary was
-          # already returning the right code 2, and the log showed its
-          # correct message, while the step reported exit 1 from a branch
-          # it had not run.
-          $ErrorActionPreference = 'Continue'
-          $PSNativeCommandUseErrorActionPreference = $false
-          & .\asq.exe --ctx x --config .\does-not-exist.yaml info
-          if ($LASTEXITCODE -ne 2) {
-            Write-Error "expected exit code 2 for a missing config file, got $LASTEXITCODE"
-            exit 1
-          }
+          .\asq.exe --ctx x --config .\does-not-exist.yaml info
+          if %ERRORLEVEL% NEQ 2 (
+            echo expected exit code 2 for a missing config file, got %ERRORLEVEL%
+            exit /b 1
+          )
+          exit /b 0
