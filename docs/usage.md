@@ -56,7 +56,7 @@ round a float for display.
 Every table result carries a preview, never the complete collected data: 10 rows by
 default (`--preview 0` to `10000`), each text cell capped at 200 Unicode code points by
 default (`--truncate 1` to `10000`, or `--no-truncate` to disable only that per-cell
-cap). A truncated cell ends in a marker of the form `...[+N]`, N being the number of
+cap). A truncated cell ends in a marker of the form `…[+N]`, N being the number of
 Unicode code points omitted; this marker is descriptive metadata, not part of the
 underlying value, even on the rare occasion the real data itself happens to contain the
 same literal text.
@@ -131,11 +131,16 @@ The supplied [agent skill](../skills/argosql/SKILL.md) states this boundary expl
 | 8 | The requested entity does not exist, or is not visible to this principal |
 | 130 | Interrupted by the user |
 
-Argument and configuration errors (code 2) are always reported before any connection is
-attempted. Object resolution always precedes the object-specific permission check for
-that object, which is why, for an object this principal cannot see at all, the exit code
-is 8 (not found or not visible), never 4 (permission denied): a principal that can prove
-nothing about an object's existence cannot report a reason for refusing it either.
+Syntactic argument and configuration errors (code 2) are reported before any connection
+is attempted: a malformed flag, an out-of-range value, a malformed `--object` name. One
+code-2 case is necessarily later than that. A name that is syntactically valid but
+resolves to an object of the wrong type for the command (a table given to `obj code`, a
+procedure given to `obj table`) can only be answered by the catalog, so it is reported
+at code 2 after the connection opens and after resolution. Object resolution always
+precedes the object-specific permission check for that object, which is why, for an
+object this principal cannot see at all, the exit code is 8 (not found or not visible),
+never 4 (permission denied): a principal that can prove nothing about an object's
+existence cannot report a reason for refusing it either.
 
 ## Permissions, briefly
 

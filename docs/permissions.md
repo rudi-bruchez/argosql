@@ -2,9 +2,12 @@
 
 `asq` never requires a privileged login. Every command probes the exact permission it
 needs and reports a refusal as a refusal, never as an absence. The three fixture tiers
-below are cumulative starting points, not claims of a universally minimal grant: they are
-what this project's own integration suite provisions and tests against
-(`tests/integration/sql/principals.sql`, `tests/integration/matrix_test.go`).
+below are cumulative starting points, not claims of a universally minimal grant. They
+are the bundles the design spec defines for the fixture principals. The integration
+suite tests against them with one addition it must make: the spec defines I as Q plus
+`VIEW DEFINITION` and `SELECT` on fixture tables (`tests/integration/sql/principals.sql`
+grants I and S `SELECT ON SCHEMA::dbo`), while `login.sql` keeps its own I at `VIEW
+DEFINITION` alone. The two are deliberately not identical, and this page states both.
 
 `login.sql`, at the root of this repository, is the versioned provisioning script: a
 single file with the login, the user, and each tier commented out except the first, meant
@@ -32,8 +35,20 @@ GRANT VIEW DEFINITION TO argosql;
 
 `VIEW DEFINITION` is the real cost of this tier: it exposes the text of every procedure,
 function, view and trigger the principal can otherwise see, including any comment or
-literal constant they contain. On SQL Server 2022 and later, two further grants are
-needed for table size collection specifically, and only there:
+literal constant they contain. The design spec defines I as Q plus `VIEW DEFINITION` and
+`SELECT` on fixture tables, but `login.sql` grants only `VIEW DEFINITION` here: it is the
+tier for an operator who wants inspection without reading a row of business data. The
+difference has one visible consequence. `stats list` reads each statistic's modification
+counter and last-updated time through `sys.dm_db_stats_properties`, which needs an
+effective `SELECT` on the statistic's own columns. Under tier I as `login.sql` grants it
+that read returns nothing, and the command reports every statistic's `properties_status`
+as `unavailable` (still exit code 0, a partial success). Grant `SELECT` on the tables
+whose statistics you want reported as `available`, or grant the wider fixture I the
+integration suite uses. The matrix below shows `stats list` at 0 under I because it
+describes the suite's fixture, which holds that `SELECT`; under `login.sql`'s I the
+command still succeeds at 0, only with unavailable properties. On SQL Server 2022 and
+later, two further grants are needed for table size collection specifically, and only
+there:
 
 ```sql
 GRANT VIEW DATABASE PERFORMANCE STATE TO argosql;
@@ -55,12 +70,15 @@ GRANT VIEW SERVER PERFORMANCE STATE TO argosql;  -- SQL Server 2022 and later
 
 Under this tier the login can observe activity in databases it was never given access
 to select. `idx usage` and `idx missing` are the only two commands that need it; every
-other command works fully under I.
+other command reaches its full result under I as the integration suite provisions it,
+which includes `SELECT` on the fixture schema. Under `login.sql`'s I, which does not,
+`stats list` still succeeds at code 0 but reports its properties as `unavailable` rather
+than `available`, as described above.
 
-None of the three tiers grants `SELECT` on application tables beyond what a command's
-own metadata probe needs, `db_datareader`, `db_owner`, `sysadmin`, or any write
-permission. `asq` issues no `INSERT`, `UPDATE`, `DELETE`, `ALTER`, `CREATE` or `DROP`
-against the database it diagnoses.
+`login.sql`'s three tiers grant no `SELECT` on application tables, no `db_datareader`,
+`db_owner`, `sysadmin`, or any write permission. The integration fixture grants I and S
+`SELECT ON SCHEMA::dbo` and nothing broader. `asq` issues no `INSERT`, `UPDATE`,
+`DELETE`, `ALTER`, `CREATE` or `DROP` against the database it diagnoses.
 
 ## What each command needs, and what it does under a narrower tier
 

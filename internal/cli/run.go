@@ -235,12 +235,15 @@ func runOffline(cmd Command, req Request, stdout, stderr io.Writer) int {
 		// already in memory and small by construction: the general
 		// --preview default of 10 rows exists to bound a SQL result set
 		// a caller has not asked to see in full, not to cap help's own
-		// inventory. Measured: with the 9 global flags alone, help's
-		// "flags" table already holds 19 rows across 3 commands, and
-		// the default --preview would have silently dropped "qs
-		// status"'s flags from help's own output, omitted_reasons
-		// row_limit, with no cell ever near its byte cap. An explicit
-		// --preview is still honored: only the silent default changes.
+		// inventory. Remeasured against the full thirteen-command
+		// registry: `asq help --format json` renders help's "flags"
+		// table with rows_collected=134, so the default --preview of 10
+		// would have silently dropped 124 of them, omitted_reasons
+		// row_limit, with no cell ever near its byte cap. The earlier
+		// figure here, 19 rows across 3 commands, predated the other ten
+		// commands; the count grew again when help started announcing
+		// the global flags it accepts. An explicit --preview is still
+		// honored: only the silent default changes.
 		options.Rows = offlineDefaultPreviewRows
 	}
 	out, renderErr := output.Render(result, options, req.Format)

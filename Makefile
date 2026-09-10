@@ -1,4 +1,4 @@
-.PHONY: test race vet build integration-2019 integration-2022 smoke-2025 integration-cleanup
+.PHONY: test race vet check build integration-2019 integration-2022 smoke-2025 integration-cleanup
 
 DIST := dist
 
@@ -11,6 +11,18 @@ race:
 vet:
 	go vet ./...
 	go vet -tags=integration ./...
+
+# check runs the five container-free verification commands docs/testing.md
+# names. gofmt -l . only prints unformatted files and still exits 0, so the
+# shell guard is what turns a non-empty list into a failed target; without
+# it, check would claim to cover formatting while passing a dirty tree.
+check: test race vet
+	@unformatted="$$(gofmt -l .)"; \
+	if [ -n "$$unformatted" ]; then \
+		echo "gofmt: these files are not formatted:" >&2; \
+		echo "$$unformatted" >&2; \
+		exit 1; \
+	fi
 
 build:
 	mkdir -p $(DIST)

@@ -10,7 +10,7 @@ go vet -tags=integration ./...
 gofmt -l .
 ```
 
-All five, or `make test race vet`, run with no container, no network, and no
+All five, or `make check`, run with no container, no network, and no
 configuration file. They cover every package except the real-server behavior that
 `tests/integration` exists for.
 
