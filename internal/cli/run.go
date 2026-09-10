@@ -142,21 +142,20 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, loadConfi
 	// of the three to leak through, being the one an operator attaches
 	// to a ticket.
 	//
-	// Measured afterwards, and worth writing down because it bounds what
-	// this guard is for: no error reachable TODAY carries the secret this
-	// far. internal/diagnostics' own classifyQueryError reformulates
-	// every driver error into a fixed message and never passes the
-	// driver's text through (CLAUDE.md records that rule), so an injected
-	// message containing the password arrives here as "diagnostic query
-	// failed". A test built on that injection passed with this guard
-	// REMOVED, which is how the measurement happened; the hollow test was
-	// deleted rather than kept green.
+	// Reachable, and measured: internal/plan/summary.go embeds
+	// encoding/xml's own parse error verbatim, and encoding/xml quotes the
+	// offending element name. A malformed plan whose element name is the
+	// secret therefore reaches Finish with the secret in its message -
+	// which is how the harm review reproduced it, stdout and stderr clean,
+	// manifest.json carrying it still.
 	//
-	// The guard stays because the ordering hole is real even where the
-	// leak is not: any future error path that does not reformulate - an
-	// artifact message built from a path, a driver error surfaced
-	// verbatim by a later change - would open it silently, and the cost
-	// of closing it now is one assignment.
+	// Worth recording how nearly this was missed: a first attempt injected
+	// the secret through a diagnostic query instead, where
+	// internal/diagnostics reformulates every driver error into a fixed
+	// message (CLAUDE.md records that rule), so it arrived as "diagnostic
+	// query failed" and the test passed with this guard REMOVED. The wrong
+	// injection path made a real defect look unreachable. The test that
+	// replaced it breaks when this line does.
 	//
 	// finalErr still comes from the ORIGINAL execErr, never from safeErr:
 	// exitCodeFor inspects the error's own type and wrapping, which a

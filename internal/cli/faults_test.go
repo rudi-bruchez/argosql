@@ -6,6 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -168,5 +171,85 @@ func TestRedactCoversTheURLEncodedPassword(t *testing.T) {
 	}
 	if got := redact("dial failed for sqlserver://user:"+encoded+"@host:1433", p); strings.Contains(got, encoded) {
 		t.Fatalf("the percent-encoded form survived redaction: %q", got)
+	}
+}
+
+// TestManifestNeverCarriesTheSecret is the harm review's measured
+// credential finding, and a third output the earlier redaction fix did
+// not reach. Collector.Finish writes manifest.json, manifest.json
+// serializes result.Error (internal/artifacts/manifest.go), and run
+// redacted result.Error only AFTER Finish returned - so the file on disk
+// kept the raw message while stdout and stderr both masked it.
+// docs/usage.md states outright that the manifest never records
+// credentials, and the manifest is the worst of the three to leak
+// through: it is the file an operator attaches to a ticket, and it
+// persists.
+//
+// The injection path matters, and choosing it wrong is how a first
+// version of this test came out hollow. internal/diagnostics
+// reformulates every driver error into a fixed message (CLAUDE.md
+// records that rule), so a secret injected through a diagnostic query
+// arrives as "diagnostic query failed" and proves nothing. The path that
+// does pass text through verbatim is internal/plan/summary.go's own
+// parse error, which embeds encoding/xml's message - and encoding/xml
+// quotes the offending element name. A malformed plan whose element name
+// is the secret therefore produces exactly the error shape the reviewer
+// measured. The real-world chain is narrower but not imaginary: module
+// code and query text routinely carry connection strings, which is this
+// project's own stated reason for treating VIEW DEFINITION as sensitive.
+func TestManifestNeverCarriesTheSecret(t *testing.T) {
+	const secret = "HARM_SYNTHETIC_SECRET"
+	profile := config.Profile{Host: "fake", Database: "db", Username: "user", Password: secret, Port: 1433, TrustServerCertificate: true}
+	outDir := t.TempDir()
+	args := []string{"--ctx", "x", "--format", "json", "--out-dir", outDir, "plan", "4821", "--plan-id", "9033", "--summary"}
+
+	malformed := "<ShowPlanXML><" + secret + "></ShowPlanXML>"
+	opener := func(ctx context.Context, p config.Profile) (*sqlserver.Session, error) {
+		return newFakeSessionWithPlanXML(t, 16, malformed), nil
+	}
+
+	var out, errout bytes.Buffer
+	code := run(context.Background(), args, &out, &errout, fakeLoadConfig(profile), opener)
+	if code == 0 {
+		t.Fatalf("the malformed plan did not fail the command: got 0, so this test exercises nothing; stdout %s", out.String())
+	}
+	if strings.Contains(out.String(), secret) || strings.Contains(errout.String(), secret) {
+		t.Fatalf("stdout or stderr leaks the secret, which is the already-fixed behaviour this test must not regress past")
+	}
+
+	var manifests []string
+	if err := filepath.WalkDir(outDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() && d.Name() == "manifest.json" {
+			manifests = append(manifests, path)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("walking %s: %v", outDir, err)
+	}
+	if len(manifests) == 0 {
+		t.Fatalf("no manifest.json under %s: this test proves nothing unless one exists", outDir)
+	}
+	for _, m := range manifests {
+		data, err := os.ReadFile(m)
+		if err != nil {
+			t.Fatalf("reading %s: %v", m, err)
+		}
+		if bytes.Contains(data, []byte(secret)) {
+			t.Fatalf("%s carries the secret in its raw bytes", m)
+		}
+		var doc struct {
+			Error struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(data, &doc); err != nil {
+			t.Fatalf("decoding %s: %v", m, err)
+		}
+		if strings.Contains(doc.Error.Message, secret) {
+			t.Fatalf("%s: error.message, once JSON-DECODED, still carries the secret: %q", m, doc.Error.Message)
+		}
 	}
 }
