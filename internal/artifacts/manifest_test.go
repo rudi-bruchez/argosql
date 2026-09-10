@@ -22,6 +22,7 @@ func TestManifestNeverCarriesPreviewState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { c.Close() })
 	if err := c.Begin(intSpec("x")); err != nil {
 		t.Fatal(err)
 	}
@@ -60,6 +61,7 @@ func TestManifestNoticeCountSurvivesTruncation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { c.Close() })
 	if err := c.Begin(intSpec("x")); err != nil {
 		t.Fatal(err)
 	}
@@ -108,6 +110,7 @@ func TestManifestExcludesSQLValues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { c.Close() })
 	spec := model.TableSpec{Name: "x", Columns: []model.Column{{Name: "s", SQLType: "varchar"}}}
 	if err := c.Begin(spec); err != nil {
 		t.Fatal(err)
@@ -144,6 +147,7 @@ func TestManifestUTF8NoBOM(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { c.Close() })
 	if err := c.Begin(intSpec("x")); err != nil {
 		t.Fatal(err)
 	}
@@ -191,6 +195,7 @@ func TestManifestReservationReclaimsIncompleteKeepsComplete(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { c.Close() })
 
 	// Table "complete": finished in full, must survive no matter what.
 	if err := c.Begin(intSpec("complete")); err != nil {
@@ -270,6 +275,7 @@ func TestManifestReservationFailsCode6WithoutClaimingComplete(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { c.Close() })
 
 	if err := c.Begin(intSpec("complete")); err != nil {
 		t.Fatal(err)
@@ -332,6 +338,7 @@ func TestFinishManifestErrorOverridesCollectionError(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			t.Cleanup(func() { c.Close() })
 			if err := c.Begin(intSpec("x")); err != nil {
 				t.Fatal(err)
 			}

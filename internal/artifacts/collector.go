@@ -382,6 +382,34 @@ func toPublicError(err error) *model.PublicError {
 	return &model.PublicError{Code: 5, Kind: "execution", Message: err.Error()}
 }
 
+// Close releases the invocation directory's open handle. Finish calls it,
+// so a completed run needs nothing else; it exists separately, and is
+// idempotent, because a Collector that is abandoned without Finish still
+// holds that handle, and on Windows an open directory handle prevents the
+// directory from being renamed or removed AT ALL.
+//
+// Measured on the Windows CI job, and it is the whole reason this method
+// exists: holding the handle for the Collector's lifetime (added to anchor
+// artifact creation and removal against an ancestor swap) made every
+// artifacts test that does not call Finish fail, not on its own assertions
+// but on t.TempDir's cleanup, "The process cannot access the file because
+// it is being used by another process". The Unix side never noticed,
+// because Unix happily unlinks a directory that someone still has open.
+//
+// The handle is deliberately held rather than reopened per operation: an
+// operation relative to a handle opened once, on the directory this store
+// itself created, cannot be redirected by a later ancestor swap, whereas
+// reopening the root by name before each operation would leave exactly
+// that window. Close is the price of that guarantee.
+func (c *Collector) Close() error {
+	if c.store == nil || c.store.root == nil {
+		return nil
+	}
+	root := c.store.root
+	c.store.root = nil
+	return root.Close()
+}
+
 // Finish assembles the run's model.Result and writes its manifest.
 //
 // runErr is the collection error the caller already observed (nil on a
@@ -395,7 +423,7 @@ func toPublicError(err error) *model.PublicError {
 // Finish closes it out as incomplete before doing anything else, so it
 // is never silently lost from the run's accounting.
 func (c *Collector) Finish(info model.ContextInfo, runErr error) (model.Result, error) {
-	defer c.store.root.Close()
+	defer c.Close()
 	if c.current != nil {
 		if err := c.finalizeCurrent(false, false); err != nil {
 			return model.Result{}, err

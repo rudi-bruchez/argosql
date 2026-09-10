@@ -41,6 +41,7 @@ func TestRowLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { c.Close() })
 	if err = c.Begin(model.TableSpec{Name: "x", Columns: []model.Column{{Name: "n", SQLType: "int"}}}); err != nil {
 		t.Fatal(err)
 	}
@@ -73,6 +74,7 @@ func TestBeginRefusesSecondTableWithoutHeaderRoom(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { c.Close() })
 	if err := c.Begin(intSpec("a")); err != nil {
 		t.Fatal(err)
 	}
@@ -107,6 +109,7 @@ func TestExactBoundaryComplete(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { c.Close() })
 	if err := c.Begin(intSpec("x")); err != nil {
 		t.Fatal(err)
 	}
@@ -147,6 +150,7 @@ func TestMultiTableRowLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { c.Close() })
 
 	if err := c.Begin(intSpec("a")); err != nil {
 		t.Fatal(err)
@@ -185,6 +189,7 @@ func TestBytesLimitBeforeAtAfter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { measure.Close() })
 	if err := measure.Begin(intSpec("x")); err != nil {
 		t.Fatal(err)
 	}
@@ -201,6 +206,7 @@ func TestBytesLimitBeforeAtAfter(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		t.Cleanup(func() { c.Close() })
 		if err := c.Begin(intSpec("x")); err != nil {
 			t.Fatal(err)
 		}
@@ -214,6 +220,7 @@ func TestBytesLimitBeforeAtAfter(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		t.Cleanup(func() { c.Close() })
 		if err := c.Begin(intSpec("x")); err != nil {
 			t.Fatal(err)
 		}
@@ -227,6 +234,7 @@ func TestBytesLimitBeforeAtAfter(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		t.Cleanup(func() { c.Close() })
 		if err := c.Begin(intSpec("x")); err != nil {
 			t.Fatal(err)
 		}
@@ -264,6 +272,7 @@ func TestRowByteAccountingMatchesDiskSize(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			t.Cleanup(func() { c.Close() })
 			if err := c.Begin(intSpec("x")); err != nil {
 				t.Fatal(err)
 			}
@@ -304,6 +313,7 @@ func TestFileLimitSingleSource(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		t.Cleanup(func() { c.Close() })
 		src := bytes.NewReader(bytes.Repeat([]byte("a"), budget))
 		artifact, err := c.File("plan", ".xml", src)
 		if err != nil {
@@ -324,6 +334,7 @@ func TestFileLimitSingleSource(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		t.Cleanup(func() { c.Close() })
 		src := bytes.NewReader(bytes.Repeat([]byte("a"), budget+1))
 		_, err = c.File("plan", ".xml", src)
 		if model.ExitCode(err) != 7 {
@@ -392,6 +403,7 @@ func TestFileCollisionAvoidsSymlink(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { c.Close() })
 
 	// Plant a symlink at the exact path Begin would otherwise use for
 	// table "x", pointing at a file outside the run directory entirely.
@@ -445,6 +457,7 @@ func TestDiskFailureDuringFlush(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { c.Close() })
 	spec := intSpec("x")
 	if err := c.Begin(spec); err != nil {
 		t.Fatal(err)
@@ -481,6 +494,7 @@ func TestDiskFailureDuringFileClose(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { c.Close() })
 	spec := intSpec("x")
 	if err := c.Begin(spec); err != nil {
 		t.Fatal(err)
@@ -513,6 +527,7 @@ func TestFinishClosesAbandonedTable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { c.Close() })
 	if err := c.Begin(intSpec("x")); err != nil {
 		t.Fatal(err)
 	}
@@ -553,6 +568,7 @@ func TestEncodingNormalizedNoticeEmitted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { c.Close() })
 	spec := model.TableSpec{Name: "x", Columns: []model.Column{{Name: "s", SQLType: "varchar"}}}
 	if err := c.Begin(spec); err != nil {
 		t.Fatal(err)
@@ -587,6 +603,7 @@ func TestEncodingNormalizedNoticeAbsentForCleanInput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { c.Close() })
 	spec := model.TableSpec{Name: "x", Columns: []model.Column{{Name: "s", SQLType: "varchar"}}}
 	if err := c.Begin(spec); err != nil {
 		t.Fatal(err)
@@ -613,6 +630,7 @@ func TestCollectionFailureIsNotLimit(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
+				t.Cleanup(func() { c.Close() })
 				if err = c.Begin(intSpec("x")); err != nil {
 					t.Fatal(err)
 				}

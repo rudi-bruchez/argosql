@@ -22,6 +22,7 @@ func TestPermissionsUnix(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { c.Close() })
 	if err := c.Begin(intSpec("x")); err != nil {
 		t.Fatal(err)
 	}
@@ -69,6 +70,7 @@ func TestStoreCreateUniqueRunDir(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { c1.Close() })
 	c2, err := New(base, "json", Limits{Rows: 10, Bytes: 1 << 20})
 	if err != nil {
 		t.Fatal(err)
@@ -82,10 +84,23 @@ func TestStoreCreateUniqueRunDir(t *testing.T) {
 }
 
 func TestStoreOperationsAfterDirectorySwap(t *testing.T) {
+	// Unix only, and the reason is the point: this test renames the
+	// invocation directory out from under an in-flight artifact write, to
+	// prove the store still operates inside the directory it opened rather
+	// than inside whatever the old path now resolves to. Windows refuses
+	// that rename outright while any handle on the directory is open, which
+	// is a STRONGER guarantee than the one measured here and leaves nothing
+	// to assert - measured on the Windows CI job, where the rename failed
+	// with "the process cannot access the file because it is being used by
+	// another process".
+	if runtime.GOOS == "windows" {
+		t.Skip("renaming a directory with an open handle is impossible on Windows, which protects this case by construction")
+	}
 	c, err := New(t.TempDir(), "json", Limits{Rows: 10, Bytes: 1 << 20})
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { c.Close() })
 	f, path, err := c.store.create("partial.sql")
 	if err != nil {
 		t.Fatal(err)

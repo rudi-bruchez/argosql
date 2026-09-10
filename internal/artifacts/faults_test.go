@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/rudi-bruchez/argosql/internal/model"
@@ -102,6 +103,7 @@ func TestBeginNeverOverwritesExistingRegularFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { c.Close() })
 
 	preexisting := filepath.Join(c.Dir(), "x.json")
 	const sentinel = "do not touch this pre-existing artifact"
@@ -141,6 +143,7 @@ func TestSanitizedFilenameNeverEscapesRunDir(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { c.Close() })
 	hostile := "../../etc/passwd"
 	if err := c.Begin(intSpec(hostile)); err != nil {
 		t.Fatal(err)
@@ -195,6 +198,7 @@ func TestFileSourceReadFailureLeavesNoPartialFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { c.Close() })
 	src := &limitedErrReader{remaining: 64}
 	_, fileErr := c.File("plan_xml", ".sqlplan", src)
 	if fileErr == nil {
@@ -228,6 +232,7 @@ func TestFileSecondSourceOverflowRetainsFirstCompleted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { c.Close() })
 
 	first, err := c.File("module_definition", ".sql", bytes.NewReader(bytes.Repeat([]byte("a"), budget/2)))
 	if err != nil {
@@ -297,6 +302,7 @@ func TestFileOverflowComposesWithRenderJSON(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { c.Close() })
 	first, err := c.File("module_definition", ".sql", bytes.NewReader(bytes.Repeat([]byte("a"), budget/2)))
 	if err != nil {
 		t.Fatalf("the first, well-within-budget file must succeed: %v", err)
@@ -370,6 +376,18 @@ func (r *swapReader) Read(p []byte) (int, error) {
 }
 
 func TestFileCleanupAfterDirectorySwap(t *testing.T) {
+	// Unix only, and the reason is the point: this test renames the
+	// invocation directory out from under an in-flight artifact write, to
+	// prove the store still operates inside the directory it opened rather
+	// than inside whatever the old path now resolves to. Windows refuses
+	// that rename outright while any handle on the directory is open, which
+	// is a STRONGER guarantee than the one measured here and leaves nothing
+	// to assert - measured on the Windows CI job, where the rename failed
+	// with "the process cannot access the file because it is being used by
+	// another process".
+	if runtime.GOOS == "windows" {
+		t.Skip("renaming a directory with an open handle is impossible on Windows, which protects this case by construction")
+	}
 	for _, tc := range []struct {
 		name    string
 		readErr error
@@ -383,6 +401,7 @@ func TestFileCleanupAfterDirectorySwap(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			t.Cleanup(func() { c.Close() })
 			victim := t.TempDir()
 			target := filepath.Join(victim, "plan_xml.sqlplan")
 			if err := os.WriteFile(target, []byte("keep"), 0600); err != nil {
