@@ -147,3 +147,26 @@ func TestRunRejectsOutOfRangeTimeoutBeforeConnecting(t *testing.T) {
 		t.Fatalf("exit code: got %d, want 2 (argument error)", code)
 	}
 }
+
+// TestRedactCoversTheURLEncodedPassword is the harm review's second
+// credential finding: redact did a literal ReplaceAll of the password,
+// but config.DSN builds its connection string with url.UserPassword,
+// which percent-escapes the userinfo. A driver error echoing that DSN
+// therefore carried a form the literal replacement walked straight past.
+// The two assertions are deliberately separate: the first would pass even
+// with the old code, and only the second fails on it.
+func TestRedactCoversTheURLEncodedPassword(t *testing.T) {
+	const secret = `p@ss"word\with/escapes`
+	p := config.Profile{Password: secret}
+
+	encoded := encodedPassword(secret)
+	if encoded == secret {
+		t.Fatalf("this test is vacuous unless net/url actually escapes the password: got %q", encoded)
+	}
+	if got := redact("error mentioning "+secret, p); strings.Contains(got, secret) {
+		t.Fatalf("the literal form survived redaction: %q", got)
+	}
+	if got := redact("dial failed for sqlserver://user:"+encoded+"@host:1433", p); strings.Contains(got, encoded) {
+		t.Fatalf("the percent-encoded form survived redaction: %q", got)
+	}
+}

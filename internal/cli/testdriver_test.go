@@ -54,15 +54,23 @@ var cliFakeDriverSeq atomic.Int64
 type cliFakeDriver struct {
 	planXML     string
 	missingArgs *[]driver.NamedValue
+	// queryErr, when set, is returned by every QueryContext after
+	// session setup has already succeeded. It exists so a test can fail
+	// a command AFTER the Collector was created and therefore after a
+	// manifest will be written - the only shape that exercises the
+	// manifest's own redaction. Failing the connection instead (see
+	// fakeOpenSession variants) never reaches a manifest at all.
+	queryErr error
 }
 
 func (d cliFakeDriver) Open(name string) (driver.Conn, error) {
-	return &cliFakeConn{planXML: d.planXML, missingArgs: d.missingArgs}, nil
+	return &cliFakeConn{planXML: d.planXML, missingArgs: d.missingArgs, queryErr: d.queryErr}, nil
 }
 
 type cliFakeConn struct {
 	planXML     string
 	missingArgs *[]driver.NamedValue
+	queryErr    error
 }
 
 func (c *cliFakeConn) Prepare(query string) (driver.Stmt, error) {
@@ -79,6 +87,16 @@ func (c *cliFakeConn) Begin() (driver.Tx, error) {
 // so this fake keeps working across cosmetic rewording of the queries
 // themselves.
 func (c *cliFakeConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	// Session setup (LOCK_TIMEOUT, @@LOCK_TIMEOUT, ProductMajorVersion)
+	// must still succeed, or no Collector and no manifest ever exist;
+	// queryErr only fails the diagnostic queries that come after.
+	// "ProductMajorVersion", not "SERVERPROPERTY": sql/info.sql reads
+	// edition and product version through SERVERPROPERTY too, so the
+	// broader exemption silently spared the very query this hook exists
+	// to fail - measured, the command returned 0 and wrote no error.
+	if c.queryErr != nil && !strings.Contains(query, "LOCK_TIMEOUT") && !strings.Contains(query, "ProductMajorVersion") {
+		return nil, c.queryErr
+	}
 	switch {
 	case strings.Contains(query, "DATABASEPROPERTYEX"):
 		// sql/info.sql

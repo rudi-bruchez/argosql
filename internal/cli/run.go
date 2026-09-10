@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -132,9 +133,44 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, loadConfi
 		CertificateValidation: certValidation(profile),
 		CollectedAt:           time.Now().UTC(),
 	}
-	result, finishErr := collector.Finish(info, execErr)
+	// Finish writes manifest.json, and manifest.json serializes
+	// result.Error (internal/artifacts/manifest.go). So the manifest is
+	// a THIRD output that could carry a secret, after stdout and stderr,
+	// and the harm review found that the earlier redaction fix reached
+	// neither it nor the file on disk - while docs/usage.md promises the
+	// manifest never records credentials, and the manifest is the worst
+	// of the three to leak through, being the one an operator attaches
+	// to a ticket.
+	//
+	// Measured afterwards, and worth writing down because it bounds what
+	// this guard is for: no error reachable TODAY carries the secret this
+	// far. internal/diagnostics' own classifyQueryError reformulates
+	// every driver error into a fixed message and never passes the
+	// driver's text through (CLAUDE.md records that rule), so an injected
+	// message containing the password arrives here as "diagnostic query
+	// failed". A test built on that injection passed with this guard
+	// REMOVED, which is how the measurement happened; the hollow test was
+	// deleted rather than kept green.
+	//
+	// The guard stays because the ordering hole is real even where the
+	// leak is not: any future error path that does not reformulate - an
+	// artifact message built from a path, a driver error surfaced
+	// verbatim by a later change - would open it silently, and the cost
+	// of closing it now is one assignment.
+	//
+	// finalErr still comes from the ORIGINAL execErr, never from safeErr:
+	// exitCodeFor inspects the error's own type and wrapping, which a
+	// flattened *PublicError copy would not preserve. The identity
+	// comparison below is what separates "Finish handed back the runErr
+	// it was given" (its success path returns exactly that) from "Finish
+	// failed on its own", which is the only case that overrides.
+	safeErr := execErr
+	if execErr != nil {
+		safeErr = redactPublicError(publicErrorOf(execErr), profile)
+	}
+	result, finishErr := collector.Finish(info, safeErr)
 	finalErr := execErr
-	if finishErr != nil {
+	if finishErr != nil && finishErr != safeErr {
 		// A later file/serialization error always overrides an earlier
 		// collection error - the project rule Finish itself documents.
 		finalErr = finishErr
@@ -268,7 +304,28 @@ func redact(msg string, p config.Profile) string {
 	if p.Password == "" {
 		return msg
 	}
-	return strings.ReplaceAll(msg, p.Password, "REDACTED")
+	out := strings.ReplaceAll(msg, p.Password, "REDACTED")
+	// And the percent-encoded form, because the literal one is not what
+	// a leaked connection string contains. config.DSN builds its URL
+	// with url.UserPassword, which escapes the userinfo: a password of
+	// p@ss"word\with/escapes reaches a driver error as
+	// p%40ss%22word%5Cwith%2Fescapes, and a literal ReplaceAll walks
+	// straight past it. Found by the harm review, which measured
+	// net/url's own escaping rather than assuming it. Both forms are
+	// replaced because an error can echo either: the raw value from
+	// config, or the encoded one from the DSN.
+	if enc := encodedPassword(p.Password); enc != p.Password {
+		out = strings.ReplaceAll(out, enc, "REDACTED")
+	}
+	return out
+}
+
+// encodedPassword returns p exactly as config.DSN's own
+// url.UserPassword would place it in a connection string. Derived from
+// net/url rather than reimplemented: a hand-rolled escaper that drifts
+// from the standard library's would reopen the very gap this closes.
+func encodedPassword(pw string) string {
+	return strings.TrimPrefix(url.UserPassword("", pw).String(), ":")
 }
 
 // redactPublicError returns a copy of pe with Message passed through
