@@ -2,6 +2,275 @@ package cli
 
 import "testing"
 
+// errorfHelper is the minimal subset of *testing.T the checks below need:
+// just enough to report a failure and mark the caller's own stack frame as
+// uninteresting in a trace. *testing.T satisfies it for every ordinary
+// test below; recordingT (further down) satisfies it for the two tests
+// that must observe a check FAIL without failing the outer test itself -
+// the brief's own required proof that a dropped handler, or an added
+// deferred command, is actually caught, without ever mutating the real
+// registry NewRegistry() returns.
+type errorfHelper interface {
+	Helper()
+	Errorf(format string, args ...any)
+}
+
+// recordingT is a throwaway errorfHelper that only remembers whether
+// Errorf was called. It exists so TestRegistryCoherenceCheckCatchesAMissingHandler
+// and TestDeferredCapabilitiesCheckCatchesAnAddedCommand can feed a
+// deliberately broken FAKE registry to the real check functions and
+// observe the failure, rather than asserting by inspection that the
+// check "should" fail - the dispatch's own warning about a cassure that
+// does not actually mordre.
+type recordingT struct{ failed bool }
+
+func (r *recordingT) Helper()               {}
+func (r *recordingT) Errorf(string, ...any) { r.failed = true }
+
+// specCommandNames is the design spec's own command table (spec lines
+// 46-53), verbatim in the document's order: the thirteen commands this
+// build of asq claims to implement, help included. TestRegistryCommandsHaveHandlers
+// uses it to prove NewRegistry() actually registers each one with a
+// handler, rather than merely checking that no Command in the real
+// registry happens to have a nil Execute - a registry that silently
+// dropped "qs top" entirely would still pass that weaker check.
+var specCommandNames = []string{
+	"help", "info", "qs status", "qs top", "qs query", "plan",
+	"obj table", "obj code", "size table", "idx list", "idx usage",
+	"idx missing", "stats list",
+}
+
+// assertEveryCommandHasAHandler is the actual coherence check, factored
+// out of its test so TestRegistryCoherenceCheckCatchesAMissingHandler can
+// run it a second time against a fake registry through a recordingT,
+// without ever touching the production NewRegistry().
+func assertEveryCommandHasAHandler(t errorfHelper, reg Registry, want []string) {
+	t.Helper()
+	byName := map[string]*Command{}
+	for i := range reg {
+		byName[reg[i].Name] = &reg[i]
+	}
+	for _, name := range want {
+		cmd, ok := byName[name]
+		if !ok {
+			t.Errorf("registry is missing command %q", name)
+			continue
+		}
+		if cmd.Execute == nil {
+			t.Errorf("command %q is registered with no handler", name)
+		}
+	}
+}
+
+func TestRegistryCommandsHaveHandlers(t *testing.T) {
+	assertEveryCommandHasAHandler(t, NewRegistry(), specCommandNames)
+}
+
+// TestRegistryCoherenceCheckCatchesAMissingHandler is the brief's own
+// required proof, in its own required form: drop one entry ("qs top")
+// from a copy of the real registry - never from NewRegistry() itself,
+// which this test never mutates - and confirm assertEveryCommandHasAHandler
+// actually reports it missing, rather than trusting that it would.
+func TestRegistryCoherenceCheckCatchesAMissingHandler(t *testing.T) {
+	real := NewRegistry()
+	var fake Registry
+	for _, c := range real {
+		if c.Name == "qs top" {
+			continue
+		}
+		fake = append(fake, c)
+	}
+
+	rec := &recordingT{}
+	assertEveryCommandHasAHandler(rec, fake, specCommandNames)
+	if !rec.failed {
+		t.Fatal("fake registry missing \"qs top\" did not fail the coherence check")
+	}
+
+	// The real registry, untouched, must still pass: this is the
+	// "restore and get green" half the brief asks for, proven by simply
+	// never having broken it in the first place.
+	rec = &recordingT{}
+	assertEveryCommandHasAHandler(rec, real, specCommandNames)
+	if rec.failed {
+		t.Fatal("the real, untouched registry failed the coherence check")
+	}
+}
+
+// specFlagsFor names, per command, the non-global flags the design spec
+// declares for it (spec's command table and the prose beneath it) - not
+// their bounds or defaults, which parse_test.go and the command's own
+// doc comments already exercise against real values, but their bare
+// presence in this build's registry: a Flags entry dropped by accident
+// would otherwise only be caught by help silently advertising less, with
+// no test ever failing.
+var specFlagsFor = map[string][]string{
+	"help":        {"json"},
+	"qs top":      {"object", "min-executions", "by", "aggregate", "hours", "since", "until", "top", "include-internal"},
+	"qs query":    {"hours", "since", "until"},
+	"plan":        {"plan-id", "summary"},
+	"idx missing": {"table", "top"},
+}
+
+// globalFlagNames are the nine flags the design spec says "every
+// connecting command" accepts (spec: "Connection and execution"),
+// reproduced here by name only, for TestRegistryFlagsMatchSpec's second
+// half.
+var globalFlagNames = []string{
+	"ctx", "db", "config", "format", "timeout", "preview", "truncate", "no-truncate", "out-dir",
+}
+
+func TestRegistryFlagsMatchSpec(t *testing.T) {
+	reg := NewRegistry()
+	byName := map[string]Command{}
+	for _, c := range reg {
+		byName[c.Name] = c
+	}
+
+	for cmdName, want := range specFlagsFor {
+		cmd, ok := byName[cmdName]
+		if !ok {
+			t.Fatalf("command %q not registered", cmdName)
+		}
+		have := map[string]bool{}
+		for _, f := range cmd.Flags {
+			have[f.Name] = true
+		}
+		for _, name := range want {
+			if !have[name] {
+				t.Errorf("%s: spec-required flag --%s is not registered", cmdName, name)
+			}
+		}
+	}
+
+	for _, c := range reg {
+		if c.Offline {
+			continue
+		}
+		have := map[string]bool{}
+		for _, f := range flagsFor(c) {
+			have[f.Name] = true
+		}
+		for _, name := range globalFlagNames {
+			if !have[name] {
+				t.Errorf("%s: global flag --%s is not accepted", c.Name, name)
+			}
+		}
+	}
+}
+
+// deferredCommandNames names the command-shaped capabilities spec line
+// 275 places out of scope for v0.1, each reduced to the registry.Name
+// string it would take if someone implemented it anyway: "arbitrary q"
+// becomes "q", "regression/temporal comparison" becomes "qs compare",
+// and so on. This list, not the registry, is what TestDeferredCapabilitiesAbsent
+// actually verifies: a deferred command added to NewRegistry() without
+// also being added here would pass silently, which is exactly the
+// failure mode the dispatch warns an invented or emptied list produces.
+// See TestDeferredCapabilitiesCheckCatchesAnAddedCommand for the
+// required proof that this list, fed to the real check, actually bites.
+var deferredCommandNames = []string{
+	"q",               // arbitrary q
+	"mcp",             // MCP
+	"broker",          // broker service
+	"qs compare",      // regression/temporal comparison
+	"qs waits",        // waits
+	"plan force",      // forced-plan reports
+	"plan diff",       // plan diff
+	"obj script",      // script generation
+	"idx scan",        // physical index scans
+	"idx consolidate", // index consolidation verdicts
+	"idx unused",      // unused-index verdicts
+	"stats histogram", // statistics histograms
+	"stats stale",     // statistics staleness verdicts
+	"server compare",  // cross-server comparisons
+	"snapshot",        // snapshot history
+	"maintenance",     // automatic maintenance
+}
+
+// deferredFlagNames are the spec-line-275 items that would surface as a
+// flag rather than a command: integrated/Entra/Kerberos authentication
+// has no command of its own to add, but would need a flag naming the
+// auth mode on every connecting command, or on the profile it reads -
+// the same globalFlags()/command-Flags surface deferredCommandNames
+// checks, just a different kind of entry in it.
+var deferredFlagNames = []string{"integrated", "entra", "kerberos", "auth-mode"}
+
+// deferredFormatValues is JSONL (spec line 275): a third value the
+// global --format enum must never advertise alongside tsv and json.
+var deferredFormatValues = []string{"jsonl"}
+
+// assertDeferredCapabilitiesAbsent is the actual absence check, factored
+// out exactly like assertEveryCommandHasAHandler above, for the same
+// reason: TestDeferredCapabilitiesCheckCatchesAnAddedCommand runs it
+// against a fake registry through a recordingT.
+func assertDeferredCapabilitiesAbsent(t errorfHelper, reg Registry) {
+	t.Helper()
+
+	for _, name := range deferredCommandNames {
+		for _, c := range reg {
+			if c.Name == name {
+				t.Errorf("deferred command %q (spec line 275) is registered", name)
+			}
+		}
+	}
+
+	checkFlag := func(where string, f Flag) {
+		for _, name := range deferredFlagNames {
+			if f.Name == name {
+				t.Errorf("%s declares deferred flag --%s (spec line 275)", where, name)
+			}
+		}
+		for _, v := range f.Enum {
+			for _, deferred := range deferredFormatValues {
+				if v == deferred {
+					t.Errorf("%s --%s enum advertises deferred value %q (spec line 275)", where, f.Name, v)
+				}
+			}
+		}
+	}
+
+	for _, f := range globalFlags() {
+		checkFlag("global flags", f)
+	}
+	for _, c := range reg {
+		for _, f := range c.Flags {
+			checkFlag(c.Name, f)
+		}
+	}
+}
+
+func TestDeferredCapabilitiesAbsent(t *testing.T) {
+	assertDeferredCapabilitiesAbsent(t, NewRegistry())
+}
+
+// TestDeferredCapabilitiesCheckCatchesAnAddedCommand is
+// TestRegistryCoherenceCheckCatchesAMissingHandler's counterpart for the
+// absence check: append a deferred command ("qs compare") to a copy of
+// the real registry and confirm assertDeferredCapabilitiesAbsent actually
+// reports it, rather than trusting that an absence check of this shape
+// would.
+func TestDeferredCapabilitiesCheckCatchesAnAddedCommand(t *testing.T) {
+	fake := append(Registry{}, NewRegistry()...)
+	fake = append(fake, Command{Name: "qs compare"})
+
+	rec := &recordingT{}
+	assertDeferredCapabilitiesAbsent(rec, fake)
+	if !rec.failed {
+		t.Fatal("adding a deferred command to the registry did not fail the absence check")
+	}
+}
+
+// TestDeferredCommandNamesListIsNotEmpty guards the other direction the
+// dispatch names explicitly: a name quietly dropped from
+// deferredCommandNames must narrow what TestDeferredCapabilitiesAbsent
+// can catch, never make it pass by testing nothing at all.
+func TestDeferredCommandNamesListIsNotEmpty(t *testing.T) {
+	if len(deferredCommandNames) == 0 {
+		t.Fatal("deferredCommandNames is empty: TestDeferredCapabilitiesAbsent would pass vacuously")
+	}
+}
+
 // TestMatchCommandPrefersLongestExactMatch makes the longest-match
 // preference observable: the real registry (help, info, qs status) has
 // no two commands sharing a leading word, so reversing matchCommand's
