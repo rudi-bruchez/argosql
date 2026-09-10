@@ -286,31 +286,24 @@ func emitQueryStoreNotices(dst model.Sink, table string, health Health, win Wind
 // opts.Window (design spec: "qs top": "Rank queries by total CPU,
 // duration, logical reads, or executions").
 //
-// Every Query Store command reads health first (design spec). A state
-// that cannot be collecting at all (OFF, READ_ONLY, ERROR) with no
-// readable runtime history anywhere in the database fails at code 4 -
+// The optional --object target is resolved BEFORE health is read,
+// because the design spec's line 172 governs it: "Permission checks
+// follow target resolution for commands taking object names." Measured
+// by the final branch review, with the health permissions denied:
+// "qs top --object dbo.Absent" used to return 4 on a permission the
+// caller cannot act on, where the same absent object returns 8 for a
+// principal that can read health. This is the project's own "8 before
+// 4" rule, and this command was the only place it applied to a target
+// carried by a FLAG rather than by a positional argument - which is why
+// no per-task review caught it.
+//
+// A state that cannot be collecting at all (OFF, READ_ONLY, ERROR) with
+// no readable runtime history anywhere in the database fails at code 4 -
 // never an empty ranking pretending the window was merely unmatched. A
 // window that genuinely matches no rows, by contrast, is an empty
 // ranking at code 0 (design spec: "no matching intervals within
 // retained history returns an empty ranking, not unavailable").
 func Top(ctx context.Context, s *sqlserver.Session, opts TopOptions, dst model.Sink) error {
-	health, err := ReadHealth(ctx, s)
-	if err != nil {
-		return err
-	}
-	if nonCollectingStates[health.Actual] && !health.HasHistory {
-		return &model.PublicError{
-			Code:    4,
-			Kind:    "query_store_unavailable",
-			Message: fmt.Sprintf("Query Store is %s with no readable runtime history", health.Actual),
-		}
-	}
-
-	orderColumn, err := orderColumnFor(opts.By, opts.Aggregate)
-	if err != nil {
-		return &model.PublicError{Code: 5, Kind: "execution", Message: err.Error()}
-	}
-
 	var objectID sql.NullInt64
 	var parentModule model.Cell // NULL unless --object resolved; never the raw --object argument.
 	if opts.Object != "" {
@@ -327,6 +320,23 @@ func Top(ctx context.Context, s *sqlserver.Session, opts TopOptions, dst model.S
 		}
 		objectID = sql.NullInt64{Int64: obj.ID, Valid: true}
 		parentModule = obj.Schema + "." + obj.Name
+	}
+
+	health, err := ReadHealth(ctx, s)
+	if err != nil {
+		return err
+	}
+	if nonCollectingStates[health.Actual] && !health.HasHistory {
+		return &model.PublicError{
+			Code:    4,
+			Kind:    "query_store_unavailable",
+			Message: fmt.Sprintf("Query Store is %s with no readable runtime history", health.Actual),
+		}
+	}
+
+	orderColumn, err := orderColumnFor(opts.By, opts.Aggregate)
+	if err != nil {
+		return &model.PublicError{Code: 5, Kind: "execution", Message: err.Error()}
 	}
 
 	oldestCell, newestCell, oldest, newest, err := readCoverage(ctx, s)

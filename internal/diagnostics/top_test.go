@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	mssql "github.com/microsoft/go-mssqldb"
 	"github.com/rudi-bruchez/argosql/internal/model"
 	"github.com/rudi-bruchez/argosql/internal/sqlserver"
 )
@@ -561,5 +562,33 @@ func TestTopRankingAndCoverageTableTypes(t *testing.T) {
 		if CoverageTable.Columns[i] != want {
 			t.Fatalf("CoverageTable.Columns[%d]: got %+v, want %+v", i, CoverageTable.Columns[i], want)
 		}
+	}
+}
+
+func TestTopResolvesBeforeHealth(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		resolve objQueryResponse
+		want    int
+	}{
+		{"absent", resolveNotFoundResponse(), 8},
+		{"wrong_type", resolveFoundResponse(1, "dbo", "Orders", "U"), 2},
+		{"module", resolveFoundResponse(2, "dbo", "PlainModule", "P"), 4},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			healthCalled := false
+			s := newFakeObjSession(t, &fakeObjConn{responses: []objQueryResponse{
+				tc.resolve,
+				{match: func(q string) bool { return strings.Contains(q, "database_query_store_options") },
+					handle: func([]driver.NamedValue) (driver.Rows, error) {
+						healthCalled = true
+						return nil, mssql.Error{Number: 297, Message: "denied"}
+					}},
+			}})
+			err := Top(context.Background(), s, TopOptions{Object: "dbo.Target", By: "cpu", Aggregate: "total"}, &captureSink{})
+			if model.ExitCode(err) != tc.want || healthCalled != (tc.want == 4) {
+				t.Fatalf("code=%d healthCalled=%t; want code=%d, health only for resolved module", model.ExitCode(err), healthCalled, tc.want)
+			}
+		})
 	}
 }
