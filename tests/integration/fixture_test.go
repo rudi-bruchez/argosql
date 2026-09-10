@@ -488,6 +488,24 @@ func buildChildConfigAndEnv(t *testing.T, profile config.Profile, pw principalPa
 // here.
 func (lab *Lab) Run(t *testing.T, principal string, args []string) (model.Result, int) {
 	t.Helper()
+	stdout, stderr, code := lab.RunRaw(t, principal, args)
+	var result model.Result
+	if err := json.Unmarshal([]byte(stdout), &result); err != nil {
+		t.Fatalf("Lab.Run: decoding stdout as model.Result: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+	return result, code
+}
+
+// RunRaw is Run's own subprocess invocation, exposing the child's raw
+// stdout/stderr rather than a decoded model.Result - for a test that
+// needs to search the literal bytes the binary emitted (design spec
+// line 261's secret-leakage clause: stderr, the JSON envelope, and
+// whatever else reached either stream), not just the fields Go's own
+// JSON decoder recognizes. Run above is this method plus the decode
+// step, never a second, independently-maintained copy of the same
+// subprocess/environment plumbing.
+func (lab *Lab) RunRaw(t *testing.T, principal string, args []string) (stdout, stderr string, code int) {
+	t.Helper()
 	bin := buildTestBinary(t)
 
 	pw := lab.ensurePrincipals(t)
@@ -501,26 +519,21 @@ func (lab *Lab) Run(t *testing.T, principal string, args []string) (model.Result
 	cmd := exec.CommandContext(ctx, bin, fullArgs...)
 	cmd.Env = env
 
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	var outBuf, errBuf bytes.Buffer
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
 	runErr := cmd.Run()
 
-	code := 0
+	code = 0
 	if runErr != nil {
 		var exitErr *exec.ExitError
 		if errors.As(runErr, &exitErr) {
 			code = exitErr.ExitCode()
 		} else {
-			t.Fatalf("Lab.Run: running %s: %v\nstderr:\n%s", bin, runErr, stderr.String())
+			t.Fatalf("Lab.RunRaw: running %s: %v\nstderr:\n%s", bin, runErr, errBuf.String())
 		}
 	}
-
-	var result model.Result
-	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
-		t.Fatalf("Lab.Run: decoding stdout as model.Result: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
-	}
-	return result, code
+	return outBuf.String(), errBuf.String(), code
 }
 
 // envProbeSource is a standalone Go program, built on demand by
