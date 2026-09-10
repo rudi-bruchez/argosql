@@ -75,6 +75,7 @@ func TestStoreCreateUniqueRunDir(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { c2.Close() })
 	if c1.Dir() == c2.Dir() {
 		t.Fatalf("two Collectors against the same base directory must not share a run directory: %q", c1.Dir())
 	}
