@@ -122,8 +122,30 @@ func TestUsageCellValuesAndOrder(t *testing.T) {
 	}
 
 	observed := tbl.rows[0]
+	if observed[1] != "PK_Orders" {
+		t.Fatalf("observed row name cell: got %#v, want %q", observed[1], "PK_Orders")
+	}
 	if observed[2] != int64(42) {
 		t.Fatalf("observed row seeks cell: got %#v, want 42", observed[2])
+	}
+	// Dispatch B5: scans/lookups/updates and last_seek/last_scan/
+	// last_lookup/last_update, for the OBSERVED row specifically, were
+	// never compared to a real value by any test - only the
+	// never_observed row's own NULLs were (further down).
+	if observed[3] != int64(7) || observed[4] != int64(0) || observed[5] != int64(3) {
+		t.Fatalf("observed row scans/lookups/updates cells: got %#v/%#v/%#v, want 7/0/3", observed[3], observed[4], observed[5])
+	}
+	if observed[6] != "2026-09-01T10:00:00" {
+		t.Fatalf("observed row last_seek cell: got %#v, want %q", observed[6], "2026-09-01T10:00:00")
+	}
+	if observed[7] != nil {
+		t.Fatalf("observed row last_scan cell: got %#v, want nil (fixture setup)", observed[7])
+	}
+	if observed[8] != nil {
+		t.Fatalf("observed row last_lookup cell: got %#v, want nil (fixture setup)", observed[8])
+	}
+	if observed[9] != "2026-09-02T11:00:00" {
+		t.Fatalf("observed row last_update cell: got %#v, want %q", observed[9], "2026-09-02T11:00:00")
 	}
 	if observed[10] != "observed" {
 		t.Fatalf("observed row observation_status cell: got %#v", observed[10])
@@ -195,6 +217,10 @@ func TestUsageObservationWindowNoticeWithStartTime(t *testing.T) {
 	if n == nil || !strings.Contains(n.Message, "2026-08-01T00:00:00") {
 		t.Fatalf("observation_window notice must name the server start time, got %#v", n)
 	}
+	// Dispatch B6: noticeWithKind only ever filters on Kind.
+	if n.Table != UsageTable.Name {
+		t.Fatalf("observation_window notice Table: got %q, want %q", n.Table, UsageTable.Name)
+	}
 }
 
 // TestUsageObservationWindowNoticeWithoutStartTime is design spec line
@@ -225,5 +251,43 @@ func TestUsageObservationWindowNoticeWithoutStartTime(t *testing.T) {
 	n := sink.noticeWithKind("observation_window")
 	if n == nil || !strings.Contains(n.Message, "unavailable") {
 		t.Fatalf("observation_window notice must say server start time is unavailable, got %#v", n)
+	}
+	if n.Table != UsageTable.Name {
+		t.Fatalf("observation_window notice Table: got %q, want %q", n.Table, UsageTable.Name)
+	}
+}
+
+// TestUsageServerStartTimeGenuineFailurePropagates is fix 1's B7: the
+// guard right above (errors.As(startErr, &pub) && pub.Kind ==
+// "permission") was tested only in the "permission absent" direction -
+// removing it ENTIRELY left every existing test in this file green,
+// because none of them ever handed the secondary server-start-time
+// read a failure that classifyQueryError does NOT classify as
+// "permission" (design spec line 228: "Missing required permissions
+// fail the command; optional fields use null plus a warning" - the
+// other half of that sentence is that anything else stays an error).
+// A driver failure unrelated to permission (measured to be mssql.Error
+// number 999, well outside classifyQueryError's own permissionSQLErrors
+// set {229, 230, 297, 300}) must fail the whole command, never turn
+// into a friendly "server start time unavailable (permission)" notice.
+func TestUsageServerStartTimeGenuineFailurePropagates(t *testing.T) {
+	conn := &fakeObjConn{responses: []objQueryResponse{
+		resolveFoundResponse(701, "dbo", "Orders", "U"),
+		usageRowsResponse(nil),
+		serverStartTimeResponse(nil, mssql.Error{Number: 999, Message: "disk io error"}),
+	}}
+	sess := newFakeObjSession(t, conn)
+	sink := &objCaptureSink{}
+
+	err := Usage(context.Background(), sess, "dbo.Orders", sink)
+	var pub *model.PublicError
+	if !errors.As(err, &pub) {
+		t.Fatalf("Usage: a non-permission failure on the server-start-time read must fail the command, got err=%v", err)
+	}
+	if pub.Kind != "execution" {
+		t.Fatalf("Usage: want kind execution for a genuine driver failure, got %q (silently reclassified as a permission limitation)", pub.Kind)
+	}
+	if len(sink.tables) != 0 {
+		t.Fatalf("Usage: a genuine failure must not still close the usage table as a degraded success, got %#v", sink.tables)
 	}
 }

@@ -87,8 +87,9 @@ func TestStatsAvailableRowComputesSamplePct(t *testing.T) {
 	conn := &fakeObjConn{responses: []objQueryResponse{
 		resolveFoundResponse(701, "dbo", "Orders", "U"),
 		statsRowsResponse([][]driver.Value{
-			{int64(1), "PK_Orders", "[Id]", int64(1000), int64(250), statsTime("2026-09-01T00:00:00"), int64(12), false, true, nil},
+			{int64(1), "PK_Orders", "[Id]", int64(1000), int64(250), statsTime("2026-09-01T00:00:00"), int64(12), false, true, nil, int64(1)},
 		}),
+		permProbeResponse(int64(1)), // VIEW DEFINITION allowed: filter not masked
 	}}
 	sess := newFakeObjSession(t, conn)
 	sink := &objCaptureSink{}
@@ -103,6 +104,13 @@ func TestStatsAvailableRowComputesSamplePct(t *testing.T) {
 	row := tbl.rows[0]
 	if row[5] != float64(25) {
 		t.Fatalf("sample_pct cell: got %#v, want 25 (250*100/1000)", row[5])
+	}
+	// Dispatch B5: columns (the STRING_AGG extension sql/stats.sql's
+	// own skeleton had to add) was never compared to a real value by
+	// any test in this task - only proven present by name, via
+	// TestStatisticsTableHasTwelveColumnsInOrder.
+	if row[2] != "[Id]" {
+		t.Fatalf("columns cell: got %#v, want %q", row[2], "[Id]")
 	}
 	if row[8] != false || row[9] != true {
 		t.Fatalf("auto_created/user_created cells: got %#v/%#v", row[8], row[9])
@@ -121,8 +129,9 @@ func TestStatsSamplePctNullWhenRowsZero(t *testing.T) {
 	conn := &fakeObjConn{responses: []objQueryResponse{
 		resolveFoundResponse(701, "dbo", "Empty", "U"),
 		statsRowsResponse([][]driver.Value{
-			{int64(1), "PK_Empty", "[Id]", int64(0), int64(0), nil, int64(0), true, false, nil},
+			{int64(1), "PK_Empty", "[Id]", int64(0), int64(0), nil, int64(0), true, false, nil, int64(1)},
 		}),
+		permProbeResponse(int64(1)), // VIEW DEFINITION allowed: filter not masked
 	}}
 	sess := newFakeObjSession(t, conn)
 	sink := &objCaptureSink{}
@@ -145,13 +154,17 @@ func TestStatsSamplePctNullWhenRowsZero(t *testing.T) {
 // available" - a NULL last_updated (no statistics blob yet) is
 // legitimate data, not a missing-properties signal. This is exactly
 // why Stats keys its available/unavailable decision on
-// modification_counter rather than on last_updated.
+// properties_stats_id (cells[10]) rather than on last_updated or
+// modification_counter - see TestStatsNullCounterAndLastUpdatedIsAvailable
+// for the sharper case where modification_counter is ALSO NULL on an
+// otherwise available row (fix 1's A1).
 func TestStatsLastUpdatedNullButAvailable(t *testing.T) {
 	conn := &fakeObjConn{responses: []objQueryResponse{
 		resolveFoundResponse(701, "dbo", "Filtered", "U"),
 		statsRowsResponse([][]driver.Value{
-			{int64(1), "FilteredStat", "[Status]", int64(0), int64(0), nil, int64(0), false, true, "([Status]='active')"},
+			{int64(1), "FilteredStat", "[Status]", int64(0), int64(0), nil, int64(0), false, true, "([Status]='active')", int64(1)},
 		}),
+		permProbeResponse(int64(1)), // VIEW DEFINITION allowed: filter not masked
 	}}
 	sess := newFakeObjSession(t, conn)
 	sink := &objCaptureSink{}
@@ -171,6 +184,87 @@ func TestStatsLastUpdatedNullButAvailable(t *testing.T) {
 	}
 }
 
+// TestStatsNullCounterAndLastUpdatedIsAvailable is fix 1's A1, the
+// exact scenario measured on a real engine (task-14-fix-1.md): a
+// statistic on an empty table, or one whose blob was never built, has
+// a properties row that genuinely EXISTS (properties_stats_id
+// non-NULL) with BOTH modification_counter and last_updated NULL. The
+// superseded code kept modification_counter IS NULL as its own signal
+// for "no properties row at all", which reached the SELECT probe here
+// and reported a confirmed permission_denied for a principal who
+// could read this statistic's properties just fine - a permission
+// state that changed when an administrator inserted a row and ran
+// UPDATE STATISTICS without touching any grant, which is not a
+// permission state at all. No SELECT probe is registered on this
+// fake conn at all: reaching it at all, for any reason, fails this
+// test outright ("no responder matched"), which is a stronger proof
+// than counting calls after the fact.
+func TestStatsNullCounterAndLastUpdatedIsAvailable(t *testing.T) {
+	conn := &fakeObjConn{responses: []objQueryResponse{
+		resolveFoundResponse(701, "dbo", "EmptyEver", "U"),
+		statsRowsResponse([][]driver.Value{
+			{int64(2), "St_OnEmptyTable", "[A]", nil, nil, nil, nil, false, true, nil, int64(2)},
+		}),
+		permProbeResponse(int64(1)), // VIEW DEFINITION allowed: answers columnsPropertiesComplete only - the row must never reach the SELECT probe at all
+	}}
+	sess := newFakeObjSession(t, conn)
+	sink := &objCaptureSink{}
+
+	if err := Stats(context.Background(), sess, "dbo.EmptyEver", sink); err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	row := sink.table("statistics").rows[0]
+	if row[11] != propertiesStatusAvailable {
+		t.Fatalf("a properties row that exists with NULL modification_counter AND NULL last_updated must be available, got %#v", row[11])
+	}
+	if row[5] != nil || row[6] != nil {
+		t.Fatalf("fixture setup error: sample_pct/last_updated must be NULL here, got %#v/%#v", row[5], row[6])
+	}
+}
+
+// TestStatsFilterMaskedWithoutViewDefinition is fix 1's A2: a
+// principal with SELECT on a statistic's columns but no VIEW
+// DEFINITION on the object reads filter=NULL for a statistic that
+// genuinely has one - measured on a real engine, the administrator
+// reads the real filter text while this principal reads NULL, with
+// every other property (rows, sample_pct, properties_status) fully
+// available. properties_complete must go false and name the cause,
+// never stay true because the per-row properties_status alone was
+// satisfied (design spec lines 57/101/228).
+func TestStatsFilterMaskedWithoutViewDefinition(t *testing.T) {
+	conn := &fakeObjConn{responses: []objQueryResponse{
+		resolveFoundResponse(701, "dbo", "Orders", "U"),
+		statsRowsResponse([][]driver.Value{
+			{int64(1), "FilteredStat", "[Status]", int64(1), int64(1), statsTime("2026-09-01T00:00:00"), int64(0), false, true, nil, int64(1)},
+		}),
+		permProbeResponse(int64(0)), // VIEW DEFINITION denied: the filter is masked, not absent
+	}}
+	sess := newFakeObjSession(t, conn)
+	sink := &objCaptureSink{}
+
+	if err := Stats(context.Background(), sess, "dbo.Orders", sink); err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	tbl := sink.table("statistics")
+	row := tbl.rows[0]
+	if row[11] != propertiesStatusAvailable {
+		t.Fatalf("a masked filter must not downgrade properties_status, got %#v", row[11])
+	}
+	if row[10] != nil {
+		t.Fatalf("fixture setup error: filter cell must read NULL (masked), got %#v", row[10])
+	}
+	if tbl.propertiesComplete {
+		t.Fatalf("a masked filter must make properties_complete=false on the table - a narrower SELECT must never have to widen into VIEW DEFINITION to look complete, got true")
+	}
+	n := sink.noticeWithKind("definition_properties_unavailable")
+	if n == nil {
+		t.Fatalf("a masked filter must emit a definition_properties_unavailable notice, the same Kind readIndexes already uses for the analogous case")
+	}
+	if n.Table != StatisticsTable.Name {
+		t.Fatalf("definition_properties_unavailable notice Table: got %q, want %q", n.Table, StatisticsTable.Name)
+	}
+}
+
 // TestStatsNeverDefaultsToPermissionDeniedWithoutProbe is dispatch
 // cassure 2's own target, and design spec line 69's own condition:
 // "only use permission_denied when a permission check establishes it.
@@ -182,7 +276,7 @@ func TestStatsNeverDefaultsToPermissionDeniedWithoutProbe(t *testing.T) {
 	conn := &fakeObjConn{responses: []objQueryResponse{
 		resolveFoundResponse(701, "dbo", "Orders", "U"),
 		statsRowsResponse([][]driver.Value{
-			{int64(1), "PK_Orders", "[Id]", nil, nil, nil, nil, true, false, nil},
+			{int64(1), "PK_Orders", "[Id]", nil, nil, nil, nil, true, false, nil, nil},
 		}),
 		permProbeResponse(int64(1)), // SELECT allowed: the NULL is not explained by a denial
 	}}
@@ -206,7 +300,7 @@ func TestStatsPermissionDeniedEstablishedByProbe(t *testing.T) {
 	conn := &fakeObjConn{responses: []objQueryResponse{
 		resolveFoundResponse(701, "dbo", "Orders", "U"),
 		statsRowsResponse([][]driver.Value{
-			{int64(1), "PK_Orders", "[Id]", nil, nil, nil, nil, true, false, nil},
+			{int64(1), "PK_Orders", "[Id]", nil, nil, nil, nil, true, false, nil, nil},
 		}),
 		permProbeResponse(int64(0)), // SELECT denied: now confirmed
 	}}
@@ -224,16 +318,22 @@ func TestStatsPermissionDeniedEstablishedByProbe(t *testing.T) {
 
 // TestStatsProbesSelectPermissionAtMostOnce proves
 // selectPermissionCache actually caches: two rows that both need an
-// answer must only cost one round trip, not one per row.
+// answer must only cost one SELECT probe, not one per row - and that
+// columnsPropertiesComplete's own VIEW DEFINITION probe (fix 1's A2,
+// now issued unconditionally once per command) is itself a SEPARATE,
+// single call, never conflated with the per-row SELECT probe. The two
+// probes share the exact same query text (hasPermsByNameQuery), so
+// this test tells them apart by their own @permission argument rather
+// than by a shared counter, the same way the real driver would.
 func TestStatsProbesSelectPermissionAtMostOnce(t *testing.T) {
-	calls := 0
+	calls := map[string]int{}
 	conn := &fakeObjConn{responses: []objQueryResponse{
 		resolveFoundResponse(701, "dbo", "Orders", "U"),
 		statsRowsResponse([][]driver.Value{
-			{int64(1), "StatA", "[A]", nil, nil, nil, nil, true, false, nil},
-			{int64(2), "StatB", "[B]", nil, nil, nil, nil, true, false, nil},
+			{int64(1), "StatA", "[A]", nil, nil, nil, nil, true, false, nil, nil},
+			{int64(2), "StatB", "[B]", nil, nil, nil, nil, true, false, nil, nil},
 		}),
-		countingPermProbeResponse(int64(0), &calls),
+		permProbeByPermissionResponse(int64(0), calls),
 	}}
 	sess := newFakeObjSession(t, conn)
 	sink := &objCaptureSink{}
@@ -241,8 +341,11 @@ func TestStatsProbesSelectPermissionAtMostOnce(t *testing.T) {
 	if err := Stats(context.Background(), sess, "dbo.Orders", sink); err != nil {
 		t.Fatalf("Stats: %v", err)
 	}
-	if calls != 1 {
-		t.Fatalf("selectPermissionCache: want exactly one probe for two unavailable rows, got %d", calls)
+	if calls["SELECT"] != 1 {
+		t.Fatalf("selectPermissionCache: want exactly one SELECT probe for two unavailable rows, got %d", calls["SELECT"])
+	}
+	if calls["VIEW DEFINITION"] != 1 {
+		t.Fatalf("columnsPropertiesComplete: want exactly one VIEW DEFINITION probe per command, got %d", calls["VIEW DEFINITION"])
 	}
 }
 
@@ -258,8 +361,8 @@ func TestStatsMixedAvailabilityLeavesTableIncomplete(t *testing.T) {
 	conn := &fakeObjConn{responses: []objQueryResponse{
 		resolveFoundResponse(701, "dbo", "Orders", "U"),
 		statsRowsResponse([][]driver.Value{
-			{int64(1), "Granted", "[Id]", int64(1000), int64(1000), statsTime("2026-09-01T00:00:00"), int64(3), false, true, nil},
-			{int64(2), "NotGranted", "[Email]", nil, nil, nil, nil, false, true, nil},
+			{int64(1), "Granted", "[Id]", int64(1000), int64(1000), statsTime("2026-09-01T00:00:00"), int64(3), false, true, nil, int64(1)},
+			{int64(2), "NotGranted", "[Email]", nil, nil, nil, nil, false, true, nil, nil},
 		}),
 		permProbeResponse(int64(0)),
 	}}
@@ -290,6 +393,10 @@ func TestStatsMixedAvailabilityLeavesTableIncomplete(t *testing.T) {
 	if !strings.Contains(n.Message, "1 of 2") {
 		t.Fatalf("properties_unavailable notice must name the count separately (1 of 2 statistics), got %q", n.Message)
 	}
+	// Dispatch B6: noticeWithKind only ever filters on Kind.
+	if n.Table != StatisticsTable.Name {
+		t.Fatalf("properties_unavailable notice Table: got %q, want %q", n.Table, StatisticsTable.Name)
+	}
 }
 
 // TestStatsPropertiesStatusNeverStale is dispatch cassure 1's own
@@ -303,8 +410,9 @@ func TestStatsPropertiesStatusNeverStale(t *testing.T) {
 	conn := &fakeObjConn{responses: []objQueryResponse{
 		resolveFoundResponse(701, "dbo", "Orders", "U"),
 		statsRowsResponse([][]driver.Value{
-			{int64(1), "PK_Orders", "[Id]", int64(1000), int64(10), statsTime("2020-01-01T00:00:00"), int64(999999999), false, true, nil},
+			{int64(1), "PK_Orders", "[Id]", int64(1000), int64(10), statsTime("2020-01-01T00:00:00"), int64(999999999), false, true, nil, int64(1)},
 		}),
+		permProbeResponse(int64(1)), // VIEW DEFINITION allowed: filter not masked
 	}}
 	sess := newFakeObjSession(t, conn)
 	sink := &objCaptureSink{}
@@ -334,6 +442,7 @@ func TestStatsPropertiesStatusNeverStale(t *testing.T) {
 func TestStatsEmptyResultIsCompleteSuccess(t *testing.T) {
 	conn := &fakeObjConn{responses: []objQueryResponse{
 		resolveFoundResponse(701, "dbo", "NoStats", "U"),
+		permProbeResponse(int64(1)), // VIEW DEFINITION allowed: the probe runs even on zero rows
 		statsRowsResponse(nil),
 	}}
 	sess := newFakeObjSession(t, conn)

@@ -41,13 +41,29 @@ var cliFakeDriverSeq atomic.Int64
 // to drive the "plan" command through Run/run for the first time in
 // this package. Every existing caller of newFakeSession leaves this at
 // its zero value ("") and never reaches the plan-query case at all.
-type cliFakeDriver struct{ planXML string }
-
-func (d cliFakeDriver) Open(name string) (driver.Conn, error) {
-	return &cliFakeConn{planXML: d.planXML}, nil
+//
+// missingArgs, when non-nil, is fix 1's B1 own addition: the args
+// sql/missing.sql's own query was actually called with, captured here
+// so a test can prove idxMissingCommand's Execute closure really built
+// MissingOptions from req.Table/req.Top and sent them all the way to
+// the query - the registry-to-diagnostics wiring that, before this
+// fix, no test in this package exercised at all (idx_missing_test.go
+// only drove Parse; TestIndexDMV, the one test against a real engine,
+// calls diagnostics.Missing directly with hand-built MissingOptions,
+// bypassing the registry entirely).
+type cliFakeDriver struct {
+	planXML     string
+	missingArgs *[]driver.NamedValue
 }
 
-type cliFakeConn struct{ planXML string }
+func (d cliFakeDriver) Open(name string) (driver.Conn, error) {
+	return &cliFakeConn{planXML: d.planXML, missingArgs: d.missingArgs}, nil
+}
+
+type cliFakeConn struct {
+	planXML     string
+	missingArgs *[]driver.NamedValue
+}
 
 func (c *cliFakeConn) Prepare(query string) (driver.Stmt, error) {
 	return nil, fmt.Errorf("cliFakeConn: Prepare not supported, use *Context")
@@ -101,6 +117,31 @@ func (c *cliFakeConn) QueryContext(ctx context.Context, query string, args []dri
 			types: []string{"XML"},
 			row:   []driver.Value{c.planXML},
 		}, nil
+	case strings.Contains(query, "sys.schemas AS s ON s.schema_id") && c.missingArgs != nil:
+		// sqlserver.Resolve's own resolveObjectQuery - only reached by
+		// "idx missing --table ..."; scanned directly with Row.Scan,
+		// never through output.ScanRow, so DatabaseTypeName is not
+		// consulted here.
+		return &cliFakeRows{
+			cols:  []string{"object_id", "schema_name", "object_name", "type"},
+			types: []string{"INT", "NVARCHAR", "NVARCHAR", "CHAR"},
+			row:   []driver.Value{int64(4242), "dbo", "Orders", "U "},
+		}, nil
+	case strings.Contains(query, "impact_score") && c.missingArgs != nil:
+		// sql/missing.sql: captures its own args (fix 1's B1) rather
+		// than merely answering the query, so a test can assert on the
+		// exact @top/@object_id values idxMissingCommand's Execute
+		// closure actually sent, all the way from the parsed Request.
+		*c.missingArgs = args
+		return &cliFakeRows{
+			cols: []string{"index_handle", "object_id", "schema_name", "object_name",
+				"equality_columns", "inequality_columns", "included_columns",
+				"user_seeks", "user_scans", "avg_total_user_cost", "avg_user_impact", "impact_score"},
+			types: []string{"INT", "INT", "NVARCHAR", "NVARCHAR", "NVARCHAR", "NVARCHAR", "NVARCHAR",
+				"BIGINT", "BIGINT", "FLOAT", "FLOAT", "FLOAT"},
+			row: []driver.Value{int64(501), int64(4242), "dbo", "Orders", "[CustomerId]", nil, nil,
+				int64(100), int64(50), float64(20), float64(80), float64(2400)},
+		}, nil
 	}
 	return nil, fmt.Errorf("cliFakeConn: unexpected query %q", query)
 }
@@ -143,8 +184,21 @@ func newFakeSession(t *testing.T, major int) *sqlserver.Session {
 // info/qs status.
 func newFakeSessionWithPlanXML(t *testing.T, major int, planXML string) *sqlserver.Session {
 	t.Helper()
+	return newFakeSessionRaw(t, cliFakeDriver{planXML: planXML}, major)
+}
+
+// newFakeSessionCapturingMissingArgs is newFakeSession, plus a
+// destination for the args "idx missing"'s own query was actually
+// called with (fix 1's B1) - see cliFakeDriver's own doc comment.
+func newFakeSessionCapturingMissingArgs(t *testing.T, major int, missingArgs *[]driver.NamedValue) *sqlserver.Session {
+	t.Helper()
+	return newFakeSessionRaw(t, cliFakeDriver{missingArgs: missingArgs}, major)
+}
+
+func newFakeSessionRaw(t *testing.T, d cliFakeDriver, major int) *sqlserver.Session {
+	t.Helper()
 	name := fmt.Sprintf("clifake-%d", cliFakeDriverSeq.Add(1))
-	sql.Register(name, cliFakeDriver{planXML: planXML})
+	sql.Register(name, d)
 	db, err := sql.Open(name, "")
 	if err != nil {
 		t.Fatalf("opening fake driver: %v", err)

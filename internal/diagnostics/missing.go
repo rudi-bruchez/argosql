@@ -4,8 +4,10 @@ import (
 	"context"
 	"database/sql"
 	_ "embed"
+	"fmt"
 
 	"github.com/rudi-bruchez/argosql/internal/model"
+	"github.com/rudi-bruchez/argosql/internal/output"
 	"github.com/rudi-bruchez/argosql/internal/sqlserver"
 )
 
@@ -73,6 +75,26 @@ func suggestionsLimitationsNotice() model.Notice {
 	}
 }
 
+// hiddenObjectNotice is fix 1's A3: sql/missing.sql's own LEFT JOINs to
+// sys.objects/sys.schemas preserve a suggestion row whose referenced
+// object's catalog metadata this principal cannot see (design spec:
+// "Use left joins for optional local names so metadata visibility
+// cannot silently remove DMV evidence") - but preserving the row is not
+// the same thing as declaring it complete. Measured on a real engine
+// under principal S with a DENY on one fixture object: the row
+// survives with schema_name/object_name both NULL, and the command
+// used to report properties_complete=true anyway, with no warning at
+// all. Same treatment as readIndexes's/Stats's own masked-property
+// notices: name the cause, mark the flag, never claim nothing is
+// missing.
+func hiddenObjectNotice() model.Notice {
+	return model.Notice{
+		Kind:    "definition_properties_unavailable",
+		Message: "one or more suggestions reference an object whose schema_name/object_name this principal cannot see; the DMV evidence is preserved, but its local identification is incomplete",
+		Table:   SuggestionsTable.Name,
+	}
+}
+
 // MissingOptions carries "idx missing"'s own flags: Table is the
 // optional --table <schema.name> filter (empty means every object),
 // Top is --top, already validated and defaulted by the registry
@@ -100,6 +122,13 @@ type MissingOptions struct {
 // spec: "Permission checks follow target resolution for commands
 // taking object names." @object_id is always this resolved obj.ID,
 // never opts.Table's own raw text.
+//
+// properties_complete reflects the LEFT JOIN's own local-name coverage
+// (fix 1's A3), not merely that the query ran: any row whose
+// schema_name or object_name came back NULL - the referenced object is
+// invisible to this principal, even though its DMV evidence was kept -
+// turns the whole table incomplete, with hiddenObjectNotice naming why,
+// rather than a flag claiming nothing is missing.
 func Missing(ctx context.Context, s *sqlserver.Session, opts MissingOptions, dst model.Sink) error {
 	var objectID sql.NullInt64
 	if opts.Table != "" {
@@ -113,12 +142,47 @@ func Missing(ctx context.Context, s *sqlserver.Session, opts MissingOptions, dst
 		objectID = sql.NullInt64{Int64: obj.ID, Valid: true}
 	}
 
+	rows, err := s.Conn.QueryContext(ctx, missingQuery, sql.Named("top", opts.Top), sql.Named("object_id", objectID))
+	if err != nil {
+		return classifyQueryError(err, "missing-index query failed")
+	}
+	defer rows.Close()
+
 	if err := dst.Begin(SuggestionsTable); err != nil {
 		return err
 	}
-	if err := queryRows(ctx, s.Conn, missingQuery, dst, sql.Named("top", opts.Top), sql.Named("object_id", objectID)); err != nil {
-		return err
+
+	hiddenObject := false
+	var types []*sql.ColumnType
+	for rows.Next() {
+		if types == nil {
+			types, err = rows.ColumnTypes()
+			if err != nil {
+				return &model.PublicError{Code: 5, Kind: "execution", Message: fmt.Sprintf("reading column types: %s", err.Error())}
+			}
+		}
+		cells, err := output.ScanRow(rows, types)
+		if err != nil {
+			return &model.PublicError{Code: 5, Kind: "execution", Message: fmt.Sprintf("scanning suggestion row: %s", err.Error())}
+		}
+		// cells, in sql/missing.sql's own column order: index_handle,
+		// object_id, schema_name, object_name, equality_columns,
+		// inequality_columns, included_columns, user_seeks, user_scans,
+		// avg_total_user_cost, avg_user_impact, impact_score.
+		if cells[2] == nil || cells[3] == nil {
+			hiddenObject = true
+		}
+		if err := dst.Row(cells); err != nil {
+			return err
+		}
 	}
+	if err := rows.Err(); err != nil {
+		return classifyQueryError(err, "reading suggestion rows")
+	}
+
 	dst.Notice(suggestionsLimitationsNotice())
-	return dst.End(true, true)
+	if hiddenObject {
+		dst.Notice(hiddenObjectNotice())
+	}
+	return dst.End(true, !hiddenObject)
 }

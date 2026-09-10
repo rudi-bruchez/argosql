@@ -165,6 +165,66 @@ func TestMissingCellValuesLeftJoinAndOrder(t *testing.T) {
 	if hidden[4] != "[Email]" {
 		t.Fatalf("hidden row's own DMV evidence must survive the LEFT JOIN, got equality_columns=%#v", hidden[4])
 	}
+	// The rest of this row's own DMV evidence, previously unchecked
+	// (dispatch B5): inequality_columns is genuinely absent here (nil
+	// in the fixture, unlike equality_columns above), included_columns,
+	// user_seeks/scans, and the two optimizer-estimate columns the
+	// impact_score formula itself consumes.
+	if hidden[5] != nil {
+		t.Fatalf("hidden row inequality_columns cell: got %#v, want nil", hidden[5])
+	}
+	if hidden[6] != nil {
+		t.Fatalf("hidden row included_columns cell: got %#v, want nil", hidden[6])
+	}
+	if hidden[1] != int64(702) {
+		t.Fatalf("hidden row object_id cell: got %#v, want 702", hidden[1])
+	}
+	if hidden[7] != int64(10) || hidden[8] != int64(5) {
+		t.Fatalf("hidden row user_seeks/user_scans cells: got %#v/%#v, want 10/5", hidden[7], hidden[8])
+	}
+	if hidden[9] != float64(5) || hidden[10] != float64(50) {
+		t.Fatalf("hidden row avg_total_user_cost/avg_user_impact cells: got %#v/%#v, want 5/50", hidden[9], hidden[10])
+	}
+
+	// Fix 1's A3: the LEFT JOIN preserves this row's DMV evidence, but
+	// its local identification is incomplete - the table's own
+	// properties_complete must say so, with a notice naming why,
+	// instead of silently declaring everything collected.
+	if tbl.propertiesComplete {
+		t.Fatalf("a row with NULL schema_name/object_name must make properties_complete=false on the table, got true")
+	}
+	if n := sink.noticeWithKind("definition_properties_unavailable"); n == nil {
+		t.Fatalf("a hidden object's own row must emit a definition_properties_unavailable notice")
+	} else if n.Table != SuggestionsTable.Name {
+		t.Fatalf("definition_properties_unavailable notice Table: got %q, want %q", n.Table, SuggestionsTable.Name)
+	}
+}
+
+// TestMissingAllObjectsVisibleIsComplete is
+// TestMissingCellValuesLeftJoinAndOrder's other half: when every
+// suggestion's referenced object IS visible, properties_complete stays
+// true and no hidden-object notice fires - the flag must track the
+// real LEFT JOIN outcome in both directions, not default to false.
+func TestMissingAllObjectsVisibleIsComplete(t *testing.T) {
+	conn := &fakeObjConn{responses: []objQueryResponse{
+		missingRowsResponse([][]driver.Value{
+			{int64(501), int64(701), "dbo", "Orders", "[CustomerId]", nil, "[OrderDate]",
+				int64(100), int64(50), float64(20), float64(80), float64(2400)},
+		}, nil),
+	}}
+	sess := newFakeObjSession(t, conn)
+	sink := &objCaptureSink{}
+
+	if err := Missing(context.Background(), sess, MissingOptions{Top: 10}, sink); err != nil {
+		t.Fatalf("Missing: %v", err)
+	}
+	tbl := sink.table("suggestions")
+	if !tbl.propertiesComplete {
+		t.Fatalf("every object visible: want properties_complete=true, got false")
+	}
+	if n := sink.noticeWithKind("definition_properties_unavailable"); n != nil {
+		t.Fatalf("no hidden object: want no definition_properties_unavailable notice, got %#v", n)
+	}
 }
 
 // TestMissingNeverEmitsCreateIndexScript is design spec line 56's own
@@ -197,6 +257,27 @@ func TestMissingNeverEmitsCreateIndexScript(t *testing.T) {
 	n := sink.noticeWithKind("ranking_score")
 	if n == nil || !strings.Contains(n.Message, "CREATE INDEX") {
 		t.Fatalf("Missing must disclose, in its own advisory notice, that it never emits a CREATE INDEX script, got %#v", n)
+	}
+	// Dispatch B6: noticeWithKind only ever filters on Kind; nothing
+	// checked Notice.Table before this fix, for any of the three
+	// notices this task emits.
+	if n.Table != SuggestionsTable.Name {
+		t.Fatalf("ranking_score notice Table: got %q, want %q", n.Table, SuggestionsTable.Name)
+	}
+
+	// Dispatch B5: equality_columns/inequality_columns/included_columns
+	// are exactly the columns "idx missing" is forbidden to compose
+	// into a script - their own escaped content, not merely its
+	// absence of "CREATE INDEX", deserves an assertion.
+	row := tbl.rows[0]
+	if row[4] != "[CustomerId]" {
+		t.Fatalf("equality_columns cell: got %#v, want %q", row[4], "[CustomerId]")
+	}
+	if row[5] != "[Status]" {
+		t.Fatalf("inequality_columns cell: got %#v, want %q", row[5], "[Status]")
+	}
+	if row[6] != "[OrderDate]" {
+		t.Fatalf("included_columns cell: got %#v, want %q", row[6], "[OrderDate]")
 	}
 }
 

@@ -46,13 +46,16 @@ const (
 // sample_pct is computed in Go (see Stats, below), not in SQL: it is
 // NULL whenever rows itself is NULL or zero (design spec: "NULL
 // sample_pct si rows=0"), never a division by zero pushed onto the
-// engine. filter can be masked by a denied VIEW DEFINITION exactly like
-// IndexesTable's own filter column (see that type's doc comment) - this
-// task does not add a second probe for it; "stats list" already
-// requires enough metadata visibility to resolve obj and read sys.stats
-// at all, and filter's own masking is no worse than every other
-// catalog-text column this project already tolerates without a second,
-// dedicated completeness flag.
+// engine. filter CAN be masked by a denied VIEW DEFINITION, exactly
+// like IndexesTable's own filter column (see that type's doc comment
+// and readIndexes's own notice) - fix 1's A2, measured: a principal
+// with SELECT on a statistic's columns but no VIEW DEFINITION on the
+// object reads filter=NULL for a statistic that genuinely has one.
+// Stats (below) probes columnsPropertiesComplete once, the same shared
+// helper table.go/indexes.go already use for their own definition-text
+// columns, and folds its result into properties_complete/the table's
+// own notice - the earlier version of this comment claimed resolving
+// obj was enough to guarantee filter is readable, which is false.
 var StatisticsTable = model.TableSpec{
 	Name: "statistics",
 	Columns: []model.Column{
@@ -80,8 +83,21 @@ var StatisticsTable = model.TableSpec{
 // grant still probes Denied at the object level - does not cause a
 // false permission_denied here: a statistic whose own columns DO carry
 // enough SELECT for sys.dm_db_stats_properties to succeed never reaches
-// this probe at all, because its modification_counter is already
-// non-NULL (see Stats, below).
+// this probe at all, because sql/stats.sql's own properties_stats_id
+// column is non-NULL whenever the function returned a row (see Stats,
+// below) - regardless of whether modification_counter/last_updated
+// happen to be NULL too (a statistic on an empty table, or one whose
+// blob was never built, legitimately has both NULL on an otherwise
+// perfectly readable row; fix 1's A1, measured on a real engine). The
+// EARLIER version of this comment instead named modification_counter
+// as that signal, which is the exact defect A1 fixes: it let a
+// column-granted statistic on an empty table reach this probe, whose
+// OBJECT-level answer (Denied, correctly, since no OBJECT-wide grant
+// exists) was then reported as a confirmed permission_denied - a
+// permission state that changed when an administrator inserted a row
+// and ran UPDATE STATISTICS without touching any grant, which is not a
+// permission state at all. Measure this comment again before trusting
+// it a third time.
 type selectPermissionCache struct {
 	probed bool
 	denied bool
@@ -116,6 +132,21 @@ func propertiesUnavailableNotice(total, deniedCount, unavailableCount int) model
 	}
 }
 
+// filterMaskedNotice is Stats's own analogue of readIndexes's notice
+// for the exact same masking (fix 1's A2): sys.stats.filter_definition
+// reads NULL for a principal with SELECT but no VIEW DEFINITION on
+// obj, indistinguishable at the cell level from a statistic that
+// genuinely carries no filter. Same Kind, same wording as
+// IndexesTable's own filter column (indexes.go) - reused rather than
+// invented a second time, per dispatch.
+func filterMaskedNotice(obj sqlserver.Object) model.Notice {
+	return model.Notice{
+		Kind:    "definition_properties_unavailable",
+		Message: fmt.Sprintf("%s.%s: VIEW DEFINITION denied; filter may be masked, not genuinely absent", obj.Schema, obj.Name),
+		Table:   StatisticsTable.Name,
+	}
+}
+
 // Stats runs "stats list <schema.name>": obj's statistics, their
 // ordered key columns, update/sampling facts when readable, and a
 // per-row properties_status that never guesses a cause it cannot
@@ -132,6 +163,14 @@ func propertiesUnavailableNotice(total, deniedCount, unavailableCount int) model
 // statistics is a successful empty result only after the target object
 // was resolved" - which Resolve above already guarantees before this
 // function ever opens sql/stats.sql.
+//
+// filter's own masking (fix 1's A2) is probed once, via the same
+// columnsPropertiesComplete table.go/indexes.go already share, and
+// folded into properties_complete alongside the per-row decision below
+// - a narrower SELECT grant never has to widen into VIEW DEFINITION to
+// succeed (design spec: partial success stays the contract, exit code
+// stays 0); it only has to be declared, not hidden behind a flag
+// claiming nothing is missing.
 func Stats(ctx context.Context, s *sqlserver.Session, name string, dst model.Sink) error {
 	obj, err := sqlserver.Resolve(ctx, s.Conn, name)
 	if err != nil {
@@ -139,6 +178,11 @@ func Stats(ctx context.Context, s *sqlserver.Session, name string, dst model.Sin
 	}
 	if !tableAllowedTypes[obj.Type] {
 		return wrongObjectTypeError(obj, "stats list", "tables")
+	}
+
+	filterComplete, err := columnsPropertiesComplete(ctx, s, obj)
+	if err != nil {
+		return err
 	}
 
 	rows, err := s.Conn.QueryContext(ctx, statsQuery, sql.Named("id", obj.ID))
@@ -168,17 +212,25 @@ func Stats(ctx context.Context, s *sqlserver.Session, name string, dst model.Sin
 		}
 		// cells, in sql/stats.sql's own column order: stats_id, name,
 		// columns, rows, rows_sampled, last_updated, modification_counter,
-		// auto_created, user_created, filter.
+		// auto_created, user_created, filter, properties_stats_id.
 		total++
-		modificationCounter := cells[6]
+		// The signal is properties_stats_id (cells[10]), never
+		// modification_counter (cells[6]): fix 1's A1. A properties row
+		// that genuinely exists can carry a NULL modification_counter
+		// and a NULL last_updated together (an empty table, or a blob
+		// never built) without that being a permission question at
+		// all - see sql/stats.sql's own doc comment and
+		// selectPermissionCache's.
+		propertiesRowExists := cells[10] != nil
 
 		var status string
 		var samplePct model.Cell
-		if modificationCounter != nil {
+		if propertiesRowExists {
 			status = propertiesStatusAvailable
 			if rowsVal, ok := cells[3].(int64); ok && rowsVal > 0 {
-				sampledVal, _ := cells[4].(int64) // rows>0 with properties available always carries a sampled count alongside it
-				samplePct = float64(sampledVal) * 100.0 / float64(rowsVal)
+				if sampledVal, ok2 := cells[4].(int64); ok2 {
+					samplePct = float64(sampledVal) * 100.0 / float64(rowsVal)
+				}
 			}
 		} else {
 			denied, perr := perm.deniedFor(ctx, s, obj)
@@ -206,9 +258,12 @@ func Stats(ctx context.Context, s *sqlserver.Session, name string, dst model.Sin
 		return classifyQueryError(err, "reading statistics rows")
 	}
 
-	complete := deniedCount == 0 && unavailableCount == 0
-	if !complete {
+	if !filterComplete {
+		dst.Notice(filterMaskedNotice(obj))
+	}
+	if deniedCount > 0 || unavailableCount > 0 {
 		dst.Notice(propertiesUnavailableNotice(total, deniedCount, unavailableCount))
 	}
+	complete := filterComplete && deniedCount == 0 && unavailableCount == 0
 	return dst.End(true, complete)
 }

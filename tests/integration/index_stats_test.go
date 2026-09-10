@@ -4,6 +4,7 @@ package integration
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -215,6 +216,22 @@ WHERE d.database_id = DB_ID(@p1)`, database).Scan(&n)
 				"dbo.MissingIndexHiddenFromS's own evidence must survive the LEFT JOIN even though "+
 				"its catalog row is denied to S, got %#v", suggestions.rows)
 		}
+
+		// Dispatch B2: impact_score descending is the core of this
+		// command's own ranking (design spec's declared row order for
+		// "suggestions"), never checked against a real engine before -
+		// a fake-driver unit test cannot catch a reversed ORDER BY,
+		// since it only ever echoes back rows already sorted by the
+		// test itself (same limitation this project's own report
+		// already named for usage.sql's ORDER BY, not reproduced here
+		// for missing.sql despite ranking being the entire point).
+		for i := 1; i < len(suggestions.rows); i++ {
+			prevScore, _ := suggestions.rows[i-1][11].(float64)
+			curScore, _ := suggestions.rows[i][11].(float64)
+			if prevScore < curScore {
+				t.Fatalf("suggestions rows are not impact_score descending: row %d has impact_score %v after %v", i, curScore, prevScore)
+			}
+		}
 	})
 
 	// Task 14's own second-database fixture: sys.dm_db_missing_index_details
@@ -264,6 +281,116 @@ END`); err != nil {
 		if len(sink.table("suggestions").rows) != wantCount {
 			t.Fatalf("idx missing as S leaked AppDB2's own evidence: got %d rows, want %d (AppDB's own count, unchanged)",
 				len(sink.table("suggestions").rows), wantCount)
+		}
+	})
+
+	// Fix 1's B4: missing.sql had this fixture; usage.sql carries the
+	// exact same database_id = DB_ID() filter (sys.dm_db_index_usage_stats
+	// is instance-wide too) and had none at all - a structural absence,
+	// not merely an untested assertion. sys.indexes itself is already
+	// database-scoped (a connection to UsageIsoA can never see AppDB's
+	// own sys.indexes rows), so the ONLY way this filter's absence can
+	// ever surface is a genuine (object_id, index_id) collision between
+	// two databases' own DMV rows - the same collision technique the
+	// conformity reviewer measured reproducibly on both engines for
+	// sys.dm_db_missing_index_details, by creating an identical table
+	// FIRST in each of two freshly created databases.
+	t.Run("idx usage does not leak a second database's evidence", func(t *testing.T) {
+		const collisionDDL = `
+IF OBJECT_ID(N'%[1]s.dbo.Collision') IS NULL
+BEGIN
+    CREATE TABLE %[1]s.dbo.Collision (
+        Id INT IDENTITY(1,1) PRIMARY KEY,
+        Category NVARCHAR(50) NOT NULL
+    );
+    CREATE NONCLUSTERED INDEX IX_Collision_Category ON %[1]s.dbo.Collision (Category);
+    INSERT INTO %[1]s.dbo.Collision (Category) VALUES (N'a');
+END`
+		for _, db := range []string{"UsageIsoA", "UsageIsoB"} {
+			db := db
+			if _, err := lab.Admin.ExecContext(ctx, fmt.Sprintf("IF DB_ID(N'%s') IS NULL CREATE DATABASE %s;", db, db)); err != nil {
+				t.Fatalf("creating %s: %v", db, err)
+			}
+			t.Cleanup(func() {
+				cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				lab.Admin.ExecContext(cleanupCtx, fmt.Sprintf("ALTER DATABASE %s SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE %s;", db, db))
+			})
+			if _, err := lab.Admin.ExecContext(ctx, fmt.Sprintf(collisionDDL, db)); err != nil {
+				t.Fatalf("building %s.dbo.Collision: %v", db, err)
+			}
+		}
+
+		var idA, idB int64
+		if err := lab.Admin.QueryRowContext(ctx, "SELECT OBJECT_ID(N'UsageIsoA.dbo.Collision')").Scan(&idA); err != nil {
+			t.Fatalf("reading UsageIsoA.dbo.Collision's own object_id: %v", err)
+		}
+		if err := lab.Admin.QueryRowContext(ctx, "SELECT OBJECT_ID(N'UsageIsoB.dbo.Collision')").Scan(&idB); err != nil {
+			t.Fatalf("reading UsageIsoB.dbo.Collision's own object_id: %v", err)
+		}
+		if idA != idB {
+			t.Fatalf("UsageIsoA/UsageIsoB's own dbo.Collision did not collide on object_id (got %d vs %d) - "+
+				"this fixture cannot demonstrate the leak it was built to catch on this engine/run; "+
+				"the database_id filter itself is unverified by this subtest", idA, idB)
+		}
+
+		// Touch A's index once, B's index seven times - two distinct,
+		// attributable seek counts, so a leaked row is distinguishable
+		// from A's own by value, not merely by its existence.
+		var dummy int
+		if err := lab.Admin.QueryRowContext(ctx, "SELECT Id FROM UsageIsoA.dbo.Collision WHERE Category = N'a'").Scan(&dummy); err != nil {
+			t.Fatalf("touching UsageIsoA's own index: %v", err)
+		}
+		for i := 0; i < 7; i++ {
+			if err := lab.Admin.QueryRowContext(ctx, "SELECT Id FROM UsageIsoB.dbo.Collision WHERE Category = N'a'").Scan(&dummy); err != nil {
+				t.Fatalf("touching UsageIsoB's own index (iteration %d): %v", i, err)
+			}
+		}
+
+		// sysadmin, not S: S has no user mapped in either fresh
+		// database, and the instance-level permission this command
+		// needs is orthogonal to what this subtest is actually
+		// checking (the database_id filter, not the permission
+		// matrix, which the earlier subtests above already cover).
+		profileA := lab.Profile
+		profileA.Database = "UsageIsoA"
+		sessA, err := sqlserver.Open(ctx, profileA)
+		if err != nil {
+			t.Fatalf("open UsageIsoA: %v", err)
+		}
+		defer sessA.Close()
+
+		sink := &captureSink{}
+		if err := diagnostics.Usage(ctx, sessA, "dbo.Collision", sink); err != nil {
+			t.Fatalf("idx usage dbo.Collision on UsageIsoA: %v", err)
+		}
+		tbl := sink.table("usage")
+		// Two rows, not one: dbo.Collision's own clustered primary key
+		// gets its own usage row too (a lookup, from this query's own
+		// SELECT Id), alongside IX_Collision_Category. A THIRD row
+		// here - or a duplicate of either - would be the fan-out a
+		// missing database_id filter produces when two databases'
+		// DMV rows both match the same (object_id, index_id) pair.
+		if tbl == nil || len(tbl.rows) != 2 {
+			t.Fatalf("idx usage on UsageIsoA's own dbo.Collision: want exactly two index rows (no fan-out from a colliding database), got %#v", tbl)
+		}
+		// Not indexIDOf: sys.indexes is itself database-scoped, and
+		// lab.Admin's own connection context is AppDB - a three-part
+		// OBJECT_ID('UsageIsoA...') joined against AppDB's own
+		// sys.indexes would resolve nothing. sessA is already
+		// connected to UsageIsoA, so a plain, unqualified lookup on
+		// it reads the right catalog.
+		var categoryID int64
+		if err := sessA.Conn.QueryRowContext(ctx,
+			"SELECT index_id FROM sys.indexes WHERE object_id = OBJECT_ID(N'dbo.Collision') AND name = N'IX_Collision_Category'",
+		).Scan(&categoryID); err != nil {
+			t.Fatalf("resolving IX_Collision_Category's own index_id on UsageIsoA: %v", err)
+		}
+		row := usageIndexRow(t, tbl, categoryID)
+		seeks, _ := row[2].(int64)
+		if seeks != 1 {
+			t.Fatalf("idx usage on UsageIsoA's own IX_Collision_Category: want seeks=1 (this database's own activity only), got %d - "+
+				"UsageIsoB's own 7 seeks leaked in if this is 7 or 8", seeks)
 		}
 	})
 }
@@ -332,15 +459,19 @@ func TestStatsMixedAvailabilityPrincipal(t *testing.T) {
 
 	var grantedStatus, withheldStatus string
 	var grantedRowsCell model.Cell
+	var grantedColumns, withheldColumns string
 	for _, row := range tbl.rows {
 		name, _ := row[1].(string)
 		status, _ := row[11].(string)
+		columns, _ := row[2].(string)
 		switch name {
 		case "St_Granted":
 			grantedStatus = status
 			grantedRowsCell = row[3]
+			grantedColumns = columns
 		case "St_Withheld":
 			withheldStatus = status
+			withheldColumns = columns
 		}
 	}
 	if grantedStatus != "available" {
@@ -349,11 +480,34 @@ func TestStatsMixedAvailabilityPrincipal(t *testing.T) {
 	if grantedRowsCell == nil {
 		t.Fatalf("St_Granted: properties_status=available but rows cell is NULL - the granted row must carry its own real values")
 	}
+	// Dispatch B5/B8: columns compared against a real, independently
+	// known value (the fixture's own column names), not merely proven
+	// non-empty - dbo.StatsFixture declares St_Granted ON (Granted) and
+	// St_Withheld ON (Withheld).
+	if grantedColumns != "[Granted]" {
+		t.Fatalf("St_Granted columns cell: got %q, want %q", grantedColumns, "[Granted]")
+	}
+	if withheldColumns != "[Withheld]" {
+		t.Fatalf("St_Withheld columns cell: got %q, want %q", withheldColumns, "[Withheld]")
+	}
 	if withheldStatus != "permission_denied" && withheldStatus != "unavailable" {
 		t.Fatalf("St_Withheld (no SELECT granted): want permission_denied or unavailable, got %q", withheldStatus)
 	}
 	if withheldStatus == grantedStatus {
 		t.Fatalf("St_Granted and St_Withheld must not share the same properties_status - that is exactly the "+
 			"decide-once-for-the-command defect this fixture exists to catch, got %q for both", grantedStatus)
+	}
+
+	// Dispatch B3: statistics' own stats_id ascending order (the same
+	// design spec declaration B2 covers for suggestions) was never
+	// checked against a real engine either - this table's own three
+	// rows (the PK's own auto-created statistic plus St_Granted/
+	// St_Withheld) are enough to prove it.
+	for i := 1; i < len(tbl.rows); i++ {
+		prevID, _ := tbl.rows[i-1][0].(int64)
+		curID, _ := tbl.rows[i][0].(int64)
+		if prevID > curID {
+			t.Fatalf("statistics rows are not stats_id ascending: row %d has stats_id %d after %d", i, curID, prevID)
+		}
 	}
 }

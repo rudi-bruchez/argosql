@@ -387,13 +387,20 @@ DECLARE @MissingIndexFixtureHit INT;
 SELECT @MissingIndexFixtureHit = Id FROM dbo.MissingIndexFixture WHERE Status = N'rare';
 GO
 
--- dbo.MissingIndexHiddenFromS: an identical fixture. principals.sql's
--- own per-object DENY VIEW DEFINITION to asq_test_s makes this
--- object's catalog row invisible to S while leaving its instance-level
--- DMV evidence visible (design spec: "Use left joins for optional
--- local names so metadata visibility cannot silently remove DMV
--- evidence") - the real-engine counterpart to
--- TestMissingCellValuesLeftJoinAndOrder's own fake-driver proof.
+-- dbo.MissingIndexHiddenFromS: the same shape, but a deliberately
+-- LESS selective predicate (50 matching rows rather than 1) - fix 1's
+-- B2, measured: an identical fixture to MissingIndexFixture produced
+-- an IDENTICAL impact_score, which made a reversed ORDER BY
+-- undetectable (both rows tied, so no row order is distinguishable
+-- from any other). The differing selectivity gives this suggestion a
+-- measurably different avg_user_impact/impact_score, so a test can
+-- actually tell DESC apart from ASC. principals.sql's own per-object
+-- DENY VIEW DEFINITION to asq_test_s makes this object's catalog row
+-- invisible to S while leaving its instance-level DMV evidence visible
+-- (design spec: "Use left joins for optional local names so metadata
+-- visibility cannot silently remove DMV evidence") - the real-engine
+-- counterpart to TestMissingCellValuesLeftJoinAndOrder's own
+-- fake-driver proof.
 IF OBJECT_ID(N'dbo.MissingIndexHiddenFromS') IS NULL
 BEGIN
     CREATE TABLE dbo.MissingIndexHiddenFromS (
@@ -402,7 +409,7 @@ BEGIN
         Payload NVARCHAR(400) NOT NULL
     );
     INSERT INTO dbo.MissingIndexHiddenFromS (Status, Payload)
-    SELECT CASE WHEN rn = 1 THEN N'rare' ELSE N'common' END, REPLICATE(N'x', 400)
+    SELECT CASE WHEN rn <= 50 THEN N'rare' ELSE N'common' END, REPLICATE(N'x', 400)
     FROM (
         SELECT TOP (200000) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS rn
         FROM sys.all_objects AS a CROSS JOIN sys.all_objects AS b

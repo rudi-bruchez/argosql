@@ -383,32 +383,50 @@ func missingRowsResponse(rows [][]driver.Value, captured *[]driver.NamedValue) o
 // given: stats_id, name, columns, rows, rows_sampled, last_updated,
 // modification_counter, auto_created, user_created, filter - the ten
 // columns sql/stats.sql itself projects, before Go computes sample_pct
-// and properties_status (stats.go).
+// and properties_status (stats.go). The eleventh column,
+// properties_stats_id, is fix 1's A1 signal: each row's own eleventh
+// driver.Value decides whether sys.dm_db_stats_properties returned a
+// real row (non-nil, however NULL its other columns may be) or none at
+// all (nil) - never modification_counter, which can legitimately be
+// NULL on an existing properties row too.
 func statsRowsResponse(rows [][]driver.Value) objQueryResponse {
 	return objQueryResponse{
 		match: func(q string) bool { return strings.Contains(q, "dm_db_stats_properties") },
 		handle: func(args []driver.NamedValue) (driver.Rows, error) {
 			return &fakeStaticRows{
 				cols: []string{"stats_id", "name", "columns", "rows", "rows_sampled",
-					"last_updated", "modification_counter", "auto_created", "user_created", "filter"},
+					"last_updated", "modification_counter", "auto_created", "user_created", "filter", "properties_stats_id"},
 				types: []string{"INT", "NVARCHAR", "NVARCHAR", "BIGINT", "BIGINT",
-					"DATETIME2", "BIGINT", "BIT", "BIT", "NVARCHAR"},
+					"DATETIME2", "BIGINT", "BIT", "BIT", "NVARCHAR", "INT"},
 				data: rows,
 			}, nil
 		},
 	}
 }
 
-// countingPermProbeResponse is permProbeResponse, plus a counter the
-// caller can inspect afterward - stats.go's own selectPermissionCache
-// claims it probes OBJECT/SELECT at most once per Stats call no matter
-// how many rows need an answer; this is what lets a test hold it to
-// that claim instead of trusting the doc comment.
-func countingPermProbeResponse(result driver.Value, calls *int) objQueryResponse {
+// permProbeByPermissionResponse is permProbeResponse, plus a per-
+// permission call counter a test can inspect afterward. Every probe
+// this package issues (sqlserver.Probe's OBJECT-class SELECT and VIEW
+// DEFINITION alike) shares the exact same query text
+// (hasPermsByNameQuery), so a fake conn that only matched on that text
+// could not tell a stats.go row's own SELECT probe apart from
+// columnsPropertiesComplete's VIEW DEFINITION probe (fix 1's A2 made
+// the latter unconditional, once per Stats call) - this responder
+// reads the @permission argument itself to answer each one
+// identically to result, while counting them separately by name, so a
+// test can hold each probe to its own "at most once" claim instead of
+// conflating the two.
+func permProbeByPermissionResponse(result driver.Value, calls map[string]int) objQueryResponse {
 	return objQueryResponse{
 		match: func(q string) bool { return strings.Contains(q, "HAS_PERMS_BY_NAME") },
 		handle: func(args []driver.NamedValue) (driver.Rows, error) {
-			*calls++
+			for _, a := range args {
+				if a.Name == "permission" {
+					if p, ok := a.Value.(string); ok {
+						calls[p]++
+					}
+				}
+			}
 			return &fakeStaticRows{
 				cols:  []string{""},
 				types: []string{"INT"},
