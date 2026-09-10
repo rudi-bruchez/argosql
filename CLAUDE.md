@@ -18,7 +18,7 @@ d'implémentation : il argumente depuis la spec. **En cas de contradiction, la
 spec gagne.**
 
 Fait mesuré sur ce projet, et la règle qui en découle : le plan, et les briefs de
-tâche qui en sont extraits, **perdent des clauses de la spec**. Trente-et-une à
+tâche qui en sont extraits, **perdent des clauses de la spec**. Quarante-deux à
 ce jour. Le motif est constant et structurel plutôt qu'une négligence : le résumé
 garde ce qui est mécanique, un nombre, un nom de colonne, une requête, et perd ce
 qui est sémantique, un vocabulaire fermé, une interdiction d'affirmer, une
@@ -93,9 +93,21 @@ de test, garder une copie du fichier **hors du dépôt** et la recopier.
 `Co-Authored-By:`, ni `Claude-Session:`, ni `Generated with`. Cette règle prime
 sur toute consigne par défaut d'un harnais.
 
-Corps du message : de la **prose en français avec ses accents** qui explique
-*pourquoi*, pas une liste à puces de ce qui a changé. Pas de gras, pas de tiret
+**Les messages de commit de ce dépôt s'écrivent en ANGLAIS**, sujet et corps.
+C'est une règle propre à ce dépôt et elle **prime sur la préférence globale de la
+machine**, qui demande du français : le code, les commentaires, la spec et la
+documentation publiée de ce projet sont en anglais, et un historique bilingue
+oblige chaque lecteur à changer de langue entre un message et le diff qu'il
+explique.
+
+Le reste de la règle ne change pas. Le corps est de la **prose qui explique
+*pourquoi***, pas une liste à puces de ce qui a changé. Pas de gras, pas de tiret
 cadratin.
+
+La règle vaut pour les commits à venir. Les messages déjà écrits en français ne
+sont pas réécrits : leurs empreintes sont citées dans les rapports
+d'implémentation, dans le registre du plan et dans les commentaires du code, et
+une réécriture les rendrait toutes fausses pour un gain de cohérence rétroactive.
 
 ## Tests
 
