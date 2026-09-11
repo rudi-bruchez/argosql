@@ -1,0 +1,111 @@
+name: release
+
+# Pushing a v* tag publishes a GitHub release. There is deliberately no
+# workflow_dispatch: the binary stamps its version from the tag (see the
+# build step), so rebuilding an old tag with a newer workflow would ship a
+# binary whose version names a commit it was not built by. A fix to this
+# file ships as a new tag.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  # The spec's release acceptance is "all required checks pass", and a tag
+  # push does not trigger ci.yml on its own: without this job a tag on a
+  # red commit would still publish.
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      # Only the two clients the spec names (line 25). Adding a target here
+      # ships a platform docs/testing.md does not claim.
+      #
+      # No -ldflags version: since Go 1.24, go build stamps the main module
+      # version from the tag at HEAD, and `go version -m` reads it back.
+      # Measured on a shallow clone of the tag with -trimpath. The check
+      # below fails the release if that ever stops holding, rather than
+      # shipping a binary that calls itself v0.0.0 or +dirty.
+      - name: build
+        run: |
+          set -eu
+          version="${TAG#v}"
+          mkdir -p dist
+          # Outside the checkout: an untracked staging directory inside it
+          # makes every build after the first one stamp itself +dirty.
+          # Measured: the windows binary failed the check below that way.
+          staging="$(mktemp -d)"
+          for target in linux/amd64 windows/amd64; do
+            os="${target%/*}"; arch="${target#*/}"
+            name="asq_${version}_${os}_${arch}"
+            stage="$staging/$name"
+            exe=asq; [ "$os" = windows ] && exe=asq.exe
+            mkdir -p "$stage"
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath -o "$stage/$exe" ./cmd/asq
+
+            stamped="$(go version -m "$stage/$exe" | awk '$1 == "mod" { print $3 }')"
+            if [ "$stamped" != "$TAG" ]; then
+              echo "binary stamped $stamped, expected $TAG"; exit 1
+            fi
+
+            # README.md links to these by relative path, so they keep their
+            # place in the tree. login.sql is the provisioning script the
+            # README sends the reader to.
+            cp --parents LICENSE README.md login.sql docs/usage.md docs/permissions.md \
+              docs/testing.md skills/argosql/SKILL.md "$stage/"
+
+            if [ "$os" = windows ]; then
+              (cd "$staging" && zip -qr "$OLDPWD/dist/$name.zip" "$name")
+            else
+              tar czf "dist/$name.tar.gz" -C "$staging" "$name"
+            fi
+          done
+          (cd dist && sha256sum * > "asq_${version}_checksums.txt")
+          ls -l dist
+
+      # Runs the binary out of the archive a user downloads, not the tree it
+      # was built from. The Windows zip is not executed here: ci.yml's
+      # windows job runs the same smoke checks on a native build of the same
+      # commit.
+      - name: verify the linux archive
+        run: |
+          set -eu
+          version="${TAG#v}"
+          tmp="$(mktemp -d)"
+          tar xzf "dist/asq_${version}_linux_amd64.tar.gz" -C "$tmp"
+          asq="$tmp/asq_${version}_linux_amd64/asq"
+          "$asq" help > /dev/null
+          set +e
+          "$asq" --ctx x --config "$tmp/does-not-exist.yaml" info > /dev/null 2>&1
+          code=$?
+          set -e
+          if [ "$code" -ne 2 ]; then
+            echo "expected exit code 2 for a missing config file, got $code"; exit 1
+          fi
+
+      # Re-running a job whose upload failed halfway must not die on "release
+      # already exists".
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --title "$TAG" --generate-notes --verify-tag
+          fi

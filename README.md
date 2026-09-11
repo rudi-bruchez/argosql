@@ -45,7 +45,13 @@ cross-server comparison, snapshot history, and automatic maintenance.
 
 ## Installing
 
-Build from source with the pinned Go toolchain named in `go.mod`:
+Each release on the GitHub releases page carries `asq_<version>_linux_amd64.tar.gz`,
+`asq_<version>_windows_amd64.zip` and a SHA-256 checksum file. An archive holds the
+binary, this README, the documentation it links to and `login.sql`. A release is only
+published after the full CI suite, integration tests on 2019 and 2022 included, passes on
+the tagged commit. `go version -m asq` prints the version the binary was built from.
+
+Or build from source with the pinned Go toolchain named in `go.mod`:
 
 ```sh
 make build

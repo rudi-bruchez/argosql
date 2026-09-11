@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # release.yml calls this whole workflow before it publishes anything.
+  workflow_call:
 
 # actions/checkout and actions/setup-go are pinned to a commit SHA, each
 # verified against the upstream repository's own tags at the time this
