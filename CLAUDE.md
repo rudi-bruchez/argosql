@@ -1,311 +1,304 @@
 # argosql
 
-CLI Go nommé `asq` qui diagnostique SQL Server via le Query Store et les vues de
-catalogue, et rend ses résultats dans un format dimensionné pour qu'un agent IA
-les consomme sans noyer son contexte.
+A Go CLI named `asq` that diagnoses SQL Server through the Query Store and the
+catalog views, and renders its results in a format sized for an AI agent to
+consume without flooding its context.
 
-Ce fichier porte les règles propres à **ce dépôt**, et rien qui soit propre à une
-machine. Les conteneurs présents sur un poste donné, les fichiers personnels qui
-traînent dans une copie de travail et les outils installés localement vont dans
-`CLAUDE.local.md`, qui est gitignoré. **Si ce que vous allez écrire cesse d'être
-vrai sur une autre machine, ce n'est pas ici que ça va.**
+This file carries the rules specific to **this repository**, and nothing
+specific to a machine. The containers present on a given workstation, the
+personal files lying around in a working copy, and locally installed tools go in
+`CLAUDE.local.md`, which is gitignored. **If what you are about to write stops
+being true on another machine, it does not belong here.**
 
-## L'autorité, et pourquoi elle compte ici plus qu'ailleurs
+## The authority, and why it matters more here than elsewhere
 
-`docs/superpowers/specs/2026-09-08-argosql-mvp-design.md` est la **spec**, et
-c'est l'autorité. `docs/superpowers/plans/2026-09-08-argosql-mvp.md` est le plan
-d'implémentation : il argumente depuis la spec. **En cas de contradiction, la
-spec gagne.**
+`docs/superpowers/specs/2026-09-08-argosql-mvp-design.md` is the **spec**, and
+it is the authority. `docs/superpowers/plans/2026-09-08-argosql-mvp.md` is the
+implementation plan: it argues from the spec. **When they contradict each other,
+the spec wins.**
 
-Fait mesuré sur ce projet, et la règle qui en découle : le plan, et les briefs de
-tâche qui en sont extraits, **perdent des clauses de la spec**. Quarante-deux à
-ce jour. Le motif est constant et structurel plutôt qu'une négligence : le résumé
-garde ce qui est mécanique, un nombre, un nom de colonne, une requête, et perd ce
-qui est sémantique, un vocabulaire fermé, une interdiction d'affirmer, une
-obligation de déclarer.
+A fact measured on this project, and the rule that follows from it: the plan,
+and the task briefs extracted from it, **lose clauses of the spec**. Forty-two to
+date. The pattern is consistent and structural rather than careless: the summary
+keeps what is mechanical, a number, a column name, a query, and loses what is
+semantic, a closed vocabulary, a prohibition on asserting, an obligation to
+disclose.
 
-Conséquence pratique : **avant d'implémenter une tâche, lire les lignes de la
-spec qui la concernent et les comparer à son brief.** Ne pas se fier au brief
-seul. Et quand on cite une clause dans un prompt, la citer **verbatim avec son
-numéro de ligne**, parce que la reformuler refait exactement la perte.
+Practical consequence: **before implementing a task, read the spec lines that
+concern it and compare them with its brief.** Do not rely on the brief alone.
+And when quoting a clause in a prompt, quote it **verbatim with its line
+number**, because rephrasing it repeats exactly that loss.
 
-## Conteneurs
+## Containers
 
-Les tests d'intégration créent leurs propres conteneurs, étiquetés
-`io.argosql.test=<id du run>`, et les retirent eux-mêmes. **Ne nettoyer que ce
-que le run a créé**, en filtrant sur cette étiquette et jamais en balayant par
-nom : une machine de développement porte d'autres conteneurs SQL Server, dont
-certains en service.
+Integration tests create their own containers, labeled
+`io.argosql.test=<run id>`, and remove them themselves. **Only clean up what the
+run created**, filtering on that label and never sweeping by name: a development
+machine carries other SQL Server containers, some of them in use.
 
-La liste de ceux qui préexistent sur un poste donné, et celui qu'il ne faut
-surtout pas toucher, sont dans `CLAUDE.local.md`. **La lire avant de lancer quoi
-que ce soit qui parle à Podman.**
+The list of those that pre-exist on a given workstation, and the one that must
+not be touched under any circumstances, are in `CLAUDE.local.md`. **Read it
+before running anything that talks to Podman.**
 
 ## Secrets
 
-Le mot de passe ne sort jamais de `config.Profile` : son champ porte
-`json:"-"`, et `String()` comme `GoString()` le masquent. Ne jamais l'écrire
-dans un message d'erreur, un log, ou une sortie de diagnostic.
+The password never leaves `config.Profile`: its field carries `json:"-"`, and
+both `String()` and `GoString()` mask it. Never write it into an error message,
+a log, or diagnostic output.
 
-Un profil YAML nomme une **variable d'environnement** par `password_env` ; un
-champ de mot de passe en clair est refusé avec le code 2. Un profil temporaire
-écrit par un test suit la même règle : il nomme la variable, et c'est
-l'environnement du processus enfant qui la porte.
+A YAML profile names an **environment variable** through `password_env`; a
+plaintext password field is rejected with code 2. A temporary profile written by
+a test follows the same rule: it names the variable, and the child process's
+environment carries it.
 
-Un test qui lance le binaire pour un principal donné n'injecte que le secret de
-**ce** principal dans l'environnement enfant, jamais les trois.
+A test that launches the binary for a given principal injects only **that**
+principal's secret into the child environment, never all three.
 
-`login.sql`, à la racine, contient un mot de passe de remplacement à éditer sur
-place. **Ne jamais le commiter après y avoir tapé un vrai mot de passe.**
+`login.sql`, at the root, contains a placeholder password to edit in place.
+**Never commit it after typing a real password into it.**
 
-Et la règle qui vaut pour les tests autant que pour le code : **un message d'échec ne
-déverse pas un environnement ni une entrée `CLÉ=VALEUR`.** Mesuré ici sur le test qui
-garantit justement l'isolation des secrets : son message imprimait l'environnement complet
-reçu par le processus enfant, avec un vrai jeton de session de la machine dedans. Un échec
-de test est exactement le texte qu'on colle dans un journal de CI ou un rapport de bug.
-Nommer la variable suffit à localiser la fuite ; `envKey` et `envKeys`, dans
-`tests/integration/fixture_test.go`, sont là pour ça.
+And the rule that applies to tests as much as to code: **a failure message does not
+dump an environment or a `KEY=VALUE` entry.** Measured here on the very test that
+guarantees secret isolation: its message printed the complete environment received by
+the child process, with a real session token from the machine in it. A test failure is
+exactly the text that gets pasted into a CI log or a bug report. Naming the variable is
+enough to locate the leak; `envKey` and `envKeys`, in
+`tests/integration/fixture_test.go`, exist for that.
 
-## Fichiers qui ne nous appartiennent pas
+## Files that do not belong to us
 
-Une copie de travail peut contenir des documents personnels du propriétaire du
-dépôt, suivis par git et parfois modifiés. `CLAUDE.local.md` les nomme. **Ne pas
-y toucher, ne pas les commiter, ne pas les écraser.** C'est la raison pour
-laquelle la règle du `git add` nommé, plus bas, n'est pas négociable.
+A working copy may contain personal documents of the repository owner, tracked
+by git and sometimes modified. `CLAUDE.local.md` names them. **Do not touch
+them, do not commit them, do not overwrite them.** That is why the rule of the
+named `git add`, below, is not negotiable.
 
-Un implémenteur de tâche ne touche ni à `docs/` ni à l'espace de travail du plan,
-à l'exception de son propre fichier de rapport.
+A task implementer touches neither `docs/` nor the plan's workspace, except for
+their own report file.
 
 ## Git
 
-**`git add` fichier par fichier, nommé.** Jamais `git add .` ni `-A` : ce dépôt
-porte les documents de l'utilisateur, et un `-A` lancé pendant qu'un relecteur
-externe travaille a déjà balayé six fichiers parasites dans l'historique d'un
-autre projet.
+**`git add` file by file, by name.** Never `git add .` or `-A`: this repository
+carries the user's documents, and a `-A` run while an external reviewer was
+working has already swept six stray files into another project's history.
 
-**Jamais `git checkout` ni `git restore` sur un fichier portant du travail non
-commité.** Mesuré deux fois ici : un implémenteur a perdu son implémentation
-comme ça, et un relecteur externe a produit un faux rapport « le dépôt ne
-compile pas » en gravité maximale pour la même raison. Pour défaire une cassure
-de test, garder une copie du fichier **hors du dépôt** et la recopier.
+**Never `git checkout` or `git restore` on a file carrying uncommitted work.**
+Measured twice here: an implementer lost their implementation that way, and an
+external reviewer produced a false "the repository does not compile" report at
+maximum severity for the same reason. To undo a test breakage, keep a copy of
+the file **outside the repository** and copy it back.
 
-**Aucun pied de page d'attribution** dans un message de commit : ni
-`Co-Authored-By:`, ni `Claude-Session:`, ni `Generated with`. Cette règle prime
-sur toute consigne par défaut d'un harnais.
+**No attribution footer** in a commit message: no `Co-Authored-By:`, no
+`Claude-Session:`, no `Generated with`. This rule takes precedence over any
+default instruction from a harness.
 
-**Les messages de commit de ce dépôt s'écrivent en ANGLAIS**, sujet et corps.
-C'est une règle propre à ce dépôt et elle **prime sur la préférence globale de la
-machine**, qui demande du français : le code, les commentaires, la spec et la
-documentation publiée de ce projet sont en anglais, et un historique bilingue
-oblige chaque lecteur à changer de langue entre un message et le diff qu'il
-explique.
+**Commit messages in this repository are written in ENGLISH**, subject and body.
+This rule is specific to this repository and **takes precedence over the
+machine's global preference**, which asks for French: the code, the comments,
+the spec and the published documentation of this project are in English, and a
+bilingual history forces every reader to switch languages between a message and
+the diff it explains.
 
-Le reste de la règle ne change pas. Le corps est de la **prose qui explique
-*pourquoi***, pas une liste à puces de ce qui a changé. Pas de gras, pas de tiret
-cadratin.
+The rest of the rule does not change. The body is **prose that explains *why***,
+not a bulleted list of what changed. No bold, no em dash.
 
-La règle vaut pour les commits à venir. Les messages déjà écrits en français ne
-sont pas réécrits : leurs empreintes sont citées dans les rapports
-d'implémentation, dans le registre du plan et dans les commentaires du code, et
-une réécriture les rendrait toutes fausses pour un gain de cohérence rétroactive.
+The rule applies to future commits. Messages already written in French are not
+rewritten: their hashes are cited in the implementation reports, in the plan's
+ledger and in code comments, and a rewrite would make all of them wrong for a
+gain in retroactive consistency.
 
 ## Tests
 
-Unitaires : `go test ./...`. Les tests d'un fichier portent son nom avec
-`_test.go` ; les helpers partagés peuvent avoir un nom propre comme
-`testdriver_test.go`.
+Unit: `go test ./...`. A file's tests carry its name with `_test.go`; shared
+helpers may have their own name, such as `testdriver_test.go`.
 
-Intégration : paquet `tests/integration`, **tag de build `integration`**, et la
-variable `ASQ_TEST_IMAGE` est obligatoire. Sans le tag, aucun paquet n'est
-trouvé ; avec le tag et sans l'image, la suite **échoue explicitement** au lieu
-de se sauter en silence.
+Integration: package `tests/integration`, **build tag `integration`**, and the
+`ASQ_TEST_IMAGE` variable is mandatory. Without the tag, no package is found;
+with the tag and without the image, the suite **fails explicitly** instead of
+skipping silently.
 
 ```sh
 ASQ_TEST_IMAGE=mcr.microsoft.com/mssql/server:2022-latest \
   go test ./tests/integration -tags=integration -count=1 -timeout=25m -v
 ```
 
-Deux pièges mesurés, qui ont chacun produit un vert mensonger sur ce projet :
+Two measured traps, each of which produced a lying green on this project:
 
-**L'état du shell ne survit pas d'un appel d'outil à l'autre.** Le setup et les
-tests vont dans un **seul** appel, sans quoi les tests d'intégration tournent
-sans base et affichent `ok`.
+**Shell state does not survive from one tool call to the next.** Setup and tests
+go in a **single** call; otherwise the integration tests run without a database
+and print `ok`.
 
-**Compter les `=== RUN`.** Un filtre `-run` qui ne correspond à rien affiche
-`ok` et sort avec le code 0, sans le moindre avertissement. Vérifier le compte
-avec `go test -run <filtre> -v | grep -c '^=== RUN'` avant de conclure au vert.
+**Count the `=== RUN` lines.** A `-run` filter that matches nothing prints `ok`
+and exits with code 0, without the slightest warning. Check the count with
+`go test -run <filter> -v | grep -c '^=== RUN'` before concluding it is green.
 
-Les deux versions du moteur comptent : 2019 et 2022 sont supportées, 2025 ne
-reçoit qu'un test de fumée. Si elles divergent sur un comportement, c'est un
-fait à rapporter, pas une assertion à écrire pour une seule version.
+Both engine versions matter: 2019 and 2022 are supported, 2025 only gets a smoke
+test. If they diverge on a behavior, that is a fact to report, not an assertion
+to write for a single version.
 
-## Codes de sortie, et un ordre qui porte
+## Exit codes, and an order that matters
 
-0 succès, 2 arguments/config, 3 connexion/auth/TLS, 4 permission ou fonction
-indisponible, 5 exécution/timeout, 6 fichier/sérialisation, 7 plafond de
-collecte, 8 absent ou invisible, 130 interruption.
+0 success, 2 arguments/config, 3 connection/auth/TLS, 4 permission or feature
+unavailable, 5 execution/timeout, 6 file/serialization, 7 collection cap, 8
+absent or invisible, 130 interruption.
 
-**L'ordre « 8 avant 4 » est porteur, pas cosmétique** : un identifiant
-introuvable rend 8 même quand une permission manque par ailleurs, parce que la
-vérification des droits suit la résolution de la cible.
+**The "8 before 4" order is load-bearing, not cosmetic**: an identifier that
+cannot be found returns 8 even when a permission is also missing, because the
+permission check follows target resolution.
 
-Corollaire mesuré et corrigé une fois : **une erreur d'argument doit se déclarer
-avant l'ouverture de la connexion.** Une validation laissée derrière la
-connexion rend 3 sur un serveur injoignable, et un agent qui lit les codes
-retente le réseau au lieu de corriger son argument.
+A corollary, measured and fixed once: **an argument error must be reported
+before the connection is opened.** A validation left behind the connection
+returns 3 on an unreachable server, and an agent reading the codes retries the
+network instead of fixing its argument.
 
-## Faits mesurés sur le moteur, à ne pas redécouvrir
+## Facts measured on the engine, not to be rediscovered
 
-Chacun a coûté une mesure sur un conteneur réel ou une lecture de la
-documentation Microsoft.
+Each one cost a measurement on a real container or a reading of the Microsoft
+documentation.
 
-`HAS_PERMS_BY_NAME` est **à deux états et non trois** : il rend 0 pour un objet
-invisible comme pour un objet inexistant, et NULL seulement pour une sonde
-malformée. Sa forme instance est obligatoirement
-`HAS_PERMS_BY_NAME(NULL, NULL, @permission)`.
+`HAS_PERMS_BY_NAME` is **two-state, not three-state**: it returns 0 for an
+invisible object as well as for a nonexistent one, and NULL only for a malformed
+probe. Its instance form must be `HAS_PERMS_BY_NAME(NULL, NULL, @permission)`.
 
-`VIEW DATABASE STATE` **implique** `VIEW DATABASE PERFORMANCE STATE`, mais pas
-`VIEW SECURITY DEFINITION`. C'est pourquoi le palier Q de `login.sql` suffit à
-`qs top` sur 2022, où la documentation exige la seconde permission.
+`VIEW DATABASE STATE` **implies** `VIEW DATABASE PERFORMANCE STATE`, but not
+`VIEW SECURITY DEFINITION`. That is why tier Q of `login.sql` is enough for
+`qs top` on 2022, where the documentation requires the second permission.
 
-Un `GRANT SELECT` limité à une colonne sonde à 0 au niveau OBJECT : seule la
-forme COLUMN à cinq arguments rend 1.
+A `GRANT SELECT` limited to a column probes at 0 at the OBJECT level: only the
+five-argument COLUMN form returns 1.
 
-**Refuser n'est pas ne pas autoriser**, et la distinction décide du code de sortie.
-`DENY VIEW DEFINITION` sur un objet retire la visibilité de ses métadonnées : l'objet
-disparaît de `sys.objects` pour ce principal, donc la commande rend 8 et jamais un état
-de définition. `GRANT EXECUTE` SEUL, sans aucun `DENY`, laisse au contraire l'objet
-visible dans `sys.objects`, rend `sys.sql_modules.definition` NULL, et la sonde sur
-`VIEW DEFINITION` répond refusé. C'est ce second montage, et lui seul, qui construit
-l'état `permission_denied` de la spec : un module visible dont la définition est
-illisible. Mesuré après s'être trompé une fois dans l'autre sens.
+**Denying is not the same as not granting**, and the distinction decides the exit code.
+`DENY VIEW DEFINITION` on an object removes the visibility of its metadata: the object
+disappears from `sys.objects` for that principal, so the command returns 8 and never a
+definition state. `GRANT EXECUTE` ALONE, without any `DENY`, on the contrary leaves the
+object visible in `sys.objects`, makes `sys.sql_modules.definition` NULL, and the probe on
+`VIEW DEFINITION` answers denied. It is this second setup, and it alone, that builds the
+spec's `permission_denied` state: a visible module whose definition is unreadable.
+Measured after getting it wrong once in the other direction.
 
-`OBJECTPROPERTYEX(..., 'IsEncrypted')` rend **NULL sur un objet qui n'est pas un
-module**, une table par exemple. Ce NULL n'est donc pas une absence de réponse mais une
-erreur de catégorie, et elle se rapporte comme telle : `definition_unavailable` au code
-4, avec un message qui nomme le type réel. Avant correction, ce cas rendait un code 5,
-c'est-à-dire une erreur d'exécution du moteur pour ce qui est une faute d'argument.
+`OBJECTPROPERTYEX(..., 'IsEncrypted')` returns **NULL on an object that is not a
+module**, a table for example. That NULL is therefore not a missing answer but a
+category error, and it is reported as such: `definition_unavailable` with code 4, with a
+message that names the actual type. Before the fix, this case returned code 5, that is,
+an engine execution error for what is an argument fault.
 
-`sys.query_store_runtime_stats.execution_type` ne prend que **trois** valeurs,
-0 régulier, 3 abandon client, 4 abandon par exception. Filtrer sur `= 0` et
-exclure 3 et 4 sont donc équivalents.
+`sys.query_store_runtime_stats.execution_type` takes only **three** values, 0
+regular, 3 client abort, 4 exception abort. Filtering on `= 0` and excluding 3
+and 4 are therefore equivalent.
 
-Sur l'intervalle courant, **plusieurs lignes coexistent** pour un même couple
-plan/intervalle, l'une vidée sur disque et les autres en mémoire. Il faut
-agréger pour obtenir l'état réel ; ce n'est pas un cas artificiel.
+On the current interval, **several rows coexist** for the same plan/interval
+pair, one flushed to disk and the others in memory. They must be aggregated to
+get the real state; this is not an artificial case.
 
-`sys.query_store_runtime_stats_interval.start_time` et `end_time` sont des
-**`datetimeoffset`**, pas des `datetime2`. Une étiquette de type fausse dans un
-`TableSpec` n'est pas cosmétique : le rendu JSON s'y fie.
+`sys.query_store_runtime_stats_interval.start_time` and `end_time` are
+**`datetimeoffset`**, not `datetime2`. A wrong type label in a `TableSpec` is
+not cosmetic: the JSON rendering relies on it.
 
-Le moteur **ne crée une ligne d'intervalle qu'au moment où des statistiques y
-sont persistées**. Une base neuve avec Query Store allumé a les deux tables
-vides. L'état « intervalle sans statistiques » n'apparaît qu'après
-`sp_query_store_remove_query`, et pour une fraction de seconde.
+The engine **only creates an interval row when statistics are persisted in
+it**. A new database with Query Store turned on has both tables empty. The
+"interval without statistics" state only appears after
+`sp_query_store_remove_query`, and for a fraction of a second.
 
-`CREATE LOGIN` **ne peut pas** paramétrer son mot de passe : c'est une erreur de
-syntaxe, pas un échec silencieux. Et une erreur dans `sp_executesql`
-n'interrompt pas le lot, donc un `PRINT` de succès placé après peut annoncer une
-réussite qui n'a pas eu lieu.
+`CREATE LOGIN` **cannot** parameterize its password: it is a syntax error, not a
+silent failure. And an error inside `sp_executesql` does not interrupt the
+batch, so a success `PRINT` placed after it can announce a success that did not
+happen.
 
-Dans un script sqlcmd, un `:setvar` **prime** sur le `-v` de la ligne de
-commande.
+In a sqlcmd script, a `:setvar` **takes precedence** over the command line's
+`-v`.
 
-Query Store **OFF laisse toutes les vues de catalogue lisibles**. L'état OFF est donc un
-cas réel à tester, pas une hypothèse : la commande doit réussir avec un avertissement
-quand l'historique reste lisible, et ne tomber au code 4 que si l'historique est
-inaccessible lui aussi.
+Query Store **OFF leaves all catalog views readable**. The OFF state is therefore a real
+case to test, not a hypothesis: the command must succeed with a warning when the history
+remains readable, and only fall to code 4 if the history is inaccessible too.
 
-`ALTER DATABASE ... SET QUERY_STORE CLEAR ALL` puis
-`SET QUERY_STORE = ON (OPERATION_MODE = READ_ONLY)` construit l'état **READ_ONLY sans
-historique**, celui que la spec distingue de READ_ONLY avec historique.
+`ALTER DATABASE ... SET QUERY_STORE CLEAR ALL` followed by
+`SET QUERY_STORE = ON (OPERATION_MODE = READ_ONLY)` builds the **READ_ONLY without
+history** state, the one the spec distinguishes from READ_ONLY with history.
 
-`DATA_FLUSH_INTERVAL_SECONDS = 5` est **refusé** par le moteur, message 153. C'est la
-première chose qu'on essaie pour accélérer une fixture, et elle ne marche pas.
+`DATA_FLUSH_INTERVAL_SECONDS = 5` is **rejected** by the engine, message 153. It is the
+first thing one tries to speed up a fixture, and it does not work.
 
-Ajouter un **index couvrant après un basculement d'intervalle** donne de façon fiable deux
-plans d'un même `query_id` dans deux intervalles distincts. C'est le cas non dégénéré dont
-dépend toute preuve de jointure vers les plans.
+Adding a **covering index after an interval rollover** reliably yields two plans of the
+same `query_id` in two distinct intervals. It is the non-degenerate case that any proof
+of a join to the plans depends on.
 
-Rien ne garantit que `sp_query_store_flush_db` rende une requête **visible par les vues de
-catalogue**, et le mode d'échec n'est pas une latence : c'est une **capture qui n'a pas eu
-lieu**. Mesuré ici, une exécution unique d'un lot n'est pas fiablement capturée là où cinq
-exécutions du même lot le sont, et sous pression mémoire la tâche d'arrière-plan qui capture
-est affamée. Conséquence : une attente plus longue ne produit jamais une ligne que le moteur
-n'a pas capturée. Un sondage doit **réémettre sa charge** et reforcer un vidage
-périodiquement, pas seulement dormir. Et son délai doit rester **strictement inférieur au
-budget de contexte** de la requête qui sonde, sans quoi c'est la requête qui meurt d'abord et
-l'échec arrive sous forme d'erreur de pilote opaque.
+Nothing guarantees that `sp_query_store_flush_db` makes a query **visible to the catalog
+views**, and the failure mode is not latency: it is **a capture that did not happen**.
+Measured here, a single execution of a batch is not reliably captured where five
+executions of the same batch are, and under memory pressure the background task that
+captures is starved. Consequence: waiting longer never produces a row that the engine did
+not capture. A poll must **reissue its workload** and force a flush again periodically, not
+just sleep. And its timeout must remain **strictly below the context budget** of the query
+doing the polling, otherwise the query dies first and the failure arrives as an opaque
+driver error.
 
-Les avertissements d'un plan d'exécution s'expriment **en attributs de l'élément `Warnings`
-autant qu'en enfants**. `<Warnings NoJoinPredicate="1"/>` est une forme que le moteur produit
-réellement, mesurée sur 2019 et 2022 avec une jointure croisée : un lecteur qui ne parcourt que
-les enfants perd l'avertissement en silence. Et **les avertissements réels ont eux-mêmes des
-enfants imbriqués**, `ColumnsWithNoStatistics` portant des `ColumnReference`, donc un lecteur
-sans garde de profondeur transforme chaque descendant en avertissement et sature son plafond.
-Les deux faits tirent en sens inverse et se tiennent ensemble.
+The warnings of an execution plan are expressed **as attributes of the `Warnings` element
+as well as children**. `<Warnings NoJoinPredicate="1"/>` is a form the engine actually
+produces, measured on 2019 and 2022 with a cross join: a reader that only walks the
+children silently loses the warning. And **real warnings themselves have nested
+children**, `ColumnsWithNoStatistics` carrying `ColumnReference` elements, so a reader
+without a depth guard turns every descendant into a warning and saturates its cap. The two
+facts pull in opposite directions and hold together.
 
-Ce programme tient **une seule connexion épinglée**, et la conséquence est un piège de
-conception, pas une subtilité de pilote : une requête émise pendant qu'un jeu de lignes est
-encore ouvert sur cette connexion **bloque indéfiniment**. Ce n'est pas une erreur qu'on
-classe, c'est un blocage, donc la commande ne rend jamais rien et aucun code de sortie
-n'arrive. Mesuré ici sur `stats list`, dont la sonde de permission était paresseuse et ne
-se déclenchait, par coïncidence de fixture, que sur la DERNIÈRE ligne du jeu : ajouter une
-statistique supplémentaire après celle dont les propriétés sont refusées a suffi à faire
-apparaître le blocage. Toute sonde ou lecture secondaire se fait donc **avant** l'ouverture
-du jeu de lignes, ou **après** sa consommation complète, jamais pendant. Les quatre boucles
-`rows.Next()` du paquet `internal/diagnostics` ont été auditées une fois dans ce sens, et
-l'audit se refait quand on en ajoute une.
+This program holds **a single pinned connection**, and the consequence is a design trap,
+not a driver subtlety: a query issued while a row set is still open on that connection
+**blocks indefinitely**. It is not an error that gets classified, it is a hang, so the
+command never returns anything and no exit code arrives. Measured here on `stats list`,
+whose permission probe was lazy and only fired, by fixture coincidence, on the LAST row of
+the set: adding one more statistic after the one whose properties are denied was enough
+to make the hang appear. Any secondary probe or read is therefore done **before** the row
+set is opened, or **after** it has been fully consumed, never during. The four
+`rows.Next()` loops of the `internal/diagnostics` package were audited once in that
+direction, and the audit is redone whenever one is added.
 
-**Révoquer une permission qui est IMPLIQUÉE par une autre ne la retire pas**, et une mesure
-construite sur un `REVOKE` ne prouve donc rien. Microsoft documente
-`sys.dm_db_partition_stats` comme exigeant, sur 2022 et au-delà, « VIEW DATABASE PERFORMANCE
-STATE and VIEW SECURITY DEFINITION permissions on the database », et la table des
-implications de `GRANT` donne `VIEW SECURITY DEFINITION` comme impliquée par
-`VIEW DEFINITION`. Un principal qui détient `VIEW DEFINITION`, ce que ces commandes exigent
-de toute façon, conserve donc la permission après révocation de son octroi explicite, et la
-commande continue de réussir. Seul un `DENY` sépare les deux hypothèses. C'est la même
-distinction que celle déjà consignée plus haut pour `VIEW DEFINITION`, et elle s'est
-présentée une seconde fois sous la forme d'un correctif qui retirait une permission du texte
-d'aide sur la foi d'une mesure qui ne pouvait pas la départager. Formulation qui reste juste
-dans les deux cas : nommer la permission en disant par quoi elle est impliquée, ce qui
-n'exige aucun octroi supplémentaire de l'opérateur.
+**Revoking a permission that is IMPLIED by another one does not remove it**, and a
+measurement built on a `REVOKE` therefore proves nothing. Microsoft documents
+`sys.dm_db_partition_stats` as requiring, on 2022 and later, "VIEW DATABASE PERFORMANCE
+STATE and VIEW SECURITY DEFINITION permissions on the database", and the `GRANT`
+implication table gives `VIEW SECURITY DEFINITION` as implied by `VIEW DEFINITION`. A
+principal that holds `VIEW DEFINITION`, which these commands require anyway, therefore
+keeps the permission after its explicit grant is revoked, and the command keeps
+succeeding. Only a `DENY` separates the two hypotheses. It is the same distinction as the
+one already recorded above for `VIEW DEFINITION`, and it came up a second time in the form
+of a fix that removed a permission from the help text on the strength of a measurement
+that could not tell the two apart. Wording that stays correct in both cases: name the
+permission while saying what implies it, which requires no additional grant from the
+operator.
 
-L'ordre de retour naturel de `sys.dm_db_partition_stats` **satisfait déjà** les deux clés
-secondaires de l'ordre que la spec déclare, `partition_number` puis type d'allocation : sur
-les fixtures de ce projet, retirer l'une ou l'autre de la clause `ORDER BY` ne change pas
-une ligne de la sortie, et seule la perte de `index_id` se voit. Une assertion d'ordre
-comparée à une lecture indépendante épingle donc ce qu'elle peut, et l'absence de cassure
-sur les deux autres clés est un fait du moteur et non une assertion creuse. Le rapporter
-ainsi plutôt que de fabriquer une fixture artificielle pour faire mordre une cassure.
+The natural return order of `sys.dm_db_partition_stats` **already satisfies** the two
+secondary keys of the order the spec declares, `partition_number` then allocation type:
+on this project's fixtures, removing either one from the `ORDER BY` clause does not change
+a single row of the output, and only the loss of `index_id` shows. An order assertion
+compared against an independent read therefore pins what it can, and the absence of a
+break on the other two keys is a fact of the engine and not a hollow assertion. Report it
+that way rather than building an artificial fixture to make a break bite.
 
-`sys.query_store_plan.query_plan` est de type **`nvarchar` et nullable**, pas `xml`. Vérifié
-par sonde sur `sys.all_columns`, sur les deux versions.
+`sys.query_store_plan.query_plan` is of type **`nvarchar` and nullable**, not `xml`.
+Verified by probing `sys.all_columns`, on both versions.
 
-Le XML de plan produit par les fixtures de ce projet fait environ **4 500 octets, sans aucun
-CRLF ni caractère non ASCII**, sur 2019 comme sur 2022. Toute preuve d'identité octet à octet
-qui compterait sur les données du moteur pour couvrir ces deux caractéristiques ne couvre rien :
-il faut une charge synthétique dédiée.
+The plan XML produced by this project's fixtures is about **4,500 bytes, without any CRLF
+or non-ASCII character**, on 2019 as on 2022. Any byte-for-byte identity proof that
+counted on engine data to cover those two characteristics covers nothing: it needs a
+dedicated synthetic payload.
 
-## Méthode : la cassure
+## Method: the break
 
-Toute assertion ajoutée se vérifie en **cassant ce qu'elle surveille** et en
-confirmant que le bon test tombe.
+Every added assertion is verified by **breaking what it guards** and confirming
+that the right test fails.
 
-**Prouver par `grep` que la substitution a pris, avant de lire le résultat du
-test.** Six fois sur ce projet, une substitution n'a pas mordu et a produit un
-vert trompeur qu'on a failli enregistrer comme un faux négatif.
+**Prove with `grep` that the substitution took, before reading the test
+result.** Six times on this project, a substitution did not bite and produced a
+misleading green that we nearly recorded as a false negative.
 
-Rapporter « trois cassures sur quatre ont fait tomber leur cible » est le
-**succès** de cette étape, pas un échec : une cassure qui ne mord pas révèle une
-assertion qui ne vérifie rien.
+Reporting "three breaks out of four made their target fail" is the **success**
+of this step, not a failure: a break that does not bite reveals an assertion
+that verifies nothing.
 
-Et ce n'est **pas à l'auteur du test de choisir la cassure**. Mesuré ici : les
-cassures choisies par un relecteur révèlent environ deux fois plus d'assertions
-creuses, parce que celui qui a écrit le test casse ce que son test surveille.
+And **it is not up to the test's author to choose the break**. Measured here:
+breaks chosen by a reviewer reveal about twice as many hollow assertions,
+because whoever wrote the test breaks what their test watches.
 
-## Si une mesure contredit une consigne
+## If a measurement contradicts an instruction
 
-**S'arrêter et le dire**, plutôt que de faire coller le code à la consigne. Six
-implémenteurs de ce projet l'ont fait et avaient raison les six fois, et chaque
-fois en **exécutant** ce que leur brief disait plutôt qu'en le lisant.
+**Stop and say so**, rather than making the code fit the instruction. Six
+implementers on this project did so and were right all six times, and each time
+by **running** what their brief said rather than reading it.
